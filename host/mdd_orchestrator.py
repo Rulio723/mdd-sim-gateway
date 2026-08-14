@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import hashlib
 import ipaddress
 import json
@@ -34,8 +35,28 @@ try:
 except ImportError:  # pragma: no cover - installer provides PyYAML
     yaml = None
 
-BASE_VPCD_PORT = 0x8C7B
+# 0x8C7B (35963) is vpcd's own default port, which the distribution package hands to its
+# "Virtual PCD" reader. Two pcscd readers cannot listen on one port, so sharing that base
+# made the modem readers and the packaged reader fight over it — directory order decided
+# who won and the loser never bound at all. Stay off it, and below the ephemeral range so
+# an outbound socket cannot squat a slot either.
+BASE_VPCD_PORT = 0x3C00
 VPCD_PORT_STRIDE = 0x100
+VPCD_PORT_SLOTS = 64
+# Slots the upstream libifdvpcd is compiled for (--enable-vpcdslots, default 2). Assumed when
+# the installer has not recorded a rebuilt driver, because asking for slots the driver does not
+# have is what leaves a bridge thread dialling a socket that never appears.
+VPCD_PACKAGED_SLOTS = 2
+VPCD_DRIVER_DIRS = ("/usr/lib", "/usr/local/lib")
+# Logical channels the bridge implements, one per slot. It rejects anything above this on its
+# command line, so a larger configured or driver-provided count must not reach it: the bridge
+# would exit at startup and be respawned every cycle. The installer deliberately builds the
+# driver with a spare slot, so this is the binding limit rather than the driver's.
+VPCD_CHANNEL_CAPACITY = 3
+# The reader definition shipped by the vsmartcard-vpcd package, renamed out of the way
+# (pcsc-lite skips dot files) rather than deleted, so an operator can restore it.
+DISTRO_VPCD_READER = "vpcd"
+DISTRO_VPCD_READER_DISABLED = ".vpcd.mdd-disabled"
 MANAGED_ROUTE_PROTO = "186"
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
 
@@ -255,6 +276,11 @@ EXIT_RANK_WARMUP_SECONDS = float(os.environ.get("MDD_EXIT_RANK_WARMUP", "25"))
 # waking on the base interval to stat the input documents so an operator action is never
 # delayed by more than one base tick.
 IDLE_INTERVAL_SECONDS = float(os.environ.get("MDD_IDLE_INTERVAL", "15"))
+# How long a tty may stay unclaimed before the bridge stops waiting for ModemManager and talks
+# to the serial port itself. ModemManager needs on the order of ten to thirty seconds to probe
+# an EC25-class module, so this is set far beyond any healthy first pass: reaching it means
+# ModemManager has decided not to manage this hardware, not that it is still working on it.
+MM_CLAIM_GRACE_SECONDS = float(os.environ.get("MDD_MM_CLAIM_GRACE", "180"))
 COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "172.17.0.1")
 COUNTRY_PROXY_PORT_BASE = int(os.environ.get("MDD_COUNTRY_PROXY_PORT_BASE", "22000"))
 
@@ -463,6 +489,7 @@ class Orchestrator:
         self._xray_rules: list[dict] = []
         self._xray_ports: dict[str, int] = {}
         self.bridges: dict[str, subprocess.Popen] = {}
+        self.bridge_ports: dict[str, int] = {}
         self.last_proxy_fingerprint = ""
         self.applied_cellular_backend: bool | None = None
         self.radio_states: dict[str, bool] = {}
@@ -470,12 +497,28 @@ class Orchestrator:
         self.data_attempt_at: dict[str, float] = {}
         self.applied_timezone = ""
         self.obsolete_services_retired = False
-        config_path = Path(os.environ.get("MDD_VPCD_READER_CONFIG", "/etc/reader.conf.d/mdd-sim-gateway-modems"))
-        try: self.last_reader_config = config_path.read_text(encoding="utf-8")
+        self.reader_config_path = Path(os.environ.get(
+            "MDD_VPCD_READER_CONFIG", "/etc/reader.conf.d/mdd-sim-gateway-modems"))
+        try: self.last_reader_config = self.reader_config_path.read_text(encoding="utf-8")
         except OSError: self.last_reader_config = ""
         self.stop = False
         # What the previous cycle concluded, for deciding whether this one changed anything.
         self._last_conclusion = ""
+        # ---------------------------------------------------------- support diagnostics
+        # Everything below exists so the redacted support bundle can answer host-side
+        # questions on its own. Without it a modem/ModemManager fault is invisible to the
+        # control plane, which only ever sees the documents this process publishes.
+        self.host_diagnostics_path = self.root / "host-diagnostics.json"
+        # Our own recent output. journalctl is unreachable from the control-plane container,
+        # so the bundle would otherwise carry no trace of what this loop decided.
+        self._log_ring: collections.deque[str] = collections.deque(maxlen=200)
+        # Populated only while a tty stays unclaimed; a healthy gateway pays nothing for it.
+        self._claim_evidence: dict = {}
+        self._virtualization: str | None = None
+        # tty -> when it was first seen unclaimed, for the grace period below.
+        self._unclaimed_since: dict[str, float] = {}
+        # device id -> why its bridge talks to the serial port instead of ModemManager.
+        self._degraded: dict[str, str] = {}
 
     @staticmethod
     def service_active(name: str) -> bool:
@@ -583,9 +626,17 @@ class Orchestrator:
             target_data_active = bool(wanted.get("cellular_enabled")) and not bool(
                 wanted.get("flight_mode"))
             observed_data_active = bool(cellular_state.get("data_active"))
-            device_transitioning = bool(transitioning or (
-                present and (bool(wanted["vowifi_enabled"]) != vowifi_actual or
-                             target_data_active != observed_data_active or
+            # The bridge is no longer a VoWiFi actual: it runs for every present modem so
+            # the card stays reachable. Comparing it against the VoWiFi switch would park
+            # every switched-off modem in "stopping" forever.
+            #
+            # A modem bridged over the serial port is a settled outcome too, not work in
+            # progress. Leaving it marked transitioning is what made a modem ModemManager
+            # refused read as an indefinite spinner with no explanation; the reason belongs
+            # in the error field instead.
+            degraded = self._degraded.get(device_id, "")
+            device_transitioning = bool(transitioning or (not degraded and
+                present and (target_data_active != observed_data_active or
                              (backend_active and radio_enabled is not None and
                               bool(wanted.get("flight_mode")) == radio_enabled) or
                              (bool(desired_devices) and not backend_active))))
@@ -600,11 +651,16 @@ class Orchestrator:
                 "actual": {"cellular_backend_active": backend_active,
                            "cellular_radio_enabled": radio_enabled,
                            "flight_mode_active": radio_enabled is False,
-                           "vowifi_bridge_active": vowifi_actual},
+                           "vowifi_bridge_active": vowifi_actual,
+                           # Which path is carrying SIM traffic, so a modem serving VoWiFi
+                           # without any cellular capability is not read as half-broken.
+                           "vowifi_backend": ("direct-serial" if degraded else
+                                              "modemmanager" if vowifi_actual else "")},
                 "cellular": cellular_state,
                 "present": present,
                 "transitioning": device_transitioning,
-                "error": error or ("device is not connected" if not present else ""),
+                "error": (error or ("device is not connected" if not present else "")
+                          or degraded),
             }
         atomic_json(self.device_status_path, {
             "version": 2, "updated_at": int(time.time()), "devices": devices,
@@ -629,6 +685,7 @@ class Orchestrator:
                     proc.kill()
                     proc.wait()
             self.bridges.pop(hwid, None)
+            self.bridge_ports.pop(hwid, None)
 
     def reset_modems_after_cellular(self):
         """Reset EC25-class modems after ModemManager releases QMI/UIM ownership."""
@@ -662,6 +719,104 @@ class Orchestrator:
         if reset:
             # USB serial ports disappear and return after the module reboot.
             time.sleep(12)
+
+    def claim_wait(self, tty: str) -> float:
+        """Seconds this tty has been continuously unclaimed by ModemManager.
+
+        The clock starts on the first cycle that finds it unclaimed, so a modem still being
+        probed is never mistaken for one ModemManager has refused. It is reset the moment a
+        claim succeeds, and a replug retires the entry with the rest of the device state.
+        """
+        first_seen = self._unclaimed_since.setdefault(tty, time.time())
+        return time.time() - first_seen
+
+    def driver_slots(self) -> int:
+        """Slots the installed libifdvpcd was compiled for.
+
+        The installer records this beside the driver when it builds one; without that marker
+        the packaged build is in place, which upstream compiles for two. Guessing higher
+        would recreate the very symptom this exists to avoid, so the fallback is the
+        conservative one.
+        """
+        for parent in (Path(item) for item in VPCD_DRIVER_DIRS):
+            for marker in parent.glob("**/.mdd-vpcd-slots-*"):
+                try:
+                    return max(1, int(marker.name.rsplit("-", 1)[1]))
+                except (IndexError, ValueError):
+                    continue
+        return VPCD_PACKAGED_SLOTS
+
+    def virtualization(self) -> str:
+        """Cached hypervisor/container label; deployments differ mostly in this one word."""
+        if self._virtualization is None:
+            result = run(["systemd-detect-virt"])
+            self._virtualization = (result.stdout or "").strip() or "none"
+        return self._virtualization
+
+    def claim_evidence(self, ttys: list[str]) -> dict:
+        """Record why ModemManager owns no object for these ttys.
+
+        A bridge that never starts leaves no trace beyond one repeating log line, so the
+        support bundle has to carry what an operator would otherwise be asked to run by
+        hand. Port lines are kept because they are exactly what the claim check matches
+        against; everything else mmcli prints is identity material the bundle must not
+        grow.
+        """
+        listing = run(["mmcli", "-L"])
+        objects = re.findall(r"(/org/freedesktop/ModemManager1/Modem/\d+)",
+                             listing.stdout or "")
+        ports = {}
+        for obj in objects:
+            detail = run(["mmcli", "-m", obj, "--output-keyvalue"])
+            ports[obj] = [line.strip() for line in (detail.stdout or "").splitlines()
+                          if re.search(r"\.(?:ports|state)\b", line)]
+        evidence = {"observed_at": int(time.time()), "unclaimed_ttys": sorted(ttys),
+                    "mmcli_list_returncode": listing.returncode,
+                    "modem_objects": objects, "modem_ports": ports}
+        if not objects:
+            # ModemManager knowing about no modem at all is a refusal, and it only ever
+            # explains itself in its own journal — which the control-plane container cannot
+            # read. Without this the bundle shows an empty list and no reason for it.
+            journal = run(["journalctl", "-u", "ModemManager.service", "-n", "40",
+                           "--no-pager", "-p", "warning"])
+            evidence["modemmanager_journal"] = [
+                line for line in (journal.stdout or "").splitlines() if line.strip()]
+        return evidence
+
+    def publish_host_diagnostics(self, discovered: list[dict], assignments: dict,
+                                 mm_active: bool, cellular_required: bool,
+                                 vowifi_required: bool) -> None:
+        """Publish the host-side view the control plane cannot observe for itself.
+
+        The control plane runs in a container without systemd or the host USB tree, so
+        every fact here would otherwise reach a maintainer only by asking the operator to
+        run commands. Fields are drawn from state this cycle already computed; nothing is
+        collected merely to fill the file.
+        """
+        atomic_json(self.host_diagnostics_path, {
+            "version": 1,
+            "updated_at": int(time.time()),
+            "virtualization": self.virtualization(),
+            "modemmanager": {
+                # The claim check depends on this unit being reported active; a mismatch
+                # against mmcli working by hand is itself the diagnosis.
+                "unit_active": mm_active,
+                "required": cellular_required,
+                "applied": self.applied_cellular_backend,
+                "unclaimed": self._claim_evidence,
+                "claim_grace_seconds": MM_CLAIM_GRACE_SECONDS,
+                # Modems whose bridge gave up on ModemManager and drives the tty itself.
+                "degraded_to_direct_serial": dict(self._degraded),
+            },
+            "discovered_modems": discovered,
+            "assignments": assignments,
+            "bridges": {hwid: {"pid": proc.pid, "running": proc.poll() is None}
+                        for hwid, proc in self.bridges.items()},
+            "country_egress_required": vowifi_required,
+            "reader_config": {"path": str(self.reader_config_path),
+                              "stanzas": self.last_reader_config.count("FRIENDLYNAME")},
+            "recent_log": list(self._log_ring),
+        })
 
     @staticmethod
     def modemmanager_modem_for_tty(tty: str) -> str:
@@ -916,7 +1071,9 @@ class Orchestrator:
             # Flight mode always wins over a still-saved 4G preference.  Keeping the
             # preference lets data reconnect when flight mode is later disabled.
             "cellular_data_enabled": wanted["cellular_enabled"] and not flight_mode,
-            "vowifi_bridge_enabled": wanted["vowifi_enabled"],
+            # The VoWiFi switch governs the line engine only. The card bridge follows the
+            # hardware, because provisioning a line requires reading the card first.
+            "vowifi_line_enabled": wanted["vowifi_enabled"],
         }
 
     @staticmethod
@@ -1034,7 +1191,11 @@ class Orchestrator:
                 self.cellular_states[device_id] = self.modem_snapshot(modem)
 
     def log(self, message):
-        print(time.strftime("%F %T"), message, flush=True)
+        line = f"{time.strftime('%F %T')} {message}"
+        # Retained as well as printed: journalctl is out of reach from the control-plane
+        # container, so the support bundle would otherwise show no reason for a stall.
+        self._log_ring.append(line)
+        print(line, flush=True)
 
     def reconcile_timezone(self):
         """Apply the validated WebUI timezone to the host without changing its hostname."""
@@ -1828,33 +1989,81 @@ class Orchestrator:
                 f"DEVICENAME /dev/null:0x{base:04X}\nLIBPATH {library}\n"
                 f"CHANNELID 0x{base:04X}\n")
 
+    def disable_distro_vpcd_reader(self, config_path: Path) -> bool:
+        """Move the vsmartcard-vpcd package's own reader definition out of pcscd's way.
+
+        That package ships /etc/reader.conf.d/vpcd: a two-slot "Virtual PCD" reader on
+        vpcd's default port, present whether or not any modem is. pcscd cannot register
+        it and a modem reader on the same port, and readdir order — not policy — decides
+        which one binds, so on some hosts every modem reader silently failed to appear
+        while two phantom devices did. Reinstalling the package restores the file, hence
+        the check on every pass. It is renamed rather than deleted (pcsc-lite skips dot
+        files) so an operator who wants a virtual card back can rename it again.
+
+        Returns True when this pass changed something, so the caller restarts pcscd.
+        """
+        packaged = config_path.with_name(DISTRO_VPCD_READER)
+        if not packaged.is_file() or packaged == config_path:
+            return False
+        if self.dry_run:
+            return True
+        disabled = config_path.with_name(DISTRO_VPCD_READER_DISABLED)
+        try:
+            os.replace(packaged, disabled)
+        except OSError as exc:
+            self.log(f"could not disable the packaged vpcd reader definition: {exc}")
+            return False
+        self.log(f"disabled the packaged vpcd reader definition ({packaged} -> {disabled}); "
+                 "it collides with this gateway's per-modem virtual readers")
+        return True
+
     def reconcile_hardware(self, desired: dict, desired_devices: dict,
                            through_modemmanager=False) -> dict:
         hardware = (desired.get("hardware") or {})
-        if not hardware.get("auto_detect", True): return {}
+        if not hardware.get("auto_detect", True):
+            # Nothing is managed, so any retained claim failure describes a past cycle.
+            self._claim_evidence, self._degraded, self._unclaimed_since = {}, {}, {}
+            return {}
         modems = self.usb_modems(hardware)
+        # A replug retires both the grace clock and the degraded verdict, so re-seating a
+        # modem is the operator's way to ask for ModemManager to be tried again.
+        live_ttys = {modem["tty"] for modem in modems}
+        live_ids = {modem["id"] for modem in modems}
+        self._unclaimed_since = {tty: seen for tty, seen in self._unclaimed_since.items()
+                                 if tty in live_ttys}
+        self._degraded = {device_id: reason for device_id, reason in self._degraded.items()
+                          if device_id in live_ids}
         old = read_json(self.hw_state_path).get("assignments") or {}
-        used = {int(v.get("base_port")) for k, v in old.items() if k in {m["id"] for m in modems}}
+        ports = [BASE_VPCD_PORT + i * VPCD_PORT_STRIDE for i in range(VPCD_PORT_SLOTS)]
+        # A port saved by a release that started at vpcd's own default is migrated here:
+        # keeping it would leave that modem fighting the packaged "Virtual PCD" reader.
+        used = {int(v.get("base_port")) for k, v in old.items()
+                if k in {m["id"] for m in modems} and int(v.get("base_port") or 0) in ports}
         assignments = {}
         for modem in modems:
             saved = old.get(modem["id"]) or {}
             base = int(saved.get("base_port") or 0)
-            if not base:
-                base = next(BASE_VPCD_PORT + i * VPCD_PORT_STRIDE for i in range(64)
-                            if BASE_VPCD_PORT + i * VPCD_PORT_STRIDE not in used)
+            if base not in ports:
+                base = next(port for port in ports if port not in used)
             used.add(base); assignments[modem["id"]] = {**modem, "base_port": base}
-        slots = max(1, min(3, int(hardware.get("vpcd_slots") or 3)))
-        vowifi_modems = [m for m in modems
-                         if (desired_devices.get(m["id"]) or {}).get("vowifi_enabled")]
+        # Never ask for more slots than the installed driver was compiled with: the count is a
+        # build-time constant, and a slot with no socket behind it leaves a bridge thread
+        # dialling a port pcscd will never listen on for the life of the process.
+        slots = max(1, min(VPCD_CHANNEL_CAPACITY, self.driver_slots(),
+                           int(hardware.get("vpcd_slots") or VPCD_CHANNEL_CAPACITY)))
         # Keep reader definitions stable for every detected modem. A capability toggle only
         # starts/stops that modem's bridge; it must not restart pcscd and disturb other lines.
-        # A disabled modem has no bridge, so its reader remains empty and cannot serve APDUs.
         reader_config = "\n".join(self.reader_stanza(m, assignments[m["id"]]["base_port"])
                                   for m in modems)
-        config_path = Path(os.environ.get("MDD_VPCD_READER_CONFIG", "/etc/reader.conf.d/mdd-sim-gateway-modems"))
+        # Resolved per cycle, not cached: the path is an environment override and tests (and
+        # a relocated install) expect a change to take effect without a restart.
+        config_path = Path(os.environ.get(
+            "MDD_VPCD_READER_CONFIG", "/etc/reader.conf.d/mdd-sim-gateway-modems"))
+        self.reader_config_path = config_path
         legacy_config = config_path.with_name("vowifi-modems")
         legacy_present = legacy_config.exists() and legacy_config != config_path
-        if reader_config != self.last_reader_config:
+        distro_disabled = self.disable_distro_vpcd_reader(config_path)
+        if reader_config != self.last_reader_config or distro_disabled:
             if not self.dry_run:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 config_path.write_text(reader_config, encoding="utf-8")
@@ -1870,12 +2079,24 @@ class Orchestrator:
             legacy_config.unlink(missing_ok=True)
             (self.root / "pcsc-maintenance").write_text(str(int(time.time())), encoding="ascii")
             run(["systemctl", "restart", "pcscd.service"])
-        live_ids = {m["id"] for m in vowifi_modems}
+        # Card access is not a capability. The virtual reader has to hold a card before a
+        # line can exist at all — detecting the SIM, verifying its PIN and managing eSIM
+        # profiles all go through it — while the VoWiFi switch stays disabled until such a
+        # line exists. Tying the bridge to that switch therefore deadlocked every fresh
+        # modem, and turning VoWiFi off to run an eSIM operation emptied the reader under
+        # it. Bridges follow the hardware instead: every present modem gets one.
+        live_ids = {m["id"] for m in modems}
         for hwid in list(self.bridges):
-            if hwid not in live_ids or self.bridges[hwid].poll() is not None:
+            # A bridge that was started on a now-migrated port would keep dialling a socket
+            # pcscd no longer listens on, so a port change has to respawn it.
+            moved = (hwid in live_ids
+                     and self.bridge_ports.get(hwid) != assignments[hwid]["base_port"])
+            if hwid not in live_ids or moved or self.bridges[hwid].poll() is not None:
                 proc = self.bridges.pop(hwid)
+                self.bridge_ports.pop(hwid, None)
                 if proc.poll() is None: proc.terminate()
-        for modem in vowifi_modems:
+        unclaimed = []
+        for modem in modems:
             if modem["id"] in self.bridges: continue
             bridge = self.repo / "host" / "vpcd_modem_bridge.py"
             metadata = self.data / "modems" / f"{modem['id']}.json"
@@ -1884,12 +2105,36 @@ class Orchestrator:
                        "--metadata-file", str(metadata), "--hardware-id", modem["id"]]
             if through_modemmanager:
                 mm_modem = self.modemmanager_modem_for_tty(modem["tty"])
-                if not mm_modem:
+                if mm_modem:
+                    self._unclaimed_since.pop(modem["tty"], None)
+                    self._degraded.pop(modem["id"], None)
+                    command += ["--modemmanager", mm_modem, "--identity-refresh", "60"]
+                elif self.claim_wait(modem["tty"]) < MM_CLAIM_GRACE_SECONDS:
                     self.log(f"waiting for ModemManager to claim {modem['tty']}")
+                    unclaimed.append(modem["tty"])
                     continue
-                command += ["--modemmanager", mm_modem, "--identity-refresh", "60"]
+                else:
+                    unclaimed.append(modem["tty"])
+                    if modem["id"] not in self._degraded:
+                        self.log(f"ModemManager has not claimed {modem['tty']} in "
+                                 f"{int(MM_CLAIM_GRACE_SECONDS)}s; bridging this modem over "
+                                 f"the serial port directly. VoWiFi works; cellular data and "
+                                 f"flight mode do not, because they need a ModemManager modem.")
+                    self._degraded[modem["id"]] = (
+                        "ModemManager did not create a modem for this hardware, so VoWiFi is "
+                        "bridged over the serial port directly. Cellular data and flight mode "
+                        "are unavailable until ModemManager claims it.")
             if not self.dry_run:
                 self.bridges[modem["id"]] = subprocess.Popen(command)
+                self.bridge_ports[modem["id"]] = assignments[modem["id"]]["base_port"]
+        # One capture per cycle rather than one per modem: this is the state an operator has to
+        # be asked for by hand today, and asking costs a support round trip. Once a bridge has
+        # degraded it holds the port exclusively and nothing further can change, so the capture
+        # taken at that moment is retained rather than re-derived on every idle cycle.
+        if unclaimed:
+            self._claim_evidence = self.claim_evidence(unclaimed)
+        elif not self._degraded:
+            self._claim_evidence = {}
         atomic_json(self.hw_state_path, {"updated_at": int(time.time()), "assignments": assignments})
         return assignments
 
@@ -1961,6 +2206,8 @@ class Orchestrator:
             assignments = self.reconcile_hardware(
                 desired, active_desired, through_modemmanager=cellular_required)
             self.publish_device_status(desired_devices, assignments)
+            self.publish_host_diagnostics(discovered, assignments, mm_active,
+                                          cellular_required, vowifi_required)
             # Compare what this cycle concluded, not what it observed: timestamps and counters
             # differ every time and would defeat the comparison.
             fingerprint = json.dumps([sorted(present_ids), active_desired, cellular_required,

@@ -94,6 +94,17 @@ PCSC_SOURCE_BUILT=0
 CCID_VERSION="${CCID_VERSION:-1.6.2}"
 CCID_SHA256="6d5e6a6884090831ed155ee75cbc03aed252bd8158d94f507a94f05ebaba296c"
 
+# Virtual smart-card driver, built from source because the packaged one is compiled for two
+# slots. A module's SIM is exposed as one virtual reader per logical channel, and this gateway
+# uses three (PIN keeper, SWu tunnel, IMS), so on the distro build the third channel has no
+# socket behind it: its bridge thread dials a port pcscd never listens on and the channel is
+# simply unavailable. The count is a compile-time constant (--enable-vpcdslots, upstream
+# default 2), so a rebuild is the only way to raise it. Same upstream release Debian packages
+# as 3.3+dfsg, so this changes the slot count and nothing else.
+VPCD_VERSION="${VPCD_VERSION:-0.8}"
+VPCD_SHA256="b428c399d5f014a350db0e8e5947ce69392429cc1aebdf3830af3c7f8078b18f"
+VPCD_SLOTS="${VPCD_SLOTS:-4}"
+
 # Host-side runtime dependencies. Versions and hashes are pinned so an upstream replacement
 # cannot silently change what this root installer executes. Override only for a reviewed release.
 SINGBOX_VERSION="${MDD_SINGBOX_VERSION:-1.13.15}"
@@ -698,8 +709,17 @@ ensure_control_local_deps() {
 setup_venv() {
   info "creating Python venv + installing control requirements ($VENV_DIR)…"
   [ -d "$VENV_DIR" ] || python3 -m venv "$VENV_DIR"
-  "$VENV_DIR/bin/pip" install --quiet --upgrade pip wheel
-  "$VENV_DIR/bin/pip" install --quiet -r "$REPO_DIR/control/requirements.txt"
+  # Most reloads do not change Python dependencies. Prove the pinned requirements are already
+  # present without consulting an index first: this keeps a release download proxy out of pip's
+  # vendored networking stack and lets a fully provisioned host reload offline. Only a genuinely
+  # missing or changed dependency needs the package index. Do not upgrade pip on every reload;
+  # replacing the installer itself creates needless network and compatibility risk.
+  if "$VENV_DIR/bin/pip" install --quiet --no-index \
+      -r "$REPO_DIR/control/requirements.txt" >/dev/null 2>&1; then
+    info "control requirements already satisfied — reusing the installed packages"
+  else
+    "$VENV_DIR/bin/pip" install --quiet wheel -r "$REPO_DIR/control/requirements.txt"
+  fi
   info "venv ready"
 }
 
@@ -761,6 +781,110 @@ remove_control_local() {
   fi
 }
 
+# The vsmartcard-vpcd package ships its own /etc/reader.conf.d/vpcd: a two-slot "Virtual PCD"
+# reader on vpcd's default port, present whether or not a modem is. pcscd cannot bind that port
+# for it AND for a modem reader, and directory order decides who wins, so on some hosts the modem
+# readers never appeared while two phantom devices did. Rename it out of the way — pcsc-lite skips
+# dot files — instead of deleting a package file, so it can be restored. The orchestrator repeats
+# this check on every pass, which also covers a later reinstall of the package.
+VPCD_PACKAGED_READER=/etc/reader.conf.d/vpcd
+VPCD_PACKAGED_READER_DISABLED=/etc/reader.conf.d/.vpcd.mdd-disabled
+disable_packaged_vpcd_reader() {
+  [ -f "$VPCD_PACKAGED_READER" ] || return 0
+  mv -f "$VPCD_PACKAGED_READER" "$VPCD_PACKAGED_READER_DISABLED"
+  info "disabled the packaged 'Virtual PCD' reader definition (collides with modem readers)"
+  systemctl restart pcscd.service >/dev/null 2>&1 || true
+}
+
+restore_packaged_vpcd_reader() {
+  [ -f "$VPCD_PACKAGED_READER_DISABLED" ] || return 0
+  [ -e "$VPCD_PACKAGED_READER" ] && { rm -f "$VPCD_PACKAGED_READER_DISABLED"; return 0; }
+  mv -f "$VPCD_PACKAGED_READER_DISABLED" "$VPCD_PACKAGED_READER"
+  systemctl restart pcscd.service >/dev/null 2>&1 || true
+}
+
+# Slot count of the installed libifdvpcd, read from the constant the build compiles in. Used to
+# decide whether a rebuild is needed and to tell the orchestrator what it may ask for; a driver
+# that cannot be inspected is reported as the upstream default rather than guessed upwards.
+installed_vpcd_slots() {
+  lib=$(find /usr/local/lib /usr/lib -name 'libifdvpcd.so*' -print -quit 2>/dev/null || true)
+  [ -n "$lib" ] || { printf '0'; return; }
+  marker=$(find /usr/local/lib /usr/lib -name ".mdd-vpcd-slots-*" -print -quit 2>/dev/null || true)
+  case "$marker" in *.mdd-vpcd-slots-*) printf '%s' "${marker##*-}"; return ;; esac
+  printf '2'
+}
+
+# Build + install libifdvpcd with enough slots for this gateway's logical channels. The packaged
+# driver is compiled for two and the count has no runtime override, so the third channel is
+# unreachable until the driver itself is replaced. Idempotent via a slot-tagged marker beside the
+# driver; a distro reinstall drops the marker and the next run rebuilds.
+ensure_vpcd_host() {
+  # Ask pcsc-lite where its drivers live rather than assuming, the way the CCID build does.
+  # Debian keeps this out of the multiarch tree today, but a distribution that does not would
+  # otherwise get a driver installed somewhere pcscd never looks — and the only symptom would
+  # be the two-slot behaviour this exists to fix, with the build reporting success.
+  drivers_dir=$(pkg-config libpcsclite --variable usbdropdir 2>/dev/null || true)
+  [ -n "$drivers_dir" ] && drivers_dir="$drivers_dir/serial"
+  # Fall back to wherever the packaged driver already sits, then to the historical path.
+  [ -d "$drivers_dir" ] || drivers_dir=$(dirname "$(find /usr/lib /usr/local/lib -name 'libifdvpcd.so*' -print -quit 2>/dev/null || true)" 2>/dev/null)
+  [ -n "$drivers_dir" ] && [ -d "$drivers_dir" ] || drivers_dir=/usr/lib/pcsc/drivers/serial
+  vpcd_marker="$drivers_dir/.mdd-vpcd-slots-${VPCD_SLOTS}"
+  if [ -f "$vpcd_marker" ]; then
+    info "virtual smart-card driver already provides $VPCD_SLOTS slots ($drivers_dir)"
+    return 0
+  fi
+  info "building the virtual smart-card driver from source for $VPCD_SLOTS slots…"
+  if   have apt-get; then
+    pkg_install autoconf automake libtool pkg-config gcc make wget ca-certificates help2man
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install libpcsclite-dev
+  elif have dnf || have yum; then
+    pkg_install autoconf automake libtool pkgconf-pkg-config gcc make wget help2man
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
+  elif have pacman;  then pkg_install autoconf automake libtool pkgconf gcc make wget help2man
+  elif have zypper;  then
+    pkg_install autoconf automake libtool pkg-config gcc make wget help2man
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-devel
+  elif have apk;     then
+    pkg_install autoconf automake libtool pkgconfig gcc make wget musl-dev help2man
+    [ -f /usr/include/PCSC/pcsclite.h ] || pkg_install pcsc-lite-dev
+  fi
+  tmp=$(mktemp -d)
+  download_verified \
+    "https://github.com/frankmorgner/vsmartcard/archive/refs/tags/virtualsmartcard-${VPCD_VERSION}.tar.gz" \
+    "$tmp/vsmartcard.tar.gz" "$VPCD_SHA256"
+  # Only the driver and the library it links against are built. The rest of the tree is the
+  # Python virtual card, the Android relay and pcsc-relay — none of which this gateway uses,
+  # and each dragging in its own dependencies. src/vpcd must come first: src/ifd-vpcd links
+  # libvpcd.la and its makefile has no rule to build it.
+  ( cd "$tmp" \
+    && tar xf vsmartcard.tar.gz \
+    && cd "vsmartcard-virtualsmartcard-${VPCD_VERSION}/virtualsmartcard" \
+    && autoreconf -vif . >/dev/null 2>&1 \
+    && ./configure --enable-serialconfdir=/etc/reader.conf.d \
+                   --enable-serialdropdir="$drivers_dir" \
+                   --enable-vpcdslots="$VPCD_SLOTS" \
+                   --disable-dependency-tracking >/dev/null \
+    && make -C src/vpcd >/dev/null \
+    && make -C src/ifd-vpcd >/dev/null \
+    && make -C src/ifd-vpcd install >/dev/null \
+  ) || { rm -rf "$tmp"; warn "could not build the virtual smart-card driver; the packaged two-slot driver stays in place and a module's third logical channel will be unavailable"; return 1; }
+  rm -rf "$tmp"
+  # configure installs its own reader definition; this gateway writes per-modem ones instead.
+  disable_packaged_vpcd_reader
+  rm -f "$drivers_dir/.mdd-vpcd-slots-"* 2>/dev/null || true
+  touch "$vpcd_marker" 2>/dev/null || true
+  if have apt-mark; then apt-mark hold vsmartcard-vpcd >/dev/null 2>&1 || true; fi
+  if have systemctl; then
+    # Same maintenance marker the orchestrator publishes, so the control plane does not read
+    # this planned enumeration gap as readers being unplugged and stop healthy engines.
+    install -d -m 0700 "$MDD_DATA_DIR/orchestrator"
+    : > "$MDD_DATA_DIR/orchestrator/pcsc-maintenance"
+    chmod 0600 "$MDD_DATA_DIR/orchestrator/pcsc-maintenance" 2>/dev/null || true
+    systemctl restart pcscd 2>/dev/null || true
+  fi
+  info "virtual smart-card driver installed with $VPCD_SLOTS slots ($drivers_dir)"
+}
+
 # Country routes and USB modem serial ports live in the host namespace even when the manager is
 # containerized, so this small privileged service is installed in both deployment modes.
 run_orchestrator() {
@@ -774,6 +898,9 @@ run_orchestrator() {
   VPCD_LIB=$(find /usr/local/lib /usr/lib -name libifdvpcd.so -print -quit 2>/dev/null || true)
   [ -n "$VPCD_LIB" ] && info "virtual smart-card driver: $VPCD_LIB" \
     || warn "libifdvpcd.so not found; native readers work, modem virtual slots will stay unavailable"
+  # The packaged driver only has two slots, one short of the logical channels a module needs.
+  [ -n "$VPCD_LIB" ] && ensure_vpcd_host
+  disable_packaged_vpcd_reader
   have sing-box || die "sing-box installation failed"
   have xray || die "Xray-core installation failed"
   cat > "$ORCHESTRATOR_UNIT" <<EOF
@@ -803,6 +930,8 @@ EOF
 remove_orchestrator() {
   if have systemctl; then systemctl disable --now mdd-sim-gateway-orchestrator >/dev/null 2>&1 || true; fi
   rm -f "$ORCHESTRATOR_UNIT" /etc/reader.conf.d/mdd-sim-gateway-modems
+  # Nothing of ours is left to collide with it, so hand the packaged reader back.
+  restore_packaged_vpcd_reader
   have systemctl && systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -1079,7 +1208,125 @@ cmd_status() {
   if have sing-box; then printf '  sing-box  %s\n' "$(sing-box version 2>/dev/null | head -1)"; else printf '  sing-box  (not installed)\n'; fi
   if have xray; then printf '  Xray-core  %s\n' "$(xray version 2>/dev/null | head -1)"; else printf '  Xray-core  (not installed)\n'; fi
   if have mmcli; then printf '  ModemManager  %s\n' "$(mmcli --version 2>/dev/null | head -1)"; else printf '  ModemManager  (not installed)\n'; fi
+  # Slot count decides whether a module's third logical channel exists at all, and the build
+  # that raises it only warns when it fails — so it has to be visible without reading a log.
+  vpcd_slots=$(installed_vpcd_slots)
+  case "$vpcd_slots" in
+    0) printf '  virtual reader driver  (not installed)\n' ;;
+    2) printf '  virtual reader driver  %s slots — run `%s vpcd` for a third logical channel\n' "$vpcd_slots" "$0" ;;
+    *) printf '  virtual reader driver  %s slots\n' "$vpcd_slots" ;;
+  esac
   if [ -x "$MDD_DATA_DIR/lpac/lpac" ]; then printf '  lpac  installed\n'; else printf '  lpac  (not installed)\n'; fi
+}
+
+# One command whose output can be pasted into a bug report: everything needed to tell a card
+# path apart from a radio path, with SIM identities masked on the way out. Long digit runs are
+# ICCID/IMSI/IMEI/EID here, so only their last four characters survive.
+diag_redact() { sed -E 's/[0-9]{6,}([0-9]{4})/****\1/g'; }
+
+diag_section() { printf '\n%s== %s ==%s\n' "$B" "$1" "$N"; }
+
+diag_readers() {
+  if [ -x "$VENV_DIR/bin/python" ]; then
+    "$VENV_DIR/bin/python" - <<'PY' 2>/dev/null || true
+try:
+    from smartcard.System import readers
+    for index, reader in enumerate(readers()):
+        print("%d: %s" % (index, reader))
+except Exception as exc:  # noqa - a diagnostic must never fail the whole report
+    print("reader enumeration failed: %r" % (exc,))
+PY
+  elif have pcsc_scan; then
+    pcsc_scan -r 2>/dev/null || true
+  else
+    printf '(no pyscard venv and no pcsc_scan — install pcsc-tools to list readers)\n'
+  fi
+}
+
+cmd_diagnose() {
+  need_root
+  resolve_mode
+  DATA_ABS=$(data_dir_abs)
+  diag_section "Install"
+  printf 'version: %s (%s)\n' "$(cat "$REPO_DIR/VERSION" 2>/dev/null || echo unknown)" \
+    "$(git -C "$REPO_DIR" describe --always --dirty 2>/dev/null || echo 'no git')"
+  printf 'mode:    %s\ndata:    %s\n' "$MODE" "$DATA_ABS"
+  printf 'host:    %s\n' "$(uname -srm)"
+  if [ -r /etc/os-release ]; then
+    (. /etc/os-release; printf 'distro:  %s\n' "${PRETTY_NAME:-unknown}") || true
+  fi
+
+  diag_section "PC/SC reader definitions"
+  ls -la /etc/reader.conf.d/ 2>/dev/null || printf '(no /etc/reader.conf.d)\n'
+  [ -f "$VPCD_PACKAGED_READER" ] \
+    && printf '\n!! the packaged "Virtual PCD" definition is still active — it collides with modem readers\n' \
+    || printf '\npackaged "Virtual PCD" definition: not active (good)\n'
+  printf '\n--- /etc/reader.conf.d/mdd-sim-gateway-modems ---\n'
+  cat /etc/reader.conf.d/mdd-sim-gateway-modems 2>/dev/null || printf '(absent)\n'
+
+  diag_section "pcscd and live readers"
+  if have systemctl; then systemctl is-active pcscd.service 2>/dev/null || true; fi
+  diag_readers
+
+  diag_section "Modem SIM bridges"
+  pgrep -af vpcd_modem_bridge.py 2>/dev/null || printf '(no bridge process running)\n'
+  printf '\n--- listening virtual-reader sockets (pcscd) ---\n'
+  if have ss; then
+    ss -lntp 2>/dev/null | grep -i pcscd || printf '(none — pcscd bound no virtual reader port)\n'
+    printf '\n--- bridge connections ---\n'
+    ss -ntp 2>/dev/null | grep -i "vpcd_modem_bridge\|python" || printf '(none)\n'
+  else
+    printf '(ss unavailable)\n'
+  fi
+
+  diag_section "Orchestrator state (masked)"
+  for name in devices-desired.json devices-hardware.json devices-status.json; do
+    printf -- '--- %s ---\n' "$name"
+    if [ -f "$DATA_ABS/orchestrator/$name" ]; then
+      diag_redact < "$DATA_ABS/orchestrator/$name"
+    else
+      printf '(absent)\n'
+    fi
+    printf '\n'
+  done
+  for path in "$DATA_ABS"/modems/*.json; do
+    [ -f "$path" ] || continue
+    printf -- '--- modems/%s ---\n' "$(basename "$path")"
+    diag_redact < "$path"
+    printf '\n'
+  done
+
+  diag_section "Orchestrator log (card path, masked)"
+  if have journalctl; then
+    journalctl -u mdd-sim-gateway-orchestrator -n 400 --no-pager 2>/dev/null \
+      | grep -Ei 'bridge|vpcd|reader|channel|modemmanager' | tail -60 | diag_redact || printf '(nothing matched)\n'
+  else
+    printf '(journalctl unavailable)\n'
+  fi
+
+  diag_section "eSIM chip read over each modem reader (masked)"
+  if [ ! -x "$MDD_DATA_DIR/lpac/lpac" ]; then
+    printf 'lpac is not built — run: sudo ./install.sh build-lpac\n'
+  else
+    diag_readers | grep -F 'VoWiFi Modem' > /tmp/mdd-diag-readers.$$ 2>/dev/null || true
+    if [ ! -s /tmp/mdd-diag-readers.$$ ]; then
+      printf '(no modem reader present, so nothing to read)\n'
+    else
+      # A running line owns the reader exclusively; lpac then fails for that reason alone.
+      while IFS= read -r entry; do
+        name=${entry#*: }
+        printf -- '--- %s ---\n' "$name"
+        LPAC_APDU=pcsc LPAC_APDU_PCSC_DRV_NAME="$name" \
+          "$MDD_DATA_DIR/lpac/lpac" chip info 2>&1 | head -30 | diag_redact || true
+        printf '\n'
+      done < /tmp/mdd-diag-readers.$$
+    fi
+    rm -f /tmp/mdd-diag-readers.$$
+  fi
+
+  diag_section "ModemManager"
+  if have mmcli; then mmcli -L 2>&1 | diag_redact || true; else printf '(mmcli unavailable)\n'; fi
+  printf '\n'
 }
 
 cmd_reset_admin() {
@@ -1101,6 +1348,14 @@ cmd_reset_admin() {
 #   patch2    compatibility fix only (02) — synthesize missing ATR TCK for HSIC reader.
 #   patchprime SCR Prime device-table support only (03).
 #   patchall  all three patches (01 + 02 + 03).
+cmd_vpcd() {
+  # Also reachable as part of install/reload. Exposed on its own because that build is the one
+  # step that warns instead of aborting, so an operator who missed the warning — or who is on a
+  # host where it first failed for a missing dependency — needs a way to retry just this.
+  need_root
+  ensure_vpcd_host
+}
+
 cmd_patch() {
   need_root
   ensure_ccid_host slot 01_hsic_slot_status.patch
@@ -1371,8 +1626,10 @@ ${B}MDD Sim Gateway installer${N}
   $0 disable-autostart    do not start on boot
   $0 uninstall [--purge]  remove MDD containers/images/service (--purge also deletes data+venv)
   $0 status               show mode + component status
+  $0 diagnose             print a masked card-path report (readers, bridges, lpac, logs)
   $0 reset-admin          reset the local administrator (old credential file is backed up)
   $0 logs                 follow control-plane logs
+  $0 vpcd                 rebuild the virtual smart-card driver with enough card slots
   $0 build-lpac [--lpac-src PATH] [--dest DIR]   compile lpac into data/lpac (local eSIM LPA)
   $0 patch                build + install the CCID driver with the base HSIC fix (01) — opt-in,
                           for the HSIC 1d99:0016 reader (safe for every card, incl. physical eSIM)
@@ -1425,12 +1682,14 @@ case "$CMD" in
   disable-autostart)  cmd_disable_autostart ;;
   uninstall)          cmd_uninstall ;;
   status)             cmd_status ;;
+  diagnose)           cmd_diagnose ;;
   reset-admin)        cmd_reset_admin ;;
   logs)               cmd_logs ;;
   build-lpac)         cmd_build_lpac ;;
   patch)              cmd_patch ;;
   patch2)             cmd_patch2 ;;
   patchprime)         cmd_patchprime ;;
+  vpcd)               cmd_vpcd ;;
   patchall)           cmd_patchall ;;
   "")                 cmd_auto ;;
   -h|--help|help)     usage ;;

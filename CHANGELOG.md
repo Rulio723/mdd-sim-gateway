@@ -2,7 +2,75 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
-## [Unreleased]
+## [1.3.7] - 2026-08-14
+
+### Fixed
+
+- Reload now checks an existing Python environment against the pinned requirements entirely
+  offline before contacting a package index, and no longer upgrades pip on every run. Updates
+  whose dependencies are already installed therefore cannot fail inside pip merely because the
+  Release download used an HTTP or SOCKS proxy.
+
+## [1.3.6] - 2026-08-14
+
+### Fixed
+
+- A module's third logical channel works on a stock host. The virtual smart-card driver
+  compiles its slot count in — upstream ships two — while a module needs three readers, one per
+  logical channel, so the third had no socket behind it and its bridge thread dialled a port
+  pcscd never listened on. The installer now builds the driver with four slots, and the
+  orchestrator never requests more than the installed driver reports, so a host that skips or
+  fails that build degrades to two working channels instead of one permanently dead one.
+- Stopped the `vsmartcard-vpcd` package's own reader definition from taking the port this
+  gateway gives a cellular module. Both used vpcd's default, only one could bind it, and
+  directory order decided which — so on some hosts every module reader vanished while two
+  phantom "Virtual PCD" devices appeared. The packaged definition is parked as a dot file
+  (installer and every orchestrator pass, so a package reinstall cannot bring it back) and
+  module readers now start well below the ephemeral port range. Saved ports on the old base
+  are migrated, and a module whose port moved gets its bridge respawned.
+- Kept a module's SIM reachable while VoWiFi is off. The card bridge used to follow the
+  VoWiFi switch, but reading the SIM is what lets a line exist in the first place and the
+  switch stays disabled until one does — a fresh module could never be provisioned, and
+  turning VoWiFi off to run an eSIM operation emptied the reader instead. Bridges now follow
+  the hardware: every connected module has one.
+- Stopped reporting "this card is not an eUICC" for a reader that simply holds no card, and
+  added `install.sh diagnose`: one masked report covering reader definitions, live readers,
+  bridges, sockets, orchestrator state and an lpac read per module reader.
+- A VPCD slot that pcscd never opens a socket for no longer writes a log line every second for
+  as long as the bridge runs. A reader can expose fewer slots than the modem offers, so this is
+  a normal steady state rather than an incident, and the unbounded repetition was a continuous
+  write stream on hosts whose storage is an SD card. Retries now back off to one minute and only
+  a changed reason is reported, so a genuinely broken slot stays visible without the repetition.
+- A modem that ModemManager declines to manage no longer costs VoWiFi as well. After three
+  minutes without a claim the bridge drives the serial port directly, so SIM access keeps
+  working; cellular data and flight mode stay unavailable because both need a ModemManager
+  modem. The device now reports that reason and a `direct-serial` VoWiFi backend instead of
+  rendering as an indefinite spinner with an empty error. Re-seating the modem retires the
+  verdict and lets ModemManager be tried again; the bridge holds the port exclusively, so
+  nothing else can hand it back automatically. A container is the common case here — the
+  Quectel QMI path needs a net port, and network interfaces belong to the host namespace.
+
+### Added
+
+- Added a route from the console to this project's issue tracker: a sidebar entry, and a prompt
+  beside the support-bundle download that asks for the bundle to be attached. Reporting a fault
+  previously meant finding the repository first, and the bundle — the one artefact that answers
+  most host-side questions on its own — was easy to miss.
+- Showed the repository's star count beside the console's Star link, abbreviated the way
+  GitHub abbreviates it. The count rides on the existing release check, so it inherits that
+  check's cache and proxy setting and the status endpoint every page load hits stays local.
+  A count that cannot be read is omitted rather than shown as zero.
+- Laid the messages allowance panel out as a scrollable six-column grid, so its fields stay on
+  one row instead of wrapping into a column on the message page's narrower card.
+- Added a host-side section to the redacted support bundle. The host orchestrator now publishes
+  the state only it can see — detected virtualization, whether the ModemManager unit is reported
+  active, the discovered modems and their ttys, VPCD port assignments, live bridge processes and
+  its own recent log — and the bundle carries it as `host-diagnostics-redacted.json`. When a tty
+  stays unclaimed, the bundle also records the ModemManager objects and their port lines, which
+  is exactly what the claim check matches against. A stopped or outdated orchestrator is
+  reported as unavailable rather than omitted, so silence is never mistaken for a healthy host.
+  Modem and SIM faults were previously diagnosable only by asking the operator to run commands
+  by hand.
 
 ## [1.3.5] - 2026-08-13
 
