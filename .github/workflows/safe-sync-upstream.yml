@@ -1,0 +1,177 @@
+name: Safe sync upstream
+
+on:
+  schedule:
+    # Every 12 hours at 03:17 and 15:17 China Standard Time.
+    - cron: "17 3,15 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: safe-sync-upstream
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPOSITORY: MddIdd/mdd-sim-gateway
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+  # Safety thresholds. The current fork has about 163 tracked files.
+  MIN_UPSTREAM_FILES: "100"
+  MAX_DELETED_FILES: "50"
+  MAX_DELETED_PERCENT: "15"
+  MIN_REMAINING_BYTES_PERCENT: "60"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the protected fork
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch and inspect upstream
+        id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+
+          # A deleted or private upstream cannot be fetched, so the fork stays intact.
+          if ! git ls-remote --exit-code upstream "refs/heads/${UPSTREAM_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Upstream is missing, private, or branch ${UPSTREAM_BRANCH} is unavailable. Sync blocked."
+            exit 1
+          fi
+
+          if ! git fetch --no-tags upstream "${UPSTREAM_BRANCH}"; then
+            echo "::error::Unable to fetch upstream. Sync blocked."
+            exit 1
+          fi
+
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          # Reject an upstream history replacement with no common ancestor.
+          if ! git merge-base HEAD "${upstream_ref}" >/dev/null 2>&1; then
+            echo "::error::Upstream history no longer shares a common ancestor. Sync blocked."
+            exit 1
+          fi
+
+          required_paths=(
+            "README.md"
+            "LICENSE"
+            "VERSION"
+            "install.sh"
+            "control"
+            "engine"
+            "host"
+            "webui"
+          )
+
+          for path in "${required_paths[@]}"; do
+            if ! git cat-file -e "${upstream_ref}:${path}" 2>/dev/null; then
+              echo "::error::Required upstream path disappeared: ${path}. Sync blocked."
+              exit 1
+            fi
+          done
+
+          current_files=$(git ls-tree -r --name-only HEAD | sed '/^$/d' | wc -l | tr -d ' ')
+          upstream_files=$(git ls-tree -r --name-only "${upstream_ref}" | sed '/^$/d' | wc -l | tr -d ' ')
+
+          tree_bytes() {
+            git ls-tree -r -l "$1" | awk '$4 ~ /^[0-9]+$/ { total += $4 } END { print total + 0 }'
+          }
+
+          current_bytes=$(tree_bytes HEAD)
+          upstream_bytes=$(tree_bytes "${upstream_ref}")
+
+          deleted_list="${RUNNER_TEMP}/upstream-deleted-files.txt"
+          git diff --find-renames=50% --diff-filter=D --name-only HEAD "${upstream_ref}" > "${deleted_list}"
+          deleted_files=$(wc -l < "${deleted_list}" | tr -d ' ')
+
+          if (( current_files > 0 )); then
+            deleted_percent=$(( deleted_files * 100 / current_files ))
+          else
+            deleted_percent=100
+          fi
+
+          if (( current_bytes > 0 )); then
+            remaining_bytes_percent=$(( upstream_bytes * 100 / current_bytes ))
+          else
+            remaining_bytes_percent=0
+          fi
+
+          {
+            echo "### Upstream safety report"
+            echo "| Check | Result |"
+            echo "|---|---:|"
+            echo "| Current tracked files | ${current_files} |"
+            echo "| Upstream tracked files | ${upstream_files} |"
+            echo "| Files deleted by upstream snapshot | ${deleted_files} (${deleted_percent}%) |"
+            echo "| Upstream size retained | ${remaining_bytes_percent}% |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          blocked=0
+
+          if (( upstream_files < MIN_UPSTREAM_FILES )); then
+            echo "::error::Upstream contains only ${upstream_files} files; minimum is ${MIN_UPSTREAM_FILES}."
+            blocked=1
+          fi
+
+          if (( deleted_files > MAX_DELETED_FILES )); then
+            echo "::error::Upstream would delete ${deleted_files} files; maximum is ${MAX_DELETED_FILES}."
+            blocked=1
+          fi
+
+          if (( deleted_percent > MAX_DELETED_PERCENT )); then
+            echo "::error::Upstream would delete ${deleted_percent}% of files; maximum is ${MAX_DELETED_PERCENT}%."
+            blocked=1
+          fi
+
+          if (( remaining_bytes_percent < MIN_REMAINING_BYTES_PERCENT )); then
+            echo "::error::Upstream retains only ${remaining_bytes_percent}% of the current repository size; minimum is ${MIN_REMAINING_BYTES_PERCENT}%."
+            blocked=1
+          fi
+
+          if (( blocked != 0 )); then
+            {
+              echo
+              echo "#### Deleted paths (first 100)"
+              echo '```text'
+              head -n 100 "${deleted_list}"
+              echo '```'
+              echo
+              echo "**Sync blocked; the fork was not changed.**"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+
+          echo "Safety checks passed."
+
+      - name: Merge safe upstream changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          if git merge-base --is-ancestor "${upstream_ref}" HEAD; then
+            echo "Fork is already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # A conflict stops the job before push, preserving the fork.
+          git merge --no-edit "${upstream_ref}"
+          git push origin "HEAD:${FORK_BRANCH}"
+
+          echo "Upstream changes merged into ${FORK_BRANCH}." >> "${GITHUB_STEP_SUMMARY}"
