@@ -113,6 +113,20 @@ class DeviceStateTests(unittest.TestCase):
         self.assertEqual(device_state.vpcd_modem_hardware_id(
             "SCR Prime CCID Reader (000000000001) 00 00"), "")
 
+    def test_the_packaged_virtual_pcd_endpoint_is_never_a_device(self):
+        """The vsmartcard package's own reader definition rendered as two phantom devices
+        that exist whether or not any hardware does. The installer disables the file, but a
+        package reinstall can restore it — the device list must not trust that."""
+        cards = [
+            {"name": "Virtual PCD 00 00", "hardware_kind": "reader", "present": True},
+            {"name": "Virtual PCD 00 01", "hardware_kind": "reader", "present": True},
+            {"name": "SCR Prime CCID Reader (000000000001) 00 00",
+             "hardware_kind": "reader", "reader_port": "1-1.5"},
+        ]
+        readers = device_state.native_reader_devices(cards)
+        self.assertEqual(len(readers), 1)
+        self.assertEqual(next(iter(readers.values()))["reader_port"], "1-1.5")
+
     def test_native_readers_exclude_orchestrator_vpcd_slots(self):
         cards = [
             {"name": "VoWiFi Modem 2c7c-0125-1-1.2 00 00", "hardware_kind": "reader"},
@@ -331,7 +345,7 @@ modem.3gpp.registration-state : unknown
         """Run one reconcile pass with the host calls stubbed out, returning the spawns."""
         processes = []
 
-        def spawn(command):
+        def spawn(command, **kwargs):
             process = self.Process(command)
             processes.append(process)
             return process
@@ -514,7 +528,7 @@ modem.3gpp.registration-state : unknown
             modems = [{"id": "a", "name": "A", "tty": "/dev/ttyUSB2"}]
             commands = []
 
-            def spawn(command):
+            def spawn(command, **kwargs):
                 commands.append(command)
                 return SimpleNamespace(poll=lambda: None, pid=7)
 
@@ -554,7 +568,7 @@ modem.3gpp.registration-state : unknown
             app.root.mkdir(parents=True)
             commands = []
 
-            def spawn(command):
+            def spawn(command, **kwargs):
                 commands.append(command)
                 return SimpleNamespace(poll=lambda: None, pid=9)
 
@@ -593,7 +607,7 @@ modem.3gpp.registration-state : unknown
                     patch("host.mdd_orchestrator.run",
                           return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
                     patch("host.mdd_orchestrator.subprocess.Popen",
-                          side_effect=lambda command: commands.append(command) or
+                          side_effect=lambda command, **kwargs: commands.append(command) or
                           SimpleNamespace(poll=lambda: None, pid=9)), \
                     patch.dict("os.environ",
                                {"MDD_VPCD_READER_CONFIG": str(root / "readers.conf")}):
@@ -617,6 +631,195 @@ modem.3gpp.registration-state : unknown
                 self.assertEqual(app.driver_slots(), mdd_orchestrator.VPCD_PACKAGED_SLOTS)
                 drivers.joinpath(".mdd-vpcd-slots-4").touch()
                 self.assertEqual(app.driver_slots(), 4)
+
+    def test_a_logged_refusal_skips_the_remaining_grace_period(self):
+        """ModemManager writes its refusal to its own journal. Waiting the full grace
+        period after that is on record costs an affected host three minutes of dead air
+        on every boot, forever."""
+        def fake_run(args, **kwargs):
+            if args[:2] == ["mmcli", "-L"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[0] == "journalctl":
+                return SimpleNamespace(returncode=0, stdout=(
+                    "couldn't create modem for device '/sys/devices/pci0000:00/usb3/"
+                    "3-4/3-4.1': Failed to find a net port in the QMI modem\n"), stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modems = [{"id": "a", "name": "A", "tty": "/dev/ttyUSB2", "usb_path": "3-4.1"}]
+            commands = []
+
+            with patch.object(app, "usb_modems", return_value=modems), \
+                    patch("host.mdd_orchestrator.run", side_effect=fake_run), \
+                    patch("host.mdd_orchestrator.subprocess.Popen",
+                          side_effect=lambda command, **kwargs: commands.append(command) or
+                          SimpleNamespace(poll=lambda: None, pid=9)), \
+                    patch.dict("os.environ",
+                               {"MDD_VPCD_READER_CONFIG": str(root / "readers.conf")}):
+                desired = {"hardware": {"auto_detect": True}}
+                wanted = {"a": {"vowifi_enabled": True}}
+                # First cycle: unclaimed, no evidence yet — waits, and captures the journal.
+                app.reconcile_hardware(desired, wanted, through_modemmanager=True)
+                self.assertEqual(commands, [])
+                self.assertTrue(app._claim_evidence.get("modemmanager_journal"))
+                # Second cycle: the refusal is on record — degrades without the 180s wait.
+                app.reconcile_hardware(desired, wanted, through_modemmanager=True)
+
+            self.assertIn("a", app.bridges)
+            self.assertNotIn("--modemmanager", commands[0])
+            self.assertIn("a", app._degraded)
+
+    def test_a_crashing_bridge_backs_off_and_tells_the_truth(self):
+        """A bridge that dies on spawn used to be respawned every cycle while device
+        status reported each fresh corpse as a running bridge."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modems = [{"id": "a", "name": "A", "tty": "/dev/ttyUSB2"}]
+            spawned = []
+
+            def spawn(command, **kwargs):
+                spawned.append(command)
+                return SimpleNamespace(poll=lambda: 1, returncode=1, pid=9)
+
+            with patch.object(app, "usb_modems", return_value=modems), \
+                    patch("host.mdd_orchestrator.run",
+                          return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+                    patch("host.mdd_orchestrator.subprocess.Popen", side_effect=spawn), \
+                    patch.dict("os.environ",
+                               {"MDD_VPCD_READER_CONFIG": str(root / "readers.conf")}):
+                desired = {"hardware": {"auto_detect": True}}
+                wanted = {"a": {"vowifi_enabled": True}}
+                app.reconcile_hardware(desired, wanted)          # spawns, process is dead
+                # What the child wrote before dying; the spawn truncated the previous file.
+                app._bridge_stderr_path("a").write_text(
+                    "Traceback (most recent call last):\nOSError: [Errno 71] Protocol error\n")
+                app.reconcile_hardware(desired, wanted)          # notices, records, gates
+                self.assertEqual(len(spawned), 1, "no instant respawn inside the backoff")
+                self.assertEqual(app._bridge_failures["a"]["count"], 1)
+                self.assertIn("Errno 71", app._bridge_failures["a"]["reason"])
+
+                # Backoff elapsed: one more attempt is allowed, then the gate closes again.
+                app._bridge_failures["a"]["at"] -= 3600
+                app.reconcile_hardware(desired, wanted)
+                app._bridge_stderr_path("a").write_text(
+                    "OSError: [Errno 71] Protocol error\n")
+                app.reconcile_hardware(desired, wanted)
+                self.assertEqual(len(spawned), 2)
+
+                app.publish_device_status(wanted, {"a": {**modems[0], "base_port": 15360}})
+            document = device_state._read(str(app.device_status_path), {})["devices"]["a"]
+            self.assertFalse(document["actual"]["vowifi_bridge_active"])
+            self.assertIn("keeps exiting", document["error"])
+            self.assertIn("Errno 71", document["error"])
+
+    def test_a_freshly_respawned_bridge_only_counts_once_it_survives_the_settle_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=True)
+            app.root.mkdir(parents=True)
+            app.bridges["a"] = SimpleNamespace(poll=lambda: None, pid=9)
+            app._bridge_started["a"] = time.time()
+            app._bridge_failures["a"] = {"count": 2, "at": time.time(), "reason": "x",
+                                         "returncode": 1, "uptime": 0.1}
+            stub = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("host.mdd_orchestrator.run", return_value=stub):
+                app.publish_device_status({"a": {"vowifi_enabled": True}},
+                                      {"a": {"id": "a", "name": "A", "tty": "/dev/x",
+                                             "base_port": 15360}})
+                fresh = device_state._read(str(app.device_status_path), {})["devices"]["a"]
+                self.assertFalse(fresh["actual"]["vowifi_bridge_active"])
+
+                app._bridge_started["a"] = time.time() - 10
+                app.publish_device_status({"a": {"vowifi_enabled": True}},
+                                          {"a": {"id": "a", "name": "A", "tty": "/dev/x",
+                                                 "base_port": 15360}})
+            settled = device_state._read(str(app.device_status_path), {})["devices"]["a"]
+            self.assertTrue(settled["actual"]["vowifi_bridge_active"])
+
+    def test_modemmanager_stands_down_once_it_has_refused_every_modem(self):
+        """Without a modem object ModemManager provides nothing, but its probes share the
+        AT ports with the direct bridges and corrupt SIM channel allocation. Field log: a
+        bridge read the reply to ModemManager's own +QGPS probe where its +CSIM answer
+        should have been."""
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            plan = Orchestrator.capability_plan({"a": {"vowifi_enabled": True},
+                                                "b": {"vowifi_enabled": True}})
+            # Refused only one of two: the healthy modem still needs the backend.
+            app._degraded = {"a": "refused"}
+            self.assertTrue(app.cellular_backend_needed(plan, {"a", "b"}, {}))
+            # Refused both, nobody wants cellular: stand down.
+            app._degraded = {"a": "refused", "b": "refused"}
+            self.assertFalse(app.cellular_backend_needed(plan, {"a", "b"}, {}))
+            # An operator turning cellular on brings it back — that request must fail
+            # visibly through ModemManager, not be silently pre-empted here.
+            wants = Orchestrator.capability_plan({"a": {"vowifi_enabled": True,
+                                                        "cellular_enabled": True},
+                                                 "b": {"vowifi_enabled": True}})
+            self.assertTrue(app.cellular_backend_needed(wants, {"a", "b"}, {}))
+            # No modems at all: nothing to run a backend for.
+            self.assertFalse(app.cellular_backend_needed(
+                Orchestrator.capability_plan({}), set(), {}))
+
+    def test_configured_serial_mode_outranks_everything(self):
+        """An explicit VoWiFi-only configuration keeps ModemManager down even when a
+        stale desired flag still asks for cellular: with the backend disabled the UI
+        presents cellular as unsupported, so nothing may resurrect it."""
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            wants = Orchestrator.capability_plan(
+                {"a": {"vowifi_enabled": True, "cellular_enabled": True}})
+            serial = {"modem_backend": "serial"}
+            self.assertFalse(app.cellular_backend_needed(wants, {"a"}, serial))
+            self.assertTrue(app.cellular_backend_needed(wants, {"a"}, {}))
+            self.assertTrue(app.cellular_backend_needed(
+                wants, {"a"}, {"modem_backend": "auto"}))
+
+    def test_serial_mode_publishes_cellular_as_unsupported_capability(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=True)
+            app.root.mkdir(parents=True)
+            app._serial_mode = True
+            app.bridges["a"] = SimpleNamespace(poll=lambda: None, pid=9)
+            app._bridge_started["a"] = time.time() - 60
+            stub = SimpleNamespace(returncode=1, stdout="", stderr="")
+            with patch("host.mdd_orchestrator.run", return_value=stub):
+                app.publish_device_status(
+                    {"a": {"vowifi_enabled": True}},
+                    {"a": {"id": "a", "name": "A", "tty": "/dev/x", "base_port": 15360}})
+            document = device_state._read(str(app.device_status_path), {})
+            device = document["devices"]["a"]
+            self.assertFalse(device["actual"]["cellular_supported"])
+            self.assertEqual(device["actual"]["vowifi_backend"], "direct-serial")
+            self.assertEqual(document["shared"]["modem_backend"], "serial")
+            self.assertEqual(document["shared"]["cellular_backend"],
+                             "disabled-by-configuration")
+
+    def test_standing_down_skips_the_modem_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            app.obsolete_services_retired = True
+            calls = []
+            stub = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("host.mdd_orchestrator.run",
+                       side_effect=lambda args, **k: calls.append(args) or stub), \
+                    patch.object(app, "service_active", return_value=True), \
+                    patch.object(app, "stop_bridges"), \
+                    patch.object(app, "reset_modems_after_cellular") as reset, \
+                    patch("host.mdd_orchestrator.time.sleep"):
+                app.apply_cellular_backend(False, reset_modems=False)
+                reset.assert_not_called()
+                self.assertIn(["systemctl", "stop", "ModemManager.service"], calls)
+
+                app.apply_cellular_backend(False)
+                reset.assert_called_once()
 
     def test_replug_retires_the_degraded_verdict(self):
         with tempfile.TemporaryDirectory() as temp:

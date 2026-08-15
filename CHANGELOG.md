@@ -2,6 +2,67 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.3.10] - 2026-08-16
+
+### Added
+
+- Added a VoWiFi-only mode switch to System settings (default off). Enabled, ModemManager
+  never runs and every SIM bridge drives its modem's serial port directly: VoWiFi keeps
+  working, while cellular data, flight mode and cellular SMS/calls are presented as
+  unsupported rather than forever starting. This is for hosts — virtual machines, containers —
+  where ModemManager's modem objects are unstable: on such a host its periodic loss of a
+  modem object severed SIM access mid-tunnel even though the serial port never went away.
+  Flipping the switch restarts the card path once (about thirty seconds) and is confirmed
+  before it applies; the ModemManager unit is disabled while the mode is on so a reboot does
+  not start, stop and reset the modems on every boot.
+- The redacted support bundle now answers the card-path questions that previously cost a
+  support round trip each: the exact command every SIM bridge runs and its recent output
+  (bridge output now lands in per-modem files that survive journal rotation), whether pcscd
+  is actually listening on each assigned virtual-reader port (read from /proc/net/tcp — a
+  probe connection could hijack a reader slot, a file cannot), the reader-definition
+  directory listing, the configured modem backend, and the live reader list as pcscd exposes
+  it. `install.sh diagnose` keeps its role for active probing (per-reader lpac reads) and
+  now includes the bridge log files as well.
+
+## [1.3.9] - 2026-08-15
+
+### Fixed
+
+- ModemManager is stood down once it has refused every present modem and no device asks for
+  cellular. Without a modem object it provides nothing — data, flight mode and cellular SMS all
+  need one — but its periodic probes still opened the same AT ports the direct bridges hold,
+  and the interleaved traffic corrupted SIM channel allocation: a bridge would read the reply
+  to ModemManager's own probe where its +CSIM answer should have been, and only allocate
+  channels in the gap between probes. Standing it down skips the modem reset (it never owned
+  the modems) so the refusal verdicts survive. Enabling cellular on any device brings it back,
+  refusals notwithstanding: that request must fail visibly, not be silently pre-empted.
+  ModemManager-managed deployments are unaffected — the stand-down requires a recorded refusal
+  for every present modem.
+
+## [1.3.8] - 2026-08-15
+
+### Fixed
+
+- The serial fallback acts on ModemManager's own refusal instead of waiting it out. When
+  ModemManager has logged that it cannot create a modem for this hardware, the bridge takes the
+  serial port at once; the three-minute grace period remains only for hosts whose journal says
+  nothing. An affected host previously paid the full wait on every boot.
+- Opening the modem's AT port tolerates absent modem-control lines. pyserial raises DTR and RTS
+  as part of open with no way to opt out, and on virtualised USB passthrough that control
+  transfer can fail — which killed the bridge for two lines an AT channel never uses. Unrelated
+  errors still fail loudly.
+- A bridge that keeps dying is now visible and paced. Its exits are recorded with the exception
+  it wrote on the way down, respawns back off exponentially to ten minutes, and the device error
+  names the count and reason. Status no longer reports a just-respawned process as a running
+  bridge while it crash-loops, and a bridge that runs stably lives its failure history down.
+- The pcsc-lite source build works on a fresh Debian 13 host: meson resolves its systemd
+  dependency through systemd.pc, which trixie moved into the new systemd-dev package.
+- `install.sh diagnose` no longer filters the one line that names a crashed bridge's exception
+  out of its own report; traceback context is kept.
+- The packaged "Virtual PCD" reader definition can no longer reappear as phantom devices even
+  if a package reinstall restores the file the installer disables: the device list drops that
+  endpoint on its own.
+
 ## [1.3.7] - 2026-08-14
 
 ### Fixed

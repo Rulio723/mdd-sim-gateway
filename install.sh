@@ -436,7 +436,13 @@ ensure_pcscd() {
     # Install the CCID USB driver from the distro (its IFDHandler ABI is stable across pcscd
     # 2.x, so the distro driver works with our source-built pcscd), plus build deps.
     info "host pcscd is '${installed_ver:-none}', pinning to $PCSC_VERSION (building from source)…"
-    if   have apt-get; then pkg_install libccid libudev-dev libsystemd-dev meson ninja-build flex pkg-config gcc wget ca-certificates
+    if   have apt-get; then
+      pkg_install libccid libudev-dev libsystemd-dev meson ninja-build flex pkg-config gcc wget ca-certificates
+      # Debian 13 split systemd.pc out of the systemd package into systemd-dev, and that
+      # file is what meson's dependency('systemd') resolves. Without it the pcsc-lite build
+      # stops at "Dependency systemd found: NO". Older releases have no such package and
+      # ship the file with systemd itself, so its absence must not fail the install.
+      apt-get install -y systemd-dev >/dev/null 2>&1 || true
     elif have dnf || have yum; then pkg_install ccid systemd-devel meson ninja-build flex pkgconf-pkg-config gcc perl-podlators wget
     elif have pacman;  then pkg_install ccid meson ninja flex pkgconf gcc wget
     elif have zypper;  then pkg_install pcsc-ccid systemd-devel meson ninja flex pkg-config gcc wget
@@ -1296,10 +1302,23 @@ cmd_diagnose() {
     printf '\n'
   done
 
+  diag_section "Bridge process logs (masked)"
+  # Since 1.3.10 bridge stdout/stderr land in per-modem files rather than the journal, so
+  # the activity trail survives journald rotation and reaches the support bundle.
+  for bridge_log in "$MDD_DATA_DIR"/orchestrator/bridge-*.log; do
+    [ -f "$bridge_log" ] || continue
+    printf -- '--- %s ---\n' "$(basename "$bridge_log")"
+    tail -40 "$bridge_log" | diag_redact
+  done
+
   diag_section "Orchestrator log (card path, masked)"
   if have journalctl; then
+    # -A6 keeps the exception line under a traceback header: the header paths matched the
+    # filter but the one line that names the error did not, and a whole support round trip
+    # was spent recovering exactly that line by hand.
     journalctl -u mdd-sim-gateway-orchestrator -n 400 --no-pager 2>/dev/null \
-      | grep -Ei 'bridge|vpcd|reader|channel|modemmanager' | tail -60 | diag_redact || printf '(nothing matched)\n'
+      | grep -Ei -A6 'bridge|vpcd|reader|channel|modemmanager|traceback|error' \
+      | tail -80 | diag_redact || printf '(nothing matched)\n'
   else
     printf '(journalctl unavailable)\n'
   fi
