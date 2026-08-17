@@ -530,13 +530,41 @@ export function NotificationsPage({ showToast }) {
 }
 
 export function SystemPage({ showToast, openUpdateDialog }) {
-  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [update,setUpdate]=useState(null); const [checking,setChecking]=useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''})
+  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [update,setUpdate]=useState(null); const [checking,setChecking]=useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null)
   const loadStatus = () => api.systemStatus().then(setStatus).catch(() => setStatus(null))
   useEffect(() => { api.settings().then(setS).catch(() => setS({ tls: {}, retry: {}, rekey: {}, security: {}, device_defaults: {}, updates: { proxy_mode: 'auto' }, proxy: { profiles: {}, exits: {} } })); loadStatus() }, [])
+  useEffect(() => {
+    if (!restarting) return
+    let stop = false, wentDown = false
+    const tick = async () => {
+      if (stop) return
+      try {
+        // The API going away IS the restart happening; from then on the only question is when
+        // it answers again. Until then the orchestrator's document is what can report failure.
+        if (wentDown) { await api.authStatus(); window.location.reload(); return }
+        const progress = await api.restartProgress()
+        if (['failed', 'stalled'].includes(progress.state)) {
+          setRestarting(null); showToast(t(progress.error_code || 'restart.error.failed')); return
+        }
+        if (progress.state === 'success') { setRestarting(null); showToast(t('Operation completed')); return }
+      } catch (err) { wentDown = true }
+      setTimeout(tick, 3000)
+    }
+    const timer = setTimeout(tick, 2000)
+    return () => { stop = true; clearTimeout(timer) }
+  }, [restarting, showToast, t])
   if (!s) return <p>{t('Loading')}…</p>
   const tabs = [['general', t('General')], ['web', t('Web access')], ['voice', t('Calls & VoWiFi')], ['security', t('Security')], ['backup', t('Backup & updates')], ['maintenance', t('Maintenance')]]
   const save = async () => { try { const saved = await api.saveSettings(s); setS(saved); showToast(t('Saved')) } catch (e) { showToast(e.message) } }
   const action = async name => { try { const result = name === 'backup' ? await api.createBackup() : await api.maintenance(name); showToast(result.ok ? t('Operation completed') : t('Operation completed with errors')); loadStatus() } catch (e) { showToast(e.message) } }
+  const restart = async scope => {
+    if (!window.confirm(t(`restart.confirm.${scope}`))) return
+    try {
+      const result = await api.maintenance(`restart_${scope}`)
+      if (result?.ok === false) { showToast(t(result.error_code || result.error)); return }
+      setRestarting(scope)
+    } catch (e) { showToast(e.message) }
+  }
   const checkUpdate=async()=>{setChecking(true);try{const result=await api.checkUpdate(true);setUpdate(result);showToast(result.update_available?t('Update available'):(result.ok?t('Already up to date'):t(result.error_code||result.error)))}catch(e){showToast(e.message)}finally{setChecking(false)}}
   const changePassword=async()=>{if(passwordForm.next!==passwordForm.confirm){showToast(t('Passwords do not match'));return}try{await api.authPassword(passwordForm.current,passwordForm.next);window.location.reload()}catch(e){showToast(e.message)}}
   return <div className="u-page"><div className="u-tabs">{tabs.map(([k, l]) => <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{l}</button>)}</div><div className="card u-panel">
@@ -564,7 +592,17 @@ export function SystemPage({ showToast, openUpdateDialog }) {
       {update&&!update.ok&&<p className="u-error">{t(update.error_code||update.error)}</p>}
       {(status?.backups || []).map(item => <div className="u-detail" key={item.name}><span>{item.name}</span><b>{formatBytes(item.size)} · {new Date(item.created_at * 1000).toLocaleString()}</b></div>)}
     </>}
-    {tab === 'maintenance' && <><h2>{t('Maintenance')}</h2><div className="u-action-grid"><button className="btn btn-ghost" onClick={() => action('restart_lines')}>{t('Restart all VoWiFi lines')}</button><button className="btn btn-ghost" onClick={() => action('refresh_egress')}>{t('Refresh country exits')}</button><button className="btn btn-ghost" onClick={() => action('clear_notification_history')}>{t('Clear notification history')}</button></div></>}
+    {tab === 'maintenance' && <><h2>{t('Maintenance')}</h2>
+      <div className="u-action-grid"><button className="btn btn-ghost" onClick={() => action('restart_lines')}>{t('Restart all VoWiFi lines')}</button><button className="btn btn-ghost" onClick={() => action('refresh_egress')}>{t('Refresh country exits')}</button><button className="btn btn-ghost" onClick={() => action('clear_notification_history')}>{t('Clear notification history')}</button></div>
+      <h3>{t('Restart')}</h3>
+      <p className="u-note">{t('Ordered by how much they interrupt: the control plane can be restarted without touching a call, the host cannot.')}</p>
+      <div className="u-action-grid">
+        <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('control')}>{t('Restart the control plane')}</button>
+        <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('services')}>{t('Restart all gateway services')}</button>
+        <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('host')}>{t('Restart the host')}</button>
+      </div>
+      {restarting && <p className="u-note u-restart-note">{t(`restart.waiting.${restarting}`)}</p>}
+    </>}
   </div>{!['backup', 'maintenance'].includes(tab) && <button className="btn btn-primary" onClick={save}>{t('Save')}</button>}</div>
 }
 

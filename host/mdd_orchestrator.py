@@ -290,7 +290,12 @@ BRIDGE_RETRY_BASE_SECONDS = 15.0
 BRIDGE_RETRY_CEILING_SECONDS = 600.0
 BRIDGE_STABLE_SECONDS = 60.0
 BRIDGE_SETTLE_SECONDS = 5.0
+# Grace between publishing "launching" and expecting systemd to report the updater unit as
+# active, so a loop pass that races a launch cannot retire the run it just started.
+UPDATE_LAUNCH_GRACE_SECONDS = 90.0
 COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "172.17.0.1")
+# The control plane's container in docker installs; install.sh owns the same name.
+CONTROL_CONTAINER = "mdd-sim-gateway-control"
 COUNTRY_PROXY_PORT_BASE = int(os.environ.get("MDD_COUNTRY_PROXY_PORT_BASE", "22000"))
 
 
@@ -785,6 +790,108 @@ class Orchestrator:
                       "--repository", repository, "--network-config", str(network_path)])
         if result.returncode != 0:
             fail(f"systemd-run failed: {(result.stderr or result.stdout or '').strip()}")
+
+    def process_service_restart_request(self):
+        """Restart the gateway's own services, or the host, when the control plane asks.
+
+        The control plane is unprivileged and is itself restarted in every scope, so it can
+        only state the intent.  ``control`` is safe to run inline — it does not touch this
+        process, so the SIM bridges and engine containers stay up — while ``services``
+        restarts this very process and has to outlive it in a transient unit, the way
+        self-updates do.
+        """
+        request_path = self.root / "service-restart-request.json"
+        request = read_json(request_path)
+        if not request:
+            return
+        try:
+            request_path.unlink()
+        except OSError:
+            pass
+        status_path = self.root / "service-restart-status.json"
+        scope = str(request.get("scope") or "")
+
+        def publish(state: str, **fields):
+            atomic_json(status_path, {"state": state, "scope": scope,
+                                      "updated_at": int(time.time()), **fields})
+
+        if scope not in {"control", "services", "host"}:
+            publish("failed", error_code="restart.error.invalid_scope")
+            return
+        if self.dry_run:
+            publish("failed", error_code="restart.error.dry_run")
+            return
+        publish("running")
+        self.log(f"restarting on request: scope={scope}")
+        if scope == "control":
+            mode = (self.data / "install-mode").read_text(encoding="utf-8").strip().lower() \
+                if (self.data / "install-mode").is_file() else "local"
+            command = ["docker", "restart", CONTROL_CONTAINER] if mode == "docker" \
+                else ["systemctl", "restart", "mdd-sim-gateway-control"]
+            result = run(command)
+            if result.returncode:
+                publish("failed", error_code="restart.error.failed",
+                        error=(result.stderr or result.stdout or "").strip()[:400])
+            else:
+                publish("success")
+            return
+        if scope == "host":
+            # systemd owns the shutdown from here; this process is torn down with everything
+            # else, so there is no completion to publish.
+            result = run(["systemctl", "reboot"])
+            if result.returncode:
+                publish("failed", error_code="restart.error.failed",
+                        error=(result.stderr or result.stdout or "").strip()[:400])
+            return
+        run(["systemctl", "reset-failed", "mdd-sim-gateway-restart.service"])
+        result = run(["systemd-run", "--unit", "mdd-sim-gateway-restart", "--collect",
+                      "--description", "MDD Sim Gateway service restart",
+                      "sh", str(self.repo / "install.sh"), "restart"])
+        if result.returncode:
+            publish("failed", error_code="restart.error.launch",
+                    error=(result.stderr or result.stdout or "").strip()[:400])
+
+    def settle_service_restart(self):
+        """Close out a restart that could not report its own completion.
+
+        ``services`` restarts this process and ``host`` takes the machine down, so neither can
+        publish a result — this process running again *is* the result. Without this the
+        document stays "running" forever, which is the very thing this release removes from
+        the update path.
+        """
+        status_path = self.root / "service-restart-status.json"
+        status = read_json(status_path)
+        if status.get("state") == "running" and status.get("scope") in {"services", "host"}:
+            atomic_json(status_path, {**status, "state": "success",
+                                      "updated_at": int(time.time())})
+
+    def reap_abandoned_update(self):
+        """Retire a progress document whose updater no longer exists.
+
+        An updater killed mid-flight — the host rebooted or lost power, the transient unit was
+        stopped, the process was OOM-killed — cannot record its own death, so the document it
+        was publishing to stays "running" and the WebUI resumes into that dead progress view on
+        every visit until someone deletes the file over SSH.  systemd knows what the document
+        cannot say: with no request waiting to be launched and no updater unit left, the run is
+        over.  The failure keeps the stage and asset it died on, which is the useful part.
+        """
+        if self.dry_run:
+            return
+        status_path = self.root / "update-status.json"
+        status = read_json(status_path)
+        if status.get("state") != "running":
+            return
+        if (self.root / "update-request.json").is_file():
+            return  # queued for process_update_request(); no unit is expected yet
+        if time.time() - int(status.get("updated_at") or 0) < UPDATE_LAUNCH_GRACE_SECONDS:
+            return
+        if self.service_active("mdd-sim-gateway-update.service"):
+            return
+        # Only the code is published: the WebUI renders it in the operator's language, and an
+        # `error` string beside it would just repeat the same sentence in English.
+        atomic_json(status_path, {**status, "state": "failed", "updated_at": int(time.time()),
+                                  "error_code": "update.error.abandoned"})
+        self.log(f"retired an abandoned update at phase {status.get('phase') or 'unknown'}")
 
     def publish_device_status(self, desired_devices: dict, assignments: dict,
                               *, transitioning=False, error="", disruption=None,
@@ -2599,8 +2706,13 @@ class Orchestrator:
 
     def loop(self):
         self.root.mkdir(parents=True, exist_ok=True)
+        # Runs once, before the first pass: a restart that took this process with it can only
+        # be completed by the process that comes back.
+        self.settle_service_restart()
         while not self.stop:
             self.process_update_request()
+            self.reap_abandoned_update()
+            self.process_service_restart_request()
             self.process_bridge_restart_requests()
             self.retire_obsolete_services()
             self.reconcile_timezone()

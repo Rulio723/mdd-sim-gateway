@@ -331,5 +331,49 @@ class LineDiagnosticsTests(unittest.TestCase):
         self.assertIn("no status sampled", entry["note"])
 
 
+class ServiceRestartTests(unittest.TestCase):
+    """The control plane states the intent; the root orchestrator carries it out."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = patch.object(config, "DATA_DIR", self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.root = Path(self.tmp.name, "orchestrator")
+
+    def test_a_request_is_published_privately_for_each_supported_scope(self):
+        for scope in operations.SERVICE_RESTART_SCOPES:
+            self.assertTrue(operations.request_service_restart(scope)["ok"])
+            request = json.loads((self.root / "service-restart-request.json").read_text())
+            self.assertEqual(request["scope"], scope)
+            # The status is reset with the request so the previous restart's outcome cannot be
+            # read as this one's while the orchestrator is still picking it up.
+            status = json.loads((self.root / "service-restart-status.json").read_text())
+            self.assertEqual(status, {"state": "requested", "scope": scope,
+                                      "updated_at": request["requested_at"]})
+            self.assertEqual(
+                (self.root / "service-restart-request.json").stat().st_mode & 0o777, 0o600)
+
+    def test_an_unknown_scope_publishes_nothing(self):
+        result = operations.request_service_restart("reformat")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "restart.error.invalid_scope")
+        self.assertFalse((self.root / "service-restart-request.json").exists())
+
+    def test_a_request_nothing_consumes_is_reported_instead_of_waited_on(self):
+        operations.request_service_restart("control")
+        self.assertEqual(operations.service_restart_status()["state"], "requested")
+        request_path = self.root / "service-restart-request.json"
+        request_path.write_text(json.dumps({"scope": "control",
+                                            "requested_at": int(time.time()) - 300}))
+        status = operations.service_restart_status()
+        self.assertEqual(status["state"], "stalled")
+        self.assertEqual(status["error_code"], "restart.error.not_picked_up")
+
+    def test_no_request_and_no_history_reads_as_idle(self):
+        self.assertEqual(operations.service_restart_status()["state"], "idle")
+
+
 if __name__ == "__main__":
     unittest.main()

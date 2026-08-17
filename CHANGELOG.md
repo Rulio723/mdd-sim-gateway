@@ -4,6 +4,80 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Added a read-only USB passthrough diagnostic for gateways running inside a Proxmox VM. The
+  support bundle answers the card-path questions from inside the gateway, but a VM cannot see
+  the layer above it: when passthrough breaks the guest only observes that the modem is gone,
+  while the reason lives in the host's USB and QEMU state. The script runs on either side —
+  host mode queries `qm status`, the passthrough-relevant config lines, host USB topology and a
+  scripted read-only `info usbhost` / `info usb` monitor snapshot; guest mode covers device
+  nodes, bound drivers, service state, kernel events and the live bridge and VPCD listeners —
+  so the two reports can be compared. It refuses host mode without an explicit VM id, because a
+  report about the wrong VM is worse than no report, and masks IMSI/ICCID/IMEI-shaped digit runs
+  by default since the report is meant to be shared.
+
+## [1.3.13] - 2026-08-17
+
+### Added
+
+- Maintenance can restart the gateway, in three scopes ordered by what they interrupt: the
+  control plane alone (the page drops for a few seconds; SIM bridges, engine containers and
+  calls in progress are untouched), all gateway services (the control plane and the
+  orchestrator together, which rebuilds every SIM bridge and re-registers the lines), and the
+  host itself. Each states what it will cost before it runs. The control plane can carry out
+  none of them — it is unprivileged and is itself restarted in every scope — so it publishes
+  the request and the root orchestrator performs it, detaching into a transient systemd unit
+  whatever would otherwise kill the process running it. A request nothing picks up within a
+  minute is reported as such instead of leaving the page waiting for a restart that will never
+  come, and the two scopes that take the orchestrator with them — which therefore cannot report
+  their own completion — are closed out by the orchestrator when it comes back, so no restart
+  leaves a document stuck on "running" either.
+
+### Fixed
+
+- A line no longer authenticates against another line's SIM. A reader binding names a slot —
+  by PC/SC name, USB port or index — and says nothing about which SIM sits in it; when a line
+  opened its sibling's card the only symptom was `SW=9862` from the carrier's AKA challenge,
+  byte for byte what an ePDG returns when it genuinely rejects a subscriber. The freeze was
+  therefore charged to the exit node and the line rebuilt every few minutes while the actual
+  fault went unmentioned. EF.ICCID needs no PIN, so the card identifies itself before anything
+  else touches it: the PIN keeper, the AMI USIM worker and the SWu/IKE worker each refuse a
+  card that is provably not the line's and name both ICCIDs. Only an ICCID actually read
+  convicts a reader — an unreadable EF.ICCID is a transient card fault, not evidence of a swap.
+  The control plane classifies this as a local card fault before the exit policy sees it, so a
+  binding mix-up can no longer cost a healthy exit node its place.
+- A drifted PC/SC reader name is no longer treated as a fault by itself. The USB-port binding
+  exists precisely so a line keeps opening the reader that physically holds its SIM after
+  pcscd renames or re-enumerates it, so "opened name != stored name" is a normal state — and
+  one the ICCID check already settles. Reporting it held the line forever and silently
+  disabled exit failover for it, so a line whose real problem was its exit could never move
+  off a bad node while the UI blamed the binding. The name is now consulted only when the card
+  will not identify itself, which is the case it was added for.
+- `SW=9862` is described by what the host can actually see. A mix-up is physically impossible
+  with a single SIM present, where 9862 is the carrier rejecting that SIM's key material —
+  provisioning or subscription, not hardware. Holding is still correct either way, and an
+  unreadable card cache falls back to the cautious plural reading instead of asserting a
+  single-SIM host that may not be one.
+- An interrupted update no longer leaves the update dialog spinning forever. An updater killed
+  mid-flight — the host rebooted or lost power, its transient unit was stopped, the process was
+  OOM-killed — cannot record its own death, so the progress document it was publishing to
+  stayed "running" and the dialog resumed into that dead progress view on every visit, counting
+  up for days, with no way out but deleting the file over SSH. The orchestrator now retires a
+  run whose updater unit no longer exists, keeping the stage and asset it died on; the control
+  plane stops treating a document nothing has refreshed as proof of a live update, so the
+  dialog offers the update again instead of resuming it; and a run that goes quiet while the
+  dialog is open can be dismissed from the dialog itself.
+- A download in progress now says how far along it is. The progress bar was only drawn once a
+  byte had arrived and the updater published no byte counts until its first heartbeat, so a
+  transfer that was stuck — curl working through its connect retries — presented as a file
+  name and a climbing clock, indistinguishable from one running normally. The bar is drawn
+  from the first poll, at zero bytes included, alongside the transferred and total size, the
+  rate and an estimate of the time left. The rate is measured over the recent window instead
+  of averaged since the start, so a slow beginning no longer depresses the estimate for the
+  rest of the transfer, and a Release whose size the update check never returned gets an
+  indeterminate bar rather than a countdown that would be a guess.
+
 ## [1.3.12] - 2026-08-17
 
 ### Added

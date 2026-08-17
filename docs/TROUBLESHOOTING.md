@@ -95,4 +95,52 @@ sudo systemctl restart docker
 - VM 带直通运行期间，宿主机上**不要** `modprobe option` 或访问那些串口 —— 宿主机驱动与 QEMU 抢同一设备会把它推入「接口被两个系统瓜分」的分裂态，两侧同时失灵。
 - 宿主机侧快速自检（VM 关机状态下）：`modprobe option` 后 8 个 `ttyUSB` 应齐全，`echo 'ATI' | socat - /dev/ttyUSB2,crnl` 应返回模块固件信息；测完 `modprobe -r option` 再启 VM。
 
+## 线路认证失败（SW=9862 / 读卡器绑定错位）
+
+一条线反复 `reg_rejected` 并每几分钟重建容器，`usim_status.json` 是
+`AUTH_FAIL / sw=9862`，而 SWu 隧道却是 `CONNECTED` —— 这不是运营商拒绝，
+是这条线打开了**另一条线的 SIM**。`9862` 是 AKA 的 MAC 校验失败，运营商用它
+回应"这张卡算出的响应不对"，和"这个用户被拒"在报文层面无法区分。
+
+自 v1.3.13 起引擎会自己拆穿这种情况：pin_keeper、ami_usim 和 swu_ike 在动卡之前
+先读一次免 PIN 的 EF.ICCID，与线路自己的 ICCID 比对，不符就拒绝并把两个 ICCID
+一起写进状态文件（`WRONG_CARD`），控制面也不再把它算作出口节点的过错。
+
+排查顺序：
+
+1. 看状态文件是否已经直接给出答案：
+
+   ```bash
+   cat data/instances/<id>/run/pin_status.json
+   cat data/instances/<id>/run/usim_status.json
+   ```
+
+2. 若引擎版本较旧、只报 `9862`，手动比对配置与运行时：
+
+   ```bash
+   # 线路被绑到哪个 reader
+   python3 -c "import json;d=json.load(open('data/instances/<id>/instance.json'));print(d['pin_reader'])"
+   # 引擎实际打开了哪个
+   python3 -c "import json;print(json.load(open('data/instances/<id>/run/pin_status.json'))['reader'])"
+   ```
+
+   两者不一致 = 容器内解析错位。**先查引擎镜像是不是旧的**——`git pull` 只更新控制面
+   的 Python，不会更新镜像：
+
+   ```bash
+   docker images --format '{{.Repository}}:{{.Tag}}  {{.CreatedAt}}' | grep engine
+   git log -1 --date=short --format='%ad %s' -- engine/
+   ```
+
+   镜像早于 `engine/` 的最后一次提交,就用 overlay 重建（只 COPY 运行时脚本，
+   几十秒，不重编 Asterisk）。`RUNTIME_FP`/`BASE_FP` 必须带上，否则下次
+   `install.sh reload` 会因标签为空而触发一次全量重建：
+
+   ```bash
+   ./install.sh reload --engines
+   ```
+
+3. 换完镜像**每条线都要重建**。恰好绑在 reader 索引 0 上的那条线在旧镜像下
+   "看起来正常"，其实是回退撞对的，不换同样不可信。
+
 提交问题前下载“诊断 → 脱敏支持包”，并再次确认其中没有个人信息。

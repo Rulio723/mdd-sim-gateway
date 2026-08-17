@@ -263,6 +263,7 @@ function UpdateModal({ update, current, t, onClose }) {
   // Polling starts only after POST /update/apply has reset the status file, otherwise the
   // first poll can read a stale success/failure left over from a previous update run.
   const [polling, setPolling] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const primaryAction = useRef(null)
   const canClose = mode === 'confirm' || mode === 'failed'
   useEffect(() => { if (mode === 'confirm') primaryAction.current?.focus() }, [mode])
@@ -272,7 +273,9 @@ function UpdateModal({ update, current, t, onClose }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose, canClose])
   useEffect(() => { // reopening while an update runs resumes the progress view
-    api.updateProgress().then(s => { if (s.state === 'running') { setProgress(s); setPhase(normalizedUpdatePhase(s.phase)); setMode('working'); setPolling(true) } }).catch(() => {})
+    // Only a document something is still refreshing counts as a live update. Resuming into a
+    // stale one is how an updater that died with its host left the dialog spinning for days.
+    api.updateProgress().then(s => { if (s.state === 'running' && !s.stale) { setProgress(s); setPhase(normalizedUpdatePhase(s.phase)); setMode('working'); setPolling(true) } }).catch(() => {})
   }, [])
   useEffect(() => {
     if (mode !== 'working' || !polling) return
@@ -285,8 +288,8 @@ function UpdateModal({ update, current, t, onClose }) {
         setProgress(s)
         lastPhase = normalizedUpdatePhase(s.phase || lastPhase)
         setPhase(lastPhase)
-        if (s.state === 'failed') { setError(s.error || ''); setMode('failed'); return }
-        if (s.state === 'stalled') { setError(t('The host orchestrator has not picked up the update request. Check the mdd-sim-gateway-orchestrator service on the host.')); setMode('failed'); return }
+        if (s.state === 'failed') { setError(s.error || (s.error_code ? t(s.error_code) : '')); setMode('failed'); return }
+        if (s.state === 'stalled') { setError(t(s.error_code || 'update.error.not_picked_up')); setMode('failed'); return }
         if (s.state === 'success') { window.location.reload(); return }
       } catch (err) {
         if (stop) return
@@ -316,6 +319,18 @@ function UpdateModal({ update, current, t, onClose }) {
       setPolling(true)
     } catch (err) { setError(err.message); setMode('failed') }
   }
+  // Discarding the progress document does not stop a live updater, so the host refuses while
+  // the run still looks alive. This is the way out of a run that died with its host.
+  const cancel = async () => {
+    setCancelling(true)
+    try {
+      const result = await api.cancelUpdate()
+      if (result?.ok === false) {
+        setError(result.error_code ? t(result.error_code) : (result.error || '')); setMode('failed'); return
+      }
+      setPolling(false); setProgress(null); setPhase('requested'); setError(''); setMode('confirm')
+    } catch (err) { setError(err.message); setMode('failed') } finally { setCancelling(false) }
+  }
   const mute = { fontSize: 12, color: 'var(--text-mute)' }
   const visiblePhases = UPDATE_PHASE_ORDER.filter(key => key !== 'control_image' || progress?.install_mode === 'docker')
   const activePhase = normalizedUpdatePhase(phase)
@@ -323,6 +338,11 @@ function UpdateModal({ update, current, t, onClose }) {
   const downloaded = Number(progress?.downloaded_bytes) || 0
   const total = Number(progress?.total_bytes) || 0
   const percent = total > 0 ? Math.min(100, Math.round(downloaded * 100 / total)) : 0
+  const transferring = activePhase === 'downloading' || activePhase === 'control_image'
+  const speed = Number(progress?.bytes_per_second) || 0
+  // Only an estimate the host can actually support: a Release whose size the check never
+  // returned, or a transfer that has not moved yet, gets no countdown rather than a wrong one.
+  const eta = total > downloaded && speed > 0 ? Math.round((total - downloaded) / speed) : 0
   const elapsed = progress?.started_at ? Math.max(0, Math.floor(Date.now() / 1000) - Number(progress.started_at)) : Number(progress?.elapsed_seconds) || 0
   const routeLabel = progress?.route === 'library'
     ? `${t('Proxy library')}${progress?.route_name ? ` · ${progress.route_name}` : ''}`
@@ -360,12 +380,20 @@ function UpdateModal({ update, current, t, onClose }) {
           <ol className="u-update-steps">
             {visiblePhases.map((key, index) => <li key={key} className={index < activeIndex || activePhase === 'done' ? 'done' : index === activeIndex ? 'active' : ''}><i />{t(UPDATE_PHASES[key] || (key === 'done' ? 'Update complete' : key))}</li>)}
           </ol>
-          {progress?.artifact && <div className="u-update-transfer">
+          {transferring && progress?.artifact && <div className="u-update-transfer">
             <div><span>{t('Current file')}</span><b>{progress.artifact}</b></div>
-            {downloaded > 0 && <><div className="u-update-progress"><i style={{ width: total > 0 ? `${percent}%` : '18%' }} /></div><small>{formatUpdateBytes(downloaded)}{total > 0 ? ` / ${formatUpdateBytes(total)} · ${percent}%` : ''}{progress?.bytes_per_second > 0 ? ` · ${formatUpdateBytes(progress.bytes_per_second)}/s` : ''}</small></>}
+            {/* Shown from the first poll, including at zero bytes: a transfer sitting at 0 B
+                with the elapsed time climbing is exactly what a stuck download looks like. */}
+            <div className={`u-update-progress${total > 0 ? '' : ' unknown'}`}><i style={total > 0 ? { width: `${percent}%` } : undefined} /></div>
+            <small>{formatUpdateBytes(downloaded)}{total > 0 ? ` / ${formatUpdateBytes(total)} · ${percent}%` : ''}{speed > 0 ? ` · ${formatUpdateBytes(speed)}/s` : ''}{eta > 0 ? ` · ${t('about {duration} left', { duration: formatUpdateDuration(eta, t) })}` : ''}</small>
           </div>}
           {progress?.detail && <div className="u-update-detail"><span>{t('Host activity')}</span><code>{progress.detail}</code></div>}
-          <p style={{ ...mute, margin: '10px 0 0' }}>{t('Keep the gateway powered on. This can take a few minutes.')}</p>
+          {mode === 'working' && progress?.stale
+            ? <div className="u-update-stale">
+                <p>{t('The host has not reported progress for a while. The update may have been interrupted by a restart or a power cut.')}</p>
+                <button className="btn btn-ghost" disabled={cancelling} onClick={cancel}>{t(cancelling ? 'Please wait…' : 'Cancel this update')}</button>
+              </div>
+            : <p style={{ ...mute, margin: '10px 0 0' }}>{t('Keep the gateway powered on. This can take a few minutes.')}</p>}
         </>}
         {mode === 'failed' && <>
           <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 10 }}>{t('Update failed')}</div>

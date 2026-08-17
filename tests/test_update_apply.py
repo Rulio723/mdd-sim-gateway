@@ -76,6 +76,42 @@ class RequestApplyTests(unittest.TestCase):
         status = update_check.apply_status()
         self.assertTrue(status["requested"])
         self.assertEqual(status["state"], "stalled")
+        self.assertEqual(status["error_code"], "update.error.not_picked_up")
+
+    def _publish_status(self, **fields):
+        os.makedirs(os.path.dirname(self.status_path), exist_ok=True)
+        with open(self.status_path, "w", encoding="utf-8") as handle:
+            json.dump({"state": "running", "phase": "downloading", **fields}, handle)
+
+    def test_a_progress_document_nothing_refreshes_stops_counting_as_live(self):
+        """An updater killed with its host left the dialog resuming into it forever."""
+        self._publish_status(updated_at=int(time.time()) - 20 * 60)
+        status = update_check.apply_status()
+        self.assertEqual(status["state"], "running")
+        self.assertTrue(status["stale"])
+
+        self._publish_status(updated_at=int(time.time()) - 7 * 3600)
+        status = update_check.apply_status()
+        self.assertEqual(status["state"], "stalled")
+        self.assertEqual(status["error_code"], "update.error.abandoned")
+
+    def test_a_live_progress_document_is_neither_stale_nor_cancellable(self):
+        self._publish_status(updated_at=int(time.time()))
+        status = update_check.apply_status()
+        self.assertFalse(status["stale"])
+        result = update_check.cancel_apply()
+        self.assertEqual(result["error_code"], "update.error.in_progress")
+        self.assertTrue(os.path.exists(self.status_path))
+
+    def test_an_abandoned_run_can_be_cancelled_and_requested_again(self):
+        self._publish_status(updated_at=int(time.time()) - 20 * 60)
+        self.assertTrue(update_check.cancel_apply()["ok"])
+        self.assertFalse(os.path.exists(self.status_path))
+        self.assertFalse(os.path.exists(self.request_path))
+        # Without cancelling, the same stale document must not block a fresh request either.
+        self._publish_status(updated_at=int(time.time()) - 20 * 60)
+        with patch.object(update_check, "check", return_value=dict(_AVAILABLE)):
+            self.assertTrue(update_check.request_apply()["ok"])
 
 
 class UpdaterTests(unittest.TestCase):
@@ -124,6 +160,37 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(published["artifact"], "release.tar.gz")
         self.assertEqual(published["total_bytes"], 1234)
         self.assertEqual(published["route_name"], "Primary")
+
+    def test_transfer_rate_follows_the_recent_window_not_the_whole_download(self):
+        """A minute lost to curl's connect retries must not depress the speed, and with it the
+        remaining-time estimate, for the rest of the transfer."""
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp, "release.tar.gz")
+            sizes = [0, 2_000_000, 4_000_000]  # stalled, then 1 MB/s over 2s polls
+
+            def poll():
+                if not sizes:
+                    return 0
+                destination.write_bytes(b"\0" * sizes.pop(0))
+                return None
+
+            process = SimpleNamespace(returncode=0, poll=poll,
+                                      communicate=Mock(return_value=("", "")))
+            with patch.object(mdd_update.subprocess, "Popen", return_value=process), \
+                    patch.object(mdd_update.time, "sleep"), \
+                    patch.object(mdd_update.time, "monotonic",
+                                 side_effect=[0.0, 2.0, 4.0, 6.0]):
+                status = mdd_update.Status(Path(tmp, "status.json"), "9.9.9")
+                mdd_update.download("https://example.invalid/release.tar.gz", destination,
+                                    {}, status=status, artifact="release.tar.gz",
+                                    total_bytes=6_000_000)
+            published = json.loads(Path(tmp, "status.json").read_text())
+        self.assertEqual(published["downloaded_bytes"], 4_000_000)
+        self.assertEqual(published["total_bytes"], 6_000_000)
+        # Averaged over the whole download this would read ~666 KB/s and promise three seconds
+        # too many; the window sees the megabyte per second the transfer is actually doing.
+        self.assertGreater(published["bytes_per_second"], 900_000)
+        self.assertLessEqual(published["bytes_per_second"], 1_000_000)
 
     def test_verified_control_image_is_loaded_and_identity_checked(self):
         completed = lambda code=0, out="", err="": type(
@@ -309,6 +376,109 @@ class OrchestratorUpdateTests(unittest.TestCase):
             command = run.call_args_list[-1].args[0]
             self.assertNotIn("socks5h://", " ".join(command))
             self.assertEqual(network_path.stat().st_mode & 0o777, 0o600)
+
+    def _restart(self, scope: str, *, mode: str = "local"):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            root = data / "orchestrator"
+            root.mkdir()
+            (data / "install-mode").write_text(mode, encoding="utf-8")
+            (root / "service-restart-request.json").write_text(
+                json.dumps({"scope": scope}), encoding="utf-8")
+            app = mdd_orchestrator.Orchestrator(
+                data, Path(__file__).resolve().parent.parent)
+            completed = type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            with patch.object(mdd_orchestrator, "run", return_value=completed) as run:
+                app.process_service_restart_request()
+            commands = [call.args[0] for call in run.call_args_list]
+            status = json.loads((root / "service-restart-status.json").read_text())
+            return commands, status, (root / "service-restart-request.json").exists()
+
+    def test_restarting_the_control_plane_does_not_disturb_this_process(self):
+        commands, status, pending = self._restart("control")
+        self.assertEqual(commands, [["systemctl", "restart", "mdd-sim-gateway-control"]])
+        self.assertEqual(status["state"], "success")
+        self.assertFalse(pending)  # consumed, so a restart loop cannot replay it
+        docker_commands, _, _ = self._restart("control", mode="docker")
+        self.assertEqual(docker_commands,
+                         [["docker", "restart", mdd_orchestrator.CONTROL_CONTAINER]])
+
+    def test_a_restart_that_kills_this_process_is_detached_into_its_own_unit(self):
+        commands, status, _ = self._restart("services")
+        self.assertEqual(commands[0][:2], ["systemctl", "reset-failed"])
+        self.assertEqual(commands[-1][:3],
+                         ["systemd-run", "--unit", "mdd-sim-gateway-restart"])
+        self.assertTrue(commands[-1][-2].endswith("install.sh"))
+        self.assertEqual(commands[-1][-1], "restart")
+        # Completion cannot be published: install.sh restarts this very process.
+        self.assertEqual(status["state"], "running")
+
+    def test_a_host_reboot_is_handed_to_systemd(self):
+        commands, status, _ = self._restart("host")
+        self.assertEqual(commands, [["systemctl", "reboot"]])
+        self.assertEqual(status["state"], "running")
+
+    def test_a_restart_that_took_this_process_with_it_is_completed_on_the_way_back(self):
+        """Observed on the ARM64 host: after `systemctl reboot` the document still said
+        "running", because the process that would have finished it was the one being killed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            root = data / "orchestrator"
+            root.mkdir()
+            status_path = root / "service-restart-status.json"
+            app = mdd_orchestrator.Orchestrator(data, Path(__file__).resolve().parent.parent)
+            for scope in ("host", "services"):
+                status_path.write_text(json.dumps({"state": "running", "scope": scope}),
+                                       encoding="utf-8")
+                app.settle_service_restart()
+                self.assertEqual(json.loads(status_path.read_text())["state"], "success")
+            # A control-plane restart reports its own result, so a "running" one is still live.
+            status_path.write_text(json.dumps({"state": "running", "scope": "control"}),
+                                   encoding="utf-8")
+            app.settle_service_restart()
+            self.assertEqual(json.loads(status_path.read_text())["state"], "running")
+
+    def test_an_unknown_restart_scope_runs_nothing(self):
+        commands, status, _ = self._restart("reformat")
+        self.assertEqual(commands, [])
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_code"], "restart.error.invalid_scope")
+
+    def _reap(self, status: dict, *, unit_active: bool, request: dict | None = None):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            root = data / "orchestrator"
+            root.mkdir()
+            (root / "update-status.json").write_text(json.dumps(status), encoding="utf-8")
+            if request is not None:
+                (root / "update-request.json").write_text(json.dumps(request), encoding="utf-8")
+            app = mdd_orchestrator.Orchestrator(
+                data, Path(__file__).resolve().parent.parent)
+            with patch.object(app, "service_active", return_value=unit_active):
+                app.reap_abandoned_update()
+            return json.loads((root / "update-status.json").read_text())
+
+    def test_an_update_that_died_with_its_host_is_retired(self):
+        """systemd knows what the document cannot say: no unit left means the run is over."""
+        retired = self._reap({"state": "running", "phase": "downloading", "target": "9.9.9",
+                              "artifact": "release.tar.gz",
+                              "updated_at": int(time.time()) - 3600}, unit_active=False)
+        self.assertEqual(retired["state"], "failed")
+        self.assertEqual(retired["error_code"], "update.error.abandoned")
+        # The stage and asset it died on are what make the failure diagnosable.
+        self.assertEqual(retired["phase"], "downloading")
+        self.assertEqual(retired["artifact"], "release.tar.gz")
+
+    def test_a_running_updater_and_a_queued_request_are_both_left_alone(self):
+        running = {"state": "running", "phase": "reloading",
+                   "updated_at": int(time.time()) - 3600}
+        self.assertEqual(self._reap(running, unit_active=True)["state"], "running")
+        # A request the loop has not consumed yet has no unit to find.
+        self.assertEqual(self._reap(running, unit_active=False,
+                                    request={"version": "9.9.9"})["state"], "running")
+        # A launch this pass raced must not be retired before systemd reports the unit.
+        fresh = {"state": "running", "phase": "launching", "updated_at": int(time.time())}
+        self.assertEqual(self._reap(fresh, unit_active=False)["state"], "running")
 
 
 if __name__ == "__main__":

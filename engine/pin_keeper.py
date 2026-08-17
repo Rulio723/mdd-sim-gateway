@@ -76,10 +76,13 @@ def log(msg):
     print(f"[pin_keeper] {msg}", flush=True)
 
 
-def write_status(state, tries_left=None, reader=None, detail=None):
+def write_status(state, tries_left=None, reader=None, detail=None, iccid=None):
+    # `iccid` is what the card in `reader` actually said it was. The manager needs it to tell a
+    # reader name that merely drifted (USB-port binding legitimately opens a renamed slot) from
+    # one that is pointing at the wrong card — the two are indistinguishable from the name alone.
     os.makedirs(RUNDIR, exist_ok=True)
     data = {"state": state, "tries_left": tries_left, "reader": reader,
-            "detail": detail, "ts": int(time.time())}
+            "iccid": iccid, "detail": detail, "ts": int(time.time())}
     tmp = STATUS_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f)
@@ -176,6 +179,49 @@ def read_iccid(conn):
     return swap_nibbles(hx).rstrip("f")
 
 
+class WrongCard(Exception):
+    """The reader this line is bound to demonstrably holds a different line's SIM."""
+
+    def __init__(self, reader, expected, actual):
+        super().__init__(f"{reader} holds ICCID {actual}, line expects {expected}")
+        self.reader = reader
+        self.expected = expected
+        self.actual = actual
+
+
+def _accept(reader, conn, expected):
+    """Return (reader, conn, iccid) once the card in it is proven to belong to this line.
+
+    The third element is the ICCID this function actually read, or None when it did not look
+    or the card would not answer. Reporting it lets the caller record which CARD replied
+    without opening the card a second time to ask the same question.
+
+    Binding a line by reader NAME, USB PORT or INDEX says which slot to open; it says nothing
+    about which SIM is sitting in that slot. When two identical serial-less modems swap USB
+    paths -- or the engine image predates a binding fix and silently falls back to index 0 --
+    the wrong slot opens and the only symptom is the carrier's AKA challenge failing with
+    SW=9862, which reads as a carrier fault and sends the operator hunting upstream. EF.ICCID
+    needs no PIN, so the card can identify itself before anything else touches it.
+
+    Only an ICCID we actually READ can convict a reader. An unreadable EF.ICCID is a transient
+    card or reader fault, not evidence of a swap; failing closed on it would strand a line
+    whose binding is perfectly correct.
+    """
+    if not expected:
+        return reader, conn, None
+    try:
+        actual = read_iccid(conn)
+    except Exception:  # noqa - unreadable EF.ICCID is not evidence; let the line proceed
+        return reader, conn, None
+    if not actual or actual == expected:
+        return reader, conn, actual
+    try:
+        conn.disconnect()
+    except Exception:
+        pass
+    raise WrongCard(str(reader), expected, actual)
+
+
 # --- Reader binding by physical USB port ----------------------------------------------------
 # Resolve a reader by its STABLE physical USB port path (e.g. "3-2") instead of the pcscd
 # enumeration index, which can flip between two identical (serial-less) readers on re-enumeration.
@@ -265,7 +311,12 @@ def index_for_port(port):
 
 
 def find_reader(reader_spec):
-    """Return (reader, open_connection) for the target SIM.
+    """Return (reader, open_connection, iccid) for the target SIM.
+
+    ``iccid`` is the card that actually answered, when this search read it — None when no read
+    happened or the card would not identify itself. It is reported here because this is where
+    the card is already open and, on most paths, already asked; the caller records it so a
+    reader name that merely drifted can be told apart from one holding the wrong card.
 
     Matching strategy that works with multiple readers (some empty) WITHOUT needing the
     PIN first:
@@ -282,7 +333,7 @@ def find_reader(reader_spec):
     """
     rlist = readers()
     if not rlist:
-        return None, None
+        return None, None, None
 
     def _open(r):
         try:
@@ -291,6 +342,8 @@ def find_reader(reader_spec):
             return c
         except Exception:
             return None
+
+    target_iccid = os.environ.get("USIM_ICCID", "").strip()
 
     # 0) Highest priority: the stable USB-port binding. If it resolves to a present, openable
     # reader, use it — this is the physical reader the line is bound to regardless of index order.
@@ -301,9 +354,7 @@ def find_reader(reader_spec):
             conn = _open(rlist[pidx])
             if conn is not None:
                 log(f"bound to USB port {port} (reader index {pidx})")
-                return rlist[pidx], conn
-
-    target_iccid = os.environ.get("USIM_ICCID", "").strip()
+                return _accept(rlist[pidx], conn, target_iccid)
 
     if isinstance(reader_spec, str) and reader_spec.startswith("iccid:"):
         want = reader_spec[6:]
@@ -312,16 +363,16 @@ def find_reader(reader_spec):
             if conn is None:
                 continue
             if read_iccid(conn) == want:
-                return r, conn
+                return r, conn, want
             try: conn.disconnect()
             except Exception: pass
-        return None, None
+        return None, None, None
 
     if isinstance(reader_spec, str) and reader_spec.startswith("imsi:"):
         target = reader_spec[5:]
         if len(rlist) == 1:
             conn = _open(rlist[0])
-            return (rlist[0], conn) if conn else (None, None)
+            return (rlist[0], conn, None) if conn else (None, None, None)
         # Multiple readers: only consider readers that actually have a card (open succeeds),
         # then match by ICCID (no PIN), then by IMSI (if PIN already satisfied), then first.
         candidates = []
@@ -331,22 +382,39 @@ def find_reader(reader_spec):
                 continue                      # empty reader -> skip
             candidates.append((r, conn))
         if not candidates:
-            return None, None
+            return None, None, None
         # 1) match by stored ICCID (always readable)
+        identified = []
+        # Keyed by reader name: what each candidate card said when asked, so a later match on
+        # IMSI can still report the ICCID already learned here instead of asking twice.
+        seen = {}
         if target_iccid:
             for r, conn in candidates:
-                if read_iccid(conn) == target_iccid:
+                try:
+                    actual = read_iccid(conn)
+                except Exception:  # noqa - unreadable card; it simply cannot be matched here
+                    actual = None
+                if actual:
+                    identified.append(actual)
+                    seen[str(r)] = actual
+                if actual == target_iccid:
                     _close_others(candidates, conn)
-                    return r, conn
+                    return r, conn, actual
         # 2) match by IMSI (only works if PIN already verified on the card)
         for r, conn in candidates:
             if select_adf_usim(conn) and read_imsi(conn) == target:
                 _close_others(candidates, conn)
-                return r, conn
-        # 3) fall back to the first card-bearing reader
+                return r, conn, seen.get(str(r))
+        # 3) Every present card said who it was and none of them was this line's. Falling back
+        # to the first one would run the carrier's AKA challenge against a stranger's SIM and
+        # report it as SW=9862. Refuse instead, and name both sides so the mix-up is obvious.
+        if target_iccid and len(identified) == len(candidates):
+            _close_others(candidates, None)
+            raise WrongCard(str(candidates[0][0]), target_iccid, ", ".join(identified))
+        # 4) fall back to the first card-bearing reader
         r, conn = candidates[0]
         _close_others(candidates, conn)
-        return r, conn
+        return r, conn, seen.get(str(r))
 
     # Modem-backed lines deliberately bind PIN, SWu and IMS to separate VPCD logical
     # channels.  Those bindings are persisted as full PC/SC reader names (for example
@@ -358,16 +426,16 @@ def find_reader(reader_spec):
         for r in rlist:
             if str(r) == wanted:
                 conn = _open(r)
-                return (r, conn) if conn else (None, None)
+                return _accept(r, conn, target_iccid) if conn else (None, None, None)
 
     try:
         idx = int(reader_spec)
     except (TypeError, ValueError):
-        return None, None
+        return None, None, None
     if idx < 0 or idx >= len(rlist):
-        return None, None
+        return None, None, None
     conn = _open(rlist[idx])
-    return (rlist[idx], conn) if conn else (None, None)
+    return _accept(rlist[idx], conn, target_iccid) if conn else (None, None, None)
 
 
 def _close_others(candidates, keep):
@@ -380,48 +448,66 @@ def _close_others(candidates, keep):
 def ensure_pin(reader_spec, pin):
     """Connect, verify PIN if enabled, return an open connection to HOLD (keeps the card
     powered so PIN stays verified). All card I/O happens inside a transaction."""
-    r, conn = find_reader(reader_spec)
+    try:
+        r, conn, card_iccid = find_reader(reader_spec)
+    except WrongCard as wrong:
+        # Naming both ICCIDs here is the whole point: SW=9862 alone sends people hunting the
+        # carrier, while "this slot holds someone else's SIM" points straight at the binding.
+        write_status("WRONG_CARD", reader=wrong.reader, iccid=wrong.actual,
+                     detail=f"reader holds ICCID {wrong.actual}, this line is {wrong.expected}")
+        log(f"refusing to use {wrong.reader}: {wrong}")
+        return None
     if r is None:
         write_status("NO_CARD", reader=str(reader_spec))
         return None
     rname = str(r)
+
+    # Record WHICH card answered, not just which slot was opened. A USB-port binding
+    # deliberately opens the reader that physically holds the SIM even when its generated name
+    # has changed, so a name that differs from the stored one is normal there; only the ICCID
+    # separates that from a slot pointing at another line's card. find_reader reports what it
+    # read while resolving, so this costs no extra APDU exchange — and, importantly, no card
+    # I/O outside the transaction below.
+    def status(state, **kw):
+        write_status(state, iccid=card_iccid, **kw)
+
     try:
         with _Tx(conn):
             if not select_adf_usim(conn):
-                write_status("NO_CARD", reader=rname, detail="ADF.USIM select failed")
+                status("NO_CARD", reader=rname, detail="ADF.USIM select failed")
                 conn.disconnect()
                 return None
 
             tries = pin_tries_left(conn)
             if not pin or pin.lower() in ("none", "disabled", ""):
-                write_status("PIN_DISABLED", tries_left=tries, reader=rname)
+                status("PIN_DISABLED", tries_left=tries, reader=rname)
                 return conn
             if tries is None:
                 # already verified in this card session (9000) -> nothing to do
-                write_status("VERIFIED", tries_left=None, reader=rname)
+                status("VERIFIED", tries_left=None, reader=rname)
                 return conn
             if tries == 0:
-                write_status("PIN_BLOCKED", tries_left=0, reader=rname)
+                status("PIN_BLOCKED", tries_left=0, reader=rname)
                 return conn
             if tries < MIN_TRIES:
-                write_status("PIN_BLOCKED", tries_left=tries, reader=rname,
+                status("PIN_BLOCKED", tries_left=tries, reader=rname,
                              detail=f"refusing verify with only {tries} tries left (PUK risk)")
                 return conn
 
             s1, s2 = verify_pin(conn, pin)
             if (s1, s2) == (0x90, 0x00):
-                write_status("VERIFIED", tries_left=3, reader=rname)
+                status("VERIFIED", tries_left=3, reader=rname)
                 return conn
             if s1 == 0x63:
-                write_status("WRONG_PIN", tries_left=s2 & 0x0F, reader=rname)
+                status("WRONG_PIN", tries_left=s2 & 0x0F, reader=rname)
                 return conn
             if (s1, s2) == (0x69, 0x83):
-                write_status("PIN_BLOCKED", tries_left=0, reader=rname)
+                status("PIN_BLOCKED", tries_left=0, reader=rname)
                 return conn
-            write_status("ERROR", reader=rname, detail=f"verify sw={s1:02x}{s2:02x}")
+            status("ERROR", reader=rname, detail=f"verify sw={s1:02x}{s2:02x}")
             return conn
     except Exception as e:  # noqa
-        write_status("ERROR", reader=rname, detail=repr(e))
+        status("ERROR", reader=rname, detail=repr(e))
         try:
             conn.disconnect()
         except Exception:

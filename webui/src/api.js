@@ -95,8 +95,10 @@ export const api = {
   repositoryStars: (force = false) => j('GET', `/api/system/repository/stars${force ? '?force=true' : ''}`),
   applyUpdate: () => j('POST', '/api/system/update/apply', {}),
   updateProgress: () => j('GET', '/api/system/update/progress'),
+  cancelUpdate: () => j('POST', '/api/system/update/cancel', {}),
   createBackup: () => j('POST', '/api/system/backups', {}),
   maintenance: (action) => j('POST', '/api/system/maintenance', { action }),
+  restartProgress: () => j('GET', '/api/system/maintenance/restart-progress'),
   supportBundleUrl: '/api/diagnostics/support-bundle',
 
   instances: () => j('GET', '/api/instances'),

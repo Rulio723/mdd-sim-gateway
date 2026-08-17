@@ -221,6 +221,37 @@ def make_connection_index(reader_index):
     return connection
 
 
+def read_iccid(connection):
+    """Read EF.ICCID (no PIN required). Returns None when the card will not answer."""
+    connection.transmit(toBytes("00a40004023f0000"))
+    connection.transmit(toBytes("00a40004022fe200"))
+    data, sw1, sw2 = connection.transmit(toBytes("00b000000a"))
+    if sw1 != 0x90:
+        return None
+    return swap_nibbles(bytes(data).hex()).rstrip("f")
+
+
+def foreign_iccid(connection):
+    """The ICCID in this connection when it provably is not this line's card, else None.
+
+    A reader name, USB port or index only names a slot; it says nothing about which SIM is
+    sitting in it. IMS-AKA run against the wrong card fails with SW=9862 -- byte for byte what
+    a carrier returns when it genuinely rejects a subscriber -- so nothing downstream can tell
+    the two apart. EF.ICCID needs no PIN, so one read here settles it.
+
+    Only an ICCID actually read convicts a reader. An unreadable EF.ICCID is a transient card
+    fault, not evidence of a swap, and failing closed on it would strand a correctly bound line.
+    """
+    expected = os.environ.get("USIM_ICCID", "").strip()
+    if connection is None or not expected:
+        return None
+    try:
+        actual = read_iccid(connection)
+    except Exception:  # noqa - unreadable EF.ICCID is not evidence of a swap
+        return None
+    return actual if actual and actual != expected else None
+
+
 def make_connection_name(reader_name):
     if isinstance(reader_name, str) and reader_name.startswith("imsi:"):
         target_imsi = reader_name[5:]
@@ -361,6 +392,19 @@ def read_res_ck_ik(reader_spec, rand, autn):
     conn = open_usim(reader_spec)
     if conn is None:
         write_status(state="NO_CARD")
+        return res, ck, ik, auts
+    # Every open_usim branch resolves a SLOT; this is the one place that checks the CARD, so it
+    # covers the USB-port, exact-name and index bindings at once. Naming both ICCIDs turns what
+    # would surface as an SW=9862 "carrier rejected us" into a binding fault anyone can act on.
+    intruder = foreign_iccid(conn)
+    if intruder:
+        write_status(state="WRONG_CARD", iccid=intruder,
+                     detail=f"reader holds ICCID {intruder}, this line is "
+                            f"{os.environ.get('USIM_ICCID', '').strip()}")
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
         return res, ck, ik, auts
     try:
         with _Tx(conn):

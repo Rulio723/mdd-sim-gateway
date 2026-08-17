@@ -5959,6 +5959,46 @@ def bcd(chars):
         bcd_string += chars[1+2*i] + chars[2*i]
     return bcd_string
 
+def read_iccid_at_index(reader_index):
+    """Read EF.ICCID from a reader index. No PIN needed; None when the card will not answer."""
+    r = readers()
+    connection = r[int(reader_index)].createConnection()
+    connection.connect()
+    try:
+        connection.transmit(toBytes('00A40000023F00'))
+        connection.transmit(toBytes('00A40000022FE2'))
+        data, sw1, sw2 = connection.transmit(toBytes('00B000000A'))
+        if sw1 != 0x90:
+            return None
+        return bcd(toHexString(data).replace(" ", "")).rstrip("Ff")
+    finally:
+        try:
+            connection.disconnect()
+        except Exception:
+            pass
+
+
+def reader_holds_foreign_card(reader_index, expected_iccid):
+    """The ICCID actually in `reader_index` when it is provably not this line's, else None.
+
+    The SWu tunnel addresses its SIM by PC/SC index, which names a slot rather than a card.
+    Running IKE_AUTH against whatever card occupies that slot fails with SW=9862 -- the same
+    code a carrier returns for a genuinely rejected subscriber -- so the two are impossible to
+    tell apart downstream. Reading EF.ICCID first costs one PIN-free APDU exchange and makes
+    the difference explicit. An unreadable card returns None: only a successful read convicts.
+    """
+    if not expected_iccid:
+        return None
+    try:
+        actual = read_iccid_at_index(reader_index)
+    except Exception as e:  # noqa - PC/SC hiccup is not evidence of a swapped card
+        swu_log("reader bind: could not read EF.ICCID at index %s (%r)" % (reader_index, e))
+        return None
+    if actual and actual != expected_iccid:
+        return actual
+    return None
+
+
 def read_imsi(reader_index):
     imsi = None
     r = readers()
@@ -6454,6 +6494,18 @@ def main():
         _mi = None
     if _mi is not None:
         modem = str(resolve_reader_index_by_port(os.environ.get("USIM_READER_PORT", "").strip(), _mi))
+        # Prove the slot holds THIS line's SIM before spending an IKE_AUTH on it. Without this
+        # the only symptom of a mis-bound reader is SW=9862 from the ePDG, indistinguishable
+        # from the carrier refusing the subscriber, and the rebuild loop that follows gets
+        # blamed on the exit node.
+        _want_iccid = os.environ.get("USIM_ICCID", "").strip()
+        _foreign = reader_holds_foreign_card(modem, _want_iccid)
+        if _foreign is not None:
+            swu_log("reader bind: index %s holds ICCID %s but this line is %s -- refusing to "
+                    "authenticate against another line's SIM" % (modem, _foreign, _want_iccid))
+            swu_write_status("WRONG_CARD", reader_index=modem,
+                             iccid=_foreign, expected=_want_iccid)
+            exit(1)
 
     a = swu(options.source_addr,destination_addr,options.apn,modem,options.gateway_ip_address,options.mcc,options.mnc,options.imsi,options.netns)
 

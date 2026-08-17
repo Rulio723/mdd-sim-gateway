@@ -166,9 +166,15 @@ a { color: inherit; }
 .u-update-transfer,.u-update-detail { margin:10px 0; padding:10px; border:1px solid var(--border); border-radius:9px; }
 .u-update-progress { height:6px; margin:8px 0 5px; overflow:hidden; border-radius:999px; background:var(--border); }
 .u-update-progress i { display:block; min-width:8px; height:100%; border-radius:inherit; background:var(--primary); transition:width .3s ease; }
+/* No Release size to divide by: sweep instead of showing a fixed sliver that reads as stalled. */
+.u-update-progress.unknown i { width:32%; animation:u-update-sweep 1.6s ease-in-out infinite; }
+@keyframes u-update-sweep { 0% { margin-left:0; } 50% { margin-left:68%; } 100% { margin-left:0; } }
 .u-update-transfer small { color:var(--text-mute); font-size:10px; }
 .u-update-detail code { display:block; overflow-wrap:anywhere; color:var(--text-dim); font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
 .u-update-failure-meta { display:grid; gap:4px; margin:-2px 0 12px; color:var(--text-mute); font-size:11px; }.u-update-failure-meta b { color:var(--text); }
+.u-restart-note { margin-top:10px; padding:9px 11px; border:1px solid #d97706; border-radius:9px; }
+.u-update-stale { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:10px 0 0; padding:9px 11px; border:1px solid #d97706; border-radius:9px; }
+.u-update-stale p { margin:0; color:var(--text-dim); font-size:12px; }.u-update-stale .btn { flex:none; }
 @media (max-width:600px) { .u-update-facts { grid-template-columns:1fr; }.u-update-steps { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 .u-support-actions { display:flex; align-items:center; gap:24px; margin-top:18px; padding-top:18px; border-top:1px solid var(--border); }.u-support-actions>.btn { flex:none; }.u-support-actions b { font-size:13px; }.u-support-actions p { margin:4px 0; color:var(--text-dim); font-size:12px; }.u-support-actions div>a { color:var(--primary); font-size:12px; font-weight:700; text-decoration:none; }
 .u-hint { margin:6px 0 0; color:var(--text-dim); font-size:12px; line-height:1.5; max-width:640px; }

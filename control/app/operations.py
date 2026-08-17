@@ -153,6 +153,70 @@ def list_local_backups() -> list[dict]:
     return result[:50]
 
 
+SERVICE_RESTART_SCOPES = ("control", "services", "host")
+# The orchestrator polls a few times a minute; a request still sitting here after this long
+# means nothing is consuming it, not that it is slow.
+_RESTART_PICKUP_SECONDS = 60
+
+
+def _service_restart_paths() -> tuple[Path, Path]:
+    root = Path(cfg.DATA_DIR) / "orchestrator"
+    return root / "service-restart-request.json", root / "service-restart-status.json"
+
+
+def _write_private_json(path: Path, value: dict):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def request_service_restart(scope: str) -> dict:
+    """Publish a service-restart request for the root orchestrator to carry out.
+
+    The control plane can restart neither itself nor the host: it is unprivileged, and in two
+    of the three scopes it is one of the processes being restarted. So it only states the
+    intent, exactly as it does for self-updates, and the orchestrator detaches whatever would
+    otherwise kill the process running it.
+    """
+    if scope not in SERVICE_RESTART_SCOPES:
+        return {"ok": False, "error_code": "restart.error.invalid_scope"}
+    request_path, status_path = _service_restart_paths()
+    now = int(time.time())
+    # Reset the visible status first so the previous restart's outcome cannot be read as this
+    # one's while the orchestrator is still picking the request up.
+    _write_private_json(status_path, {"state": "requested", "scope": scope, "updated_at": now})
+    _write_private_json(request_path, {"scope": scope, "requested_at": now})
+    return {"ok": True, "scope": scope}
+
+
+def service_restart_status() -> dict:
+    """Progress of the requested restart, as published by the host orchestrator."""
+    request_path, status_path = _service_restart_paths()
+    status = _read_json(status_path)
+    status.setdefault("state", "idle")
+    requested_at = int(_read_json(request_path).get("requested_at") or 0) \
+        if request_path.exists() else 0
+    if requested_at:
+        status["requested"] = True
+        # An unconsumed request means the orchestrator is not picking work up (stopped, or
+        # never installed) — say so instead of leaving the page waiting for a restart that is
+        # never going to happen.
+        if time.time() - requested_at > _RESTART_PICKUP_SECONDS:
+            status["state"] = "stalled"
+            status["error_code"] = "restart.error.not_picked_up"
+    return status
+
+
 def host_diagnostics() -> dict:
     """Read the host orchestrator's published view, or say why it is absent.
 

@@ -30,6 +30,8 @@ LABELS = {
 # reason_code -> user-friendly message
 REASONS = {
     "no_card": "No SIM card detected in the reader.",
+    "wrong_card": "The reader this line is bound to holds a different line's SIM. VoWiFi will "
+                  "not authenticate against it — check this line's reader binding.",
     "pin_wrong": "SIM PIN is incorrect.",
     "pin_blocked": "SIM PIN is blocked — PUK required.",
     "epdg_unresolved": "Can't resolve the carrier's VoWiFi (ePDG) address — the carrier may "
@@ -173,6 +175,10 @@ async def compute(inst: dict, ami_client=None, runtime: dict | None = None) -> d
         return out("REGISTERING", "registering")
     if pstate == "NO_CARD":
         return out("NO_CARD", "no_card")
+    if pstate == "WRONG_CARD":
+        # This line's own SIM is absent from the slot it is bound to, which is what NO_CARD
+        # means for it; the reason line carries the ICCID pair that says how it went wrong.
+        return out("NO_CARD", "wrong_card")
     if pstate == "WRONG_PIN":
         return out("PIN_PROBLEM", "pin_wrong")
     if pstate == "PIN_BLOCKED":

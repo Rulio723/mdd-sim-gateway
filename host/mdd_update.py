@@ -139,16 +139,27 @@ def download(url: str, destination: Path, env: dict[str, str], proxy_url: str = 
         command[1:1] = ["--speed-limit", "65536", "--speed-time", "45"]
     process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, text=True)
+    rate, sampled_at, sampled_bytes = 0.0, started, 0
     while process.poll() is None:
-        elapsed = max(0, int(time.monotonic() - started))
+        now = time.monotonic()
+        elapsed = max(0, int(now - started))
         try:
             downloaded = destination.stat().st_size
         except OSError:
             downloaded = 0
+        # Rate over the recent window, not since the start. A route that spends its first
+        # minute inside curl's connect retries would otherwise report a permanently depressed
+        # speed, and an estimate the transfer never catches up to is worse than none. Smoothed
+        # so the reading does not jump between polls.
+        window = now - sampled_at
+        if window >= 1:
+            sample = max(0, downloaded - sampled_bytes) / window
+            rate = sample if rate <= 0 else rate * 0.6 + sample * 0.4
+            sampled_at, sampled_bytes = now, downloaded
         if status:
             status.publish("running", phase, url=url, artifact=artifact,
                            downloaded_bytes=downloaded, total_bytes=max(0, int(total_bytes or 0)),
-                           bytes_per_second=int(downloaded / max(1, elapsed)),
+                           bytes_per_second=int(rate),
                            elapsed_seconds=elapsed, route=route, route_name=route_name,
                            route_attempt=route_attempt, route_total=route_total)
         time.sleep(2)
@@ -346,9 +357,13 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
         control_name = f"mdd-sim-gateway-control-v{version}-arm64.tar.gz"
         base = f"https://github.com/{repo_name}/releases/download/v{version}"
         url = f"{base}/{archive_name}"
+        # Publish the transfer skeleton before curl starts so the dialog shows a sized bar from
+        # the first poll instead of a bare file name until the first heartbeat lands.
         status.publish("running", "downloading", url=url, install_mode=mode,
                        route=clean_routes[active_route]["route"],
                        route_name=clean_routes[active_route]["route_name"], artifact=archive_name,
+                       downloaded_bytes=0, total_bytes=int(asset_sizes.get(archive_name) or 0),
+                       bytes_per_second=0, elapsed_seconds=0,
                        route_attempt=1, route_total=len(clean_routes))
         archive = staging / archive_name
         sums = staging / "SHA256SUMS"
@@ -396,7 +411,10 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
         if mode == "docker":
             if shutil.disk_usage(data / "update").free < 1024 * 1024 * 1024:
                 raise UpdateError("not enough persistent disk space to import the control image")
-            status.publish("running", "control_image", artifact=control_name, detail="")
+            status.publish("running", "control_image", artifact=control_name, detail="",
+                           downloaded_bytes=0,
+                           total_bytes=int(asset_sizes.get(control_name) or 0),
+                           bytes_per_second=0, elapsed_seconds=0)
             control_archive = staging / control_name
             fetch(f"{base}/{control_name}", control_archive, control_name,
                   phase="control_image")

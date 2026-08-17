@@ -22,6 +22,13 @@ _cache: tuple[float, dict] | None = None
 _stars_cache: int | None = None
 _stars_checked_at = 0.0
 _STARS_CACHE_SECONDS = 15 * 60
+# How long a "running" progress document may go unrefreshed before it stops counting as proof
+# that an update is alive. The orchestrator retires abandoned runs within a minute by asking
+# systemd whether the updater unit still exists; these are the control plane's own fallback for
+# a host whose orchestrator is down too, so they are deliberately generous — updaters before
+# v1.3.12 published no heartbeat at all during downloads and service reloads.
+_APPLY_STALE_SECONDS = 15 * 60
+_APPLY_ABANDONED_SECONDS = 6 * 3600
 
 
 class UpdateNetworkError(RuntimeError):
@@ -287,6 +294,16 @@ def apply_status() -> dict:
     except (OSError, ValueError):
         status = {}
     status.setdefault("state", "idle")
+    if status.get("state") == "running":
+        # A progress document only proves an update is alive while something keeps refreshing
+        # it. An updater that died with its host — reboot, power cut, `systemctl stop` — leaves
+        # this document saying "running" with nobody left to advance it, and the WebUI used to
+        # resume into that dead progress view on every visit, forever.
+        idle = time.time() - int(status.get("updated_at") or 0)
+        status["stale"] = idle > _APPLY_STALE_SECONDS
+        if idle > _APPLY_ABANDONED_SECONDS:
+            status["state"] = "stalled"
+            status["error_code"] = "update.error.abandoned"
     try:
         with open(request_path, encoding="utf-8") as handle:
             requested_at = int((json.load(handle) or {}).get("requested_at") or 0)
@@ -295,15 +312,37 @@ def apply_status() -> dict:
         # never installed) — surface that instead of letting the UI spin forever.
         if time.time() - requested_at > 120:
             status["state"] = "stalled"
+            status["error_code"] = "update.error.not_picked_up"
     except (OSError, ValueError, TypeError, AttributeError):
         pass
     return status
 
 
+def cancel_apply() -> dict:
+    """Discard a progress document the user has been left staring at.
+
+    This cannot stop a live updater — it runs detached as root — so it refuses while the run
+    still looks alive rather than blinding the UI to an update that is genuinely mid-flight.
+    The host orchestrator fails abandoned runs on its own; this is the manual escape hatch for
+    a host whose orchestrator is down too.
+    """
+    request_path, status_path = _apply_paths()
+    status = apply_status()
+    if status.get("state") == "running" and not status.get("stale"):
+        return {"ok": False, "error": "An update is already in progress",
+                "error_code": "update.error.in_progress", "status": status}
+    for path in (request_path, status_path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return {"ok": True}
+
+
 def request_apply() -> dict:
     """Publish a one-click update request for the host orchestrator."""
     status = apply_status()
-    if status.get("state") == "running" and time.time() - int(status.get("updated_at") or 0) < 3600:
+    if status.get("state") == "running" and not status.get("stale"):
         return {"ok": False, "error": "An update is already in progress",
                 "error_code": "update.error.in_progress", "status": status}
     info = check(True)
