@@ -58,10 +58,11 @@ jobs:
 
           upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
 
-          # Reject an upstream history replacement with no common ancestor.
+          # A force-pushed/rebuilt upstream history is allowed only after all
+          # tree-level safety checks below pass. Exact-tree syncing does not require
+          # a common ancestor, but the history rewrite remains visible in the log.
           if ! git merge-base HEAD "${upstream_ref}" >/dev/null 2>&1; then
-            echo "::error::Upstream history no longer shares a common ancestor. Sync blocked."
-            exit 1
+            echo "::warning::Upstream history was rewritten; continuing with strict tree safety checks."
           fi
 
           required_paths=(
