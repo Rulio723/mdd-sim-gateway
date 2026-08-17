@@ -833,7 +833,7 @@ class IdleBackoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             app = self._app(temp)
             # None of them exist yet on a fresh install.
-            self.assertEqual(len(app._input_mtimes()), 6)
+            self.assertEqual(len(app._input_mtimes()), 7)
 
 
 class HotplugResponsivenessTests(unittest.TestCase):
@@ -853,4 +853,4 @@ class HotplugResponsivenessTests(unittest.TestCase):
             self.assertNotEqual(two_devices, three_devices,
                                 "a newly plugged modem must end the backoff")
             # A platform without a USB tree still returns a stable shape.
-            self.assertEqual(len(app._input_mtimes()), 6)
+            self.assertEqual(len(app._input_mtimes()), 7)

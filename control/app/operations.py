@@ -60,6 +60,12 @@ def _safe_name(name: str) -> str:
 
 
 def redact_log(text: str) -> str:
+    """Redact a plain log file line by line.
+
+    Blanking the whole line is right here: an unlabelled key row carries nothing else, and a
+    log line that mentions key material is not worth reconstructing. ``redact_jsonl`` exists
+    because that trade is wrong for a structured record.
+    """
     lines = []
     redact_following = 0
     for line in text.splitlines():
@@ -74,6 +80,49 @@ def redact_log(text: str) -> str:
             lines.append("<redacted cryptographic material>")
         else:
             lines.append(str(redact(line)))
+    return "\n".join(lines)
+
+
+def _redact_record(value, key: str = ""):
+    """Redact inside a diagnostic record, blanking only the strings that carry key material.
+
+    Same rules as ``redact_log``, applied per string rather than per line. A captured log tail
+    is a list of log lines, so each element gets exactly the treatment it would have got in
+    its own file, and the registration/SIP/host evidence beside it survives.
+    """
+    if _SECRET_KEYS.search(key):
+        return "<redacted>" if value not in (None, "", [], {}) else value
+    if isinstance(value, dict):
+        return {str(k): _redact_record(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_record(item, key) for item in value]
+    if isinstance(value, str):
+        if _MULTILINE_SECRET.search(value) or _KEY_MATERIAL.search(value):
+            return "<redacted cryptographic material>"
+        return redact(value)
+    return value
+
+
+def redact_jsonl(text: str) -> str:
+    """Redact a JSON-lines diagnostic file record by record.
+
+    One record is one line, so ``redact_log``'s line rules blank an entire record — and, via
+    the two-line lookahead, the two records after it — as soon as any captured log tail inside
+    it mentions key material. The engine's own tunnel log says ``received decoded message`` on
+    every fragmented exchange, so in practice that wiped every record of the one file written
+    specifically to outlive a rebuild loop (see ``engine.capture_diagnostics``). Redact the
+    parsed structure instead; a record that will not parse still falls back to the line rules.
+    """
+    lines = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            lines.append(redact_log(line))
+            continue
+        lines.append(json.dumps(_redact_record(record), ensure_ascii=False, sort_keys=True))
     return "\n".join(lines)
 
 
@@ -145,7 +194,8 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
                 lines = path.read_text(errors="replace").splitlines()[-log_lines:]
             except OSError:
                 continue
-            text = redact_log("\n".join(lines))
+            joined = "\n".join(lines)
+            text = redact_jsonl(joined) if path.suffix == ".jsonl" else redact_log(joined)
             iid = path.parents[2].name if path.parent.name == "ike" else path.parent.parent.name
             archive.writestr(f"logs/{iid}-{path.name}", text)
         archive.writestr("manifest.json", json.dumps({

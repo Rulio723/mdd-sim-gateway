@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -67,9 +68,11 @@ class Status:
     def __init__(self, path: Path, target: str):
         self.path, self.target = path, target
         self.started = int(time.time())
+        self.phase = "requested"
         self.extra: dict = {}
 
     def publish(self, state: str, phase: str, **fields):
+        self.phase = phase
         self.extra.update(fields)
         atomic_json(self.path, {"state": state, "phase": phase, "target": self.target,
                                 "started_at": self.started, "updated_at": int(time.time()),
@@ -117,36 +120,127 @@ def redact_log(path: Path, proxy_url: str):
         pass
 
 
-def download(url: str, destination: Path, env: dict[str, str], proxy_url: str = ""):
-    """Download through curl so HTTP and SOCKS5(H) proxies are supported consistently."""
-    result = subprocess.run([
+def download(url: str, destination: Path, env: dict[str, str], proxy_url: str = "",
+             *, status: Status | None = None, artifact: str = "release package",
+             total_bytes: int = 0, route: str = "direct", route_name: str = "",
+             phase: str = "downloading", route_attempt: int = 1, route_total: int = 1,
+             allow_fallback: bool = False):
+    """Download through curl while publishing byte, speed and heartbeat details."""
+    started = time.monotonic()
+    command = [
         "curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
-        "--tlsv1.2", "--retry", "3", "--retry-all-errors", "--connect-timeout", "20",
-        "--max-time", "600", "--user-agent", "mdd-sim-gateway-updater",
-        "--output", str(destination), url,
-    ], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    if result.returncode:
-        detail = _redact_proxy_error(result.stderr, proxy_url).strip().splitlines()
-        tail = detail[-1] if detail else f"curl exited with {result.returncode}"
+        "--tlsv1.2", "--retry", "0" if allow_fallback else "3", "--retry-all-errors",
+        "--connect-timeout", "20", "--max-time", "600", "--silent", "--show-error",
+        "--user-agent", "mdd-sim-gateway-updater", "--output", str(destination), url,
+    ]
+    # A route that cannot sustain a useful asset-transfer rate should yield to the next Auto
+    # candidate. The final/only route keeps the generous timeout for genuinely slow links.
+    if allow_fallback:
+        command[1:1] = ["--speed-limit", "65536", "--speed-time", "45"]
+    process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True)
+    while process.poll() is None:
+        elapsed = max(0, int(time.monotonic() - started))
+        try:
+            downloaded = destination.stat().st_size
+        except OSError:
+            downloaded = 0
+        if status:
+            status.publish("running", phase, url=url, artifact=artifact,
+                           downloaded_bytes=downloaded, total_bytes=max(0, int(total_bytes or 0)),
+                           bytes_per_second=int(downloaded / max(1, elapsed)),
+                           elapsed_seconds=elapsed, route=route, route_name=route_name,
+                           route_attempt=route_attempt, route_total=route_total)
+        time.sleep(2)
+    _, stderr = process.communicate()
+    if process.returncode:
+        detail = _redact_proxy_error(stderr, proxy_url).strip().splitlines()
+        tail = detail[-1] if detail else f"curl exited with {process.returncode}"
         raise UpdateError(f"release download failed: {tail}")
 
 
+def _last_log_line(path: Path, proxy_url: str) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return _redact_proxy_error(next((line for line in reversed(lines) if line.strip()), ""),
+                               proxy_url)[-300:]
+
+
+def reload_services(command: list[str], cwd: Path, env: dict[str, str], log_path: Path,
+                    status: Status, proxy_url: str) -> int:
+    """Run the disruptive reload while keeping the progress document alive and useful."""
+    started = time.monotonic()
+    with open(log_path, "w", encoding="utf-8") as log:
+        process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=log,
+                                   stderr=subprocess.STDOUT)
+        while process.poll() is None:
+            status.publish("running", "reloading",
+                           elapsed_seconds=max(0, int(time.monotonic() - started)),
+                           detail=_last_log_line(log_path, proxy_url))
+            time.sleep(3)
+    return int(process.returncode or 0)
+
+
 def verify_release_archive(archive: Path, sums: Path):
+    verify_release_file(archive, sums, "update archive")
+
+
+def verify_release_file(artifact: Path, sums: Path, description: str):
     expected = ""
     for line in sums.read_text(encoding="utf-8").splitlines():
         parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[1].lstrip("*") == archive.name \
+        if len(parts) == 2 and parts[1].lstrip("*") == artifact.name \
                 and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
             expected = parts[0].lower()
             break
     if not expected:
-        raise UpdateError("release checksum file does not name the update archive")
+        raise UpdateError(f"release checksum file does not name the {description}")
     digest = hashlib.sha256()
-    with open(archive, "rb") as handle:
+    with open(artifact, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     if digest.hexdigest() != expected:
-        raise UpdateError("release archive checksum mismatch")
+        raise UpdateError(f"release {description} checksum mismatch")
+
+
+def installed_mode(data: Path) -> str:
+    try:
+        mode = (data / "install-mode").read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        mode = ""
+    return mode if mode in {"local", "docker"} else "local"
+
+
+def load_control_image(artifact: Path, version: str):
+    """Load a verified image archive without changing or restarting the Docker daemon."""
+    image = "mdd-sim-gateway/control"
+    previous = f"{image}:previous"
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    had_previous = inspect.returncode == 0 and bool(inspect.stdout.strip())
+    if had_previous:
+        tagged = subprocess.run(["docker", "tag", image, previous],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if tagged.returncode:
+            raise UpdateError(f"could not preserve the current control image: {tagged.stderr.strip()}")
+    loaded = subprocess.run(["docker", "load", "--input", str(artifact)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if loaded.returncode:
+        raise UpdateError(f"could not load Release control image: {loaded.stderr.strip()}")
+    expected_arch = "arm64" if platform.machine().lower() in {"aarch64", "arm64"} else "amd64"
+    checked = subprocess.run(
+        ["docker", "image", "inspect", image, "--format",
+         '{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.version"}}'],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    actual = checked.stdout.strip() if checked.returncode == 0 else ""
+    if actual != f"{expected_arch}|{version}":
+        if had_previous:
+            subprocess.run(["docker", "tag", previous, image], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        raise UpdateError(f"Release control image identity mismatch: {actual or 'unreadable'}")
 
 
 def extract(archive: Path, destination: Path) -> Path:
@@ -223,25 +317,70 @@ def apply_tree(source_root: Path, repo: Path):
 
 
 def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status,
-            proxy_url: str = ""):
+            proxy_url: str = "", *, route: str = "direct", route_name: str = "",
+            asset_sizes: dict | None = None, routes: list[dict] | None = None):
     if not VERSION_RE.fullmatch(version):
         raise UpdateError(f"invalid target version: {version!r}")
     if not REPOSITORY_RE.fullmatch(repo_name):
         raise UpdateError(f"invalid repository: {repo_name!r}")
     (data / "update").mkdir(mode=0o700, parents=True, exist_ok=True)
-    env = network_environment(proxy_url)
+    routes = routes if isinstance(routes, list) and routes else [
+        {"proxy_url": proxy_url, "route": route, "route_name": route_name}]
+    clean_routes = []
+    for item in routes:
+        if not isinstance(item, dict):
+            continue
+        candidate_url = str(item.get("proxy_url") or "")
+        network_environment(candidate_url)  # validate before creating the staging directory
+        clean_routes.append({"proxy_url": candidate_url,
+                             "route": "library" if candidate_url else "direct",
+                             "route_name": str(item.get("route_name") or "")[:120]})
+    if not clean_routes:
+        raise UpdateError("no usable update download route")
+    active_route = 0
     staging = Path(tempfile.mkdtemp(prefix="mdd-update.", dir=str(data / "update")))
     try:
+        mode = installed_mode(data)
+        asset_sizes = asset_sizes or {}
         archive_name = f"mdd-sim-gateway-v{version}.tar.gz"
+        control_name = f"mdd-sim-gateway-control-v{version}-arm64.tar.gz"
         base = f"https://github.com/{repo_name}/releases/download/v{version}"
         url = f"{base}/{archive_name}"
-        status.publish("running", "downloading", url=url)
+        status.publish("running", "downloading", url=url, install_mode=mode,
+                       route=clean_routes[active_route]["route"],
+                       route_name=clean_routes[active_route]["route_name"], artifact=archive_name,
+                       route_attempt=1, route_total=len(clean_routes))
         archive = staging / archive_name
         sums = staging / "SHA256SUMS"
-        download(url, archive, env, proxy_url)
-        download(f"{base}/SHA256SUMS", sums, env, proxy_url)
 
-        status.publish("running", "verifying")
+        def fetch(download_url: str, destination: Path, artifact: str,
+                  *, phase: str = "downloading"):
+            nonlocal active_route
+            order = [active_route] + [i for i in range(len(clean_routes)) if i != active_route]
+            failures = []
+            for attempt, index in enumerate(order, 1):
+                candidate = clean_routes[index]
+                try:
+                    destination.unlink(missing_ok=True)
+                    download(download_url, destination,
+                             network_environment(candidate["proxy_url"]), candidate["proxy_url"],
+                             status=status, artifact=artifact,
+                             total_bytes=asset_sizes.get(artifact, 0),
+                             route=candidate["route"], route_name=candidate["route_name"],
+                             phase=phase, route_attempt=attempt, route_total=len(order),
+                             allow_fallback=attempt < len(order))
+                except UpdateError as exc:
+                    failures.append(str(exc))
+                    continue
+                active_route = index
+                return
+            raise UpdateError("all update download routes failed: " + "; ".join(failures)[-1500:])
+
+        fetch(url, archive, archive_name)
+        fetch(f"{base}/SHA256SUMS", sums, "SHA256SUMS")
+
+        status.publish("running", "verifying", artifact=archive_name, downloaded_bytes=0,
+                       total_bytes=0, bytes_per_second=0, elapsed_seconds=0, detail="")
         verify_release_archive(archive, sums)
         source_root = extract(archive, staging / "tree")
         version_file = source_root / "VERSION"
@@ -253,6 +392,19 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
             encoding="utf-8").strip() if release_dist.is_dir() else ""
         if dist_version != version or not (release_dist / "index.html").is_file():
             raise UpdateError("release archive has no matching prebuilt WebUI")
+
+        if mode == "docker":
+            if shutil.disk_usage(data / "update").free < 1024 * 1024 * 1024:
+                raise UpdateError("not enough persistent disk space to import the control image")
+            status.publish("running", "control_image", artifact=control_name, detail="")
+            control_archive = staging / control_name
+            fetch(f"{base}/{control_name}", control_archive, control_name,
+                  phase="control_image")
+            status.publish("running", "control_image", artifact=control_name,
+                           downloaded_bytes=0, total_bytes=0, bytes_per_second=0,
+                           elapsed_seconds=0, detail="")
+            verify_release_file(control_archive, sums, "ARM64 control image")
+            load_control_image(control_archive, version)
 
         status.publish("running", "backup")
         try:
@@ -268,17 +420,21 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
         # the control plane and orchestrator — this unit outlives both restarts.
         status.publish("running", "reloading")
         log_path = data / "update" / "reload.log"
-        with open(log_path, "w", encoding="utf-8") as log:
-            env["MDD_REUSE_WEBUI"] = "1"
-            result = subprocess.run(["sh", str(repo / "install.sh"), "reload", "--no-engines"],
-                                    cwd=str(repo), env=env, stdout=log,
-                                    stderr=subprocess.STDOUT)
-        redact_log(log_path, proxy_url)
-        if result.returncode != 0:
+        selected_proxy_url = clean_routes[active_route]["proxy_url"]
+        env = network_environment(selected_proxy_url)
+        env["MDD_REUSE_WEBUI"] = "1"
+        if mode == "docker":
+            env["MDD_REUSE_CONTROL_IMAGE"] = "1"
+        result_code = reload_services(
+            ["sh", str(repo / "install.sh"), "reload", "--no-engines"], repo, env,
+            log_path, status, selected_proxy_url)
+        redact_log(log_path, selected_proxy_url)
+        if result_code != 0:
             with open(log_path, encoding="utf-8", errors="replace") as log:
                 tail = "".join(log.readlines()[-40:])
-            raise UpdateError(f"install.sh reload exited with {result.returncode}\n{tail}")
-        status.publish("success", "done")
+            raise UpdateError(f"install.sh reload exited with {result_code}\n{tail}")
+        status.publish("success", "done", elapsed_seconds=int(time.time()) - status.started,
+                       detail="")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -297,9 +453,14 @@ def main():
         network_path = args.network_config.resolve() if args.network_config else None
         network = read_network_config(network_path)
         perform(args.repo.resolve(), data, args.version, args.repository, status,
-                str(network.get("proxy_url") or ""))
+                str(network.get("proxy_url") or ""),
+                route=str(network.get("route") or "direct"),
+                route_name=str(network.get("route_name") or ""),
+                asset_sizes=network.get("asset_sizes") if isinstance(
+                    network.get("asset_sizes"), dict) else {},
+                routes=network.get("routes") if isinstance(network.get("routes"), list) else None)
     except Exception as exc:  # published for the WebUI; the unit exit code is for journalctl
-        status.publish("failed", "error", error=str(exc)[:4000])
+        status.publish("failed", status.phase or "error", error=str(exc)[:4000])
         raise SystemExit(1)
     finally:
         if args.network_config:

@@ -976,3 +976,25 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={}):
             main.apply_health("9", self.INST, st)
         self.assertNotIn("9", main.hub.exit_ledgers)
+
+
+class StaleStatusCacheTests(unittest.TestCase):
+    """Switching VoWiFi off stops the line but the last sample taken while it ran stayed
+    authoritative until the next poll — so a device kept reporting the problem of a line
+    the operator had just switched off, and a module reported "no SIM card" for a SIM
+    sitting in its reader."""
+
+    STALE = {"state": "NO_CARD", "label": "No SIM card", "reason_code": "no_card",
+             "reason": "No SIM card detected in the reader.", "detail": {}}
+
+    def setUp(self):
+        main.hub.status_cache["line-stale"] = dict(self.STALE)
+        self.addCleanup(main.hub.status_cache.pop, "line-stale", None)
+
+    def test_a_disabled_line_is_not_reported_from_the_cache_it_left_behind(self):
+        status = main._cached_line_status({"id": "line-stale", "enabled": False})
+        self.assertEqual(status["state"], "STOPPED")
+
+    def test_a_running_line_still_reports_its_last_observation(self):
+        status = main._cached_line_status({"id": "line-stale", "enabled": True})
+        self.assertEqual(status["state"], "NO_CARD")

@@ -1,11 +1,12 @@
 import json
+import os
 import re
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from control.app import device_state
 from host import mdd_orchestrator
@@ -632,6 +633,31 @@ modem.3gpp.registration-state : unknown
                 drivers.joinpath(".mdd-vpcd-slots-4").touch()
                 self.assertEqual(app.driver_slots(), 4)
 
+    def test_each_modem_reader_uses_an_independent_vpcd_library_image(self):
+        """libifdvpcd's ctx array is process-global, so two readers must not share a DSO."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "libifdvpcd.so"
+            source.write_bytes(b"test-vpcd-driver")
+            config_path = root / "reader.conf.d" / "mdd-sim-gateway-modems"
+            app = Orchestrator(root / "data", root, dry_run=False)
+
+            with patch.dict(os.environ, {
+                    "MDD_VPCD_LIBRARY": str(source),
+                    "MDD_VPCD_DRIVER_INSTANCE_DIR": str(root / "isolated"),
+            }):
+                first = app.reader_stanza({"id": "modem-a"}, 0x3C00, config_path)
+                second = app.reader_stanza({"id": "modem-b"}, 0x3D00, config_path)
+
+            first_path = root / "isolated" / "libifdvpcd-mdd-3c00.so"
+            second_path = root / "isolated" / "libifdvpcd-mdd-3d00.so"
+            self.assertIn(f"LIBPATH {first_path}", first)
+            self.assertIn(f"LIBPATH {second_path}", second)
+            self.assertNotEqual(first_path, second_path)
+            self.assertEqual(first_path.read_bytes(), source.read_bytes())
+            self.assertEqual(second_path.read_bytes(), source.read_bytes())
+            self.assertNotEqual(first_path.stat().st_ino, second_path.stat().st_ino)
+
     def test_a_logged_refusal_skips_the_remaining_grace_period(self):
         """ModemManager writes its refusal to its own journal. Waiting the full grace
         period after that is on record costs an affected host three minutes of dead air
@@ -741,6 +767,28 @@ modem.3gpp.registration-state : unknown
             settled = device_state._read(str(app.device_status_path), {})["devices"]["a"]
             self.assertTrue(settled["actual"]["vowifi_bridge_active"])
 
+    def test_repeated_modemmanager_phone_failure_degrades_to_direct_serial(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=True)
+            app.root.mkdir(parents=True)
+            app._bridge_stderr_path("a").write_text(
+                "ModemError: SIM logical channel allocation failed (0/3 allocated): "
+                "GDBus.Error:org.freedesktop.ModemManager1.Error.MobileEquipment."
+                "PhoneFailure: Phone failure\n")
+            proc = SimpleNamespace(returncode=1)
+
+            for _ in range(3):
+                app._record_bridge_exit("a", proc, time.time() - 1)
+
+            self.assertIn("a", app._degraded)
+            self.assertIn("direct serial", app._degraded["a"])
+            plan = Orchestrator.capability_plan({
+                "a": {"cellular_enabled": False, "flight_mode": True,
+                      "vowifi_enabled": True},
+            })
+            self.assertFalse(app.cellular_backend_needed(plan, {"a"}, {}))
+
     def test_modemmanager_stands_down_once_it_has_refused_every_modem(self):
         """Without a modem object ModemManager provides nothing, but its probes share the
         AT ports with the direct bridges and corrupt SIM channel allocation. Field log: a
@@ -797,9 +845,61 @@ modem.3gpp.registration-state : unknown
             device = document["devices"]["a"]
             self.assertFalse(device["actual"]["cellular_supported"])
             self.assertEqual(device["actual"]["vowifi_backend"], "direct-serial")
+            self.assertFalse(device["transitioning"])
             self.assertEqual(document["shared"]["modem_backend"], "serial")
             self.assertEqual(document["shared"]["cellular_backend"],
                              "disabled-by-configuration")
+
+    def test_flight_mode_only_uses_direct_serial_without_modemmanager(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            flight_only = Orchestrator.capability_plan({
+                "a": {"cellular_enabled": False, "flight_mode": True,
+                      "vowifi_enabled": True},
+            })
+            self.assertFalse(app.cellular_backend_needed(flight_only, {"a"}, {}))
+
+            with_cellular = Orchestrator.capability_plan({
+                "a": {"cellular_enabled": True, "flight_mode": True,
+                      "vowifi_enabled": True},
+            })
+            self.assertTrue(app.cellular_backend_needed(with_cellular, {"a"}, {}))
+
+    def test_flight_mode_direct_bridge_is_a_settled_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            app.root.mkdir(parents=True)
+            app.bridges["a"] = SimpleNamespace(poll=lambda: None, pid=9)
+            app._bridge_started["a"] = time.time() - 10
+            desired = {"a": {"cellular_enabled": False, "flight_mode": True,
+                              "vowifi_enabled": True}}
+            assignments = {"a": {"id": "a", "name": "A", "tty": "/dev/ttyUSB2"}}
+
+            with patch.object(app, "service_active", return_value=False):
+                app.publish_device_status(desired, assignments)
+
+            device = device_state._read(str(app.device_status_path), {})["devices"]["a"]
+            self.assertFalse(device["transitioning"])
+            self.assertEqual(device["actual"]["vowifi_backend"], "direct-serial")
+
+    def test_serial_mode_never_touches_the_modem_radio_port(self):
+        """VoWiFi-only mode gives the direct bridge exclusive ownership of the AT port.
+
+        The PVE field host rejects ordinary pyserial DTR/RTS setup with EPROTO.  Sending
+        AT+CFUN before the virtualisation-tolerant bridge starts left both modems unable to
+        answer its first ATE0 command, despite cellular and flight mode being unsupported.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            app._serial_mode = True
+            serial_module = SimpleNamespace(Serial=Mock())
+            with patch("host.mdd_orchestrator.serial", serial_module):
+                app.apply_device_radios(
+                    [{"id": "a", "tty": "/dev/ttyUSB2"}],
+                    {"a": {"cellular_enabled": True, "flight_mode": False}},
+                    through_modemmanager=False)
+            serial_module.Serial.assert_not_called()
+            self.assertEqual(app.radio_states, {})
 
     def test_standing_down_skips_the_modem_reset(self):
         with tempfile.TemporaryDirectory() as temp:

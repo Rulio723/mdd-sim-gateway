@@ -10,7 +10,9 @@
 # under /app so run.py (`from app import ...`) resolves.
 
 # ---------- stage 1: build the WebUI ----------
-FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS webui
+# The output is architecture-independent static content. Keep this stage on the native build
+# platform so an amd64 GitHub runner does not run npm under ARM64 QEMU during release builds.
+FROM --platform=$BUILDPLATFORM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS webui
 WORKDIR /webui
 # Install deps against the lockfile first (better layer caching), then build.
 COPY webui/package.json webui/package-lock.json ./
@@ -20,6 +22,7 @@ RUN npm run build
 
 # ---------- stage 2: python runtime ----------
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+ARG MDD_VERSION=dev
 # pcsc-lite client library, built from source and pinned to the SAME version as the host pcscd
 # and the engine image (PCSC_VERSION). pyscard loads libpcsclite.so.1 at runtime to detect the
 # reader via the mounted host /run/pcscd socket — matching versions avoids protocol mismatch.
@@ -57,5 +60,6 @@ ENV MDD_WEBUI=/app/webui/dist \
 
 EXPOSE 8443
 LABEL io.mdd-sim-gateway.managed="true" \
+      org.opencontainers.image.version="${MDD_VERSION}" \
       org.opencontainers.image.title="MDD Sim Gateway control plane"
 ENTRYPOINT ["python", "run.py"]

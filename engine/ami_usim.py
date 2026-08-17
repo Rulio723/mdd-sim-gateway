@@ -242,7 +242,18 @@ def make_connection_name(reader_name):
                 return connection
         print("Target SIM not found")
         return None
-    return make_connection_index(int(reader_name))
+    # Persisted modem bindings use the full PC/SC reader name so each engine role stays
+    # on its own VPCD logical channel.  Resolve that name explicitly; int(reader_name)
+    # rejects it and prevents SIP IMS-AKA from ever reaching the selected channel.
+    if isinstance(reader_name, str):
+        wanted = reader_name.strip()
+        for idx, reader in enumerate(readers()):
+            if str(reader) == wanted:
+                return make_connection_index(idx)
+    try:
+        return make_connection_index(int(reader_name))
+    except (TypeError, ValueError):
+        return None
 
 
 def make_reselect_adf(connection):
@@ -284,6 +295,18 @@ def open_usim(reader_spec):
                 return conn
             except Exception:
                 pass
+    # Full names are the stable role binding for modem VPCD slots.  They must win over
+    # the legacy index fallback; otherwise every non-numeric name silently selects slot 0.
+    if isinstance(reader_spec, str):
+        wanted = reader_spec.strip()
+        for reader in rlist:
+            if str(reader) == wanted:
+                try:
+                    conn = reader.createConnection()
+                    conn.connect()
+                    return conn
+                except Exception:
+                    return None
     if isinstance(reader_spec, str) and reader_spec.startswith("imsi:") and len(rlist) > 1:
         target = reader_spec[5:]
         for r in rlist:
@@ -304,11 +327,12 @@ def open_usim(reader_spec):
                 pass
         return None
     # single reader, or explicit index
-    idx = 0
-    if isinstance(reader_spec, str) and reader_spec.isdigit():
+    try:
         idx = int(reader_spec)
-    if idx >= len(rlist):
-        idx = 0
+    except (TypeError, ValueError):
+        return None
+    if idx < 0 or idx >= len(rlist):
+        return None
     conn = rlist[idx].createConnection()
     conn.connect()
     return conn

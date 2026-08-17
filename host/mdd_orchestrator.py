@@ -438,6 +438,8 @@ class Orchestrator:
         self.hw_state_path = self.root / "hardware-state.json"
         self.device_desired_path = self.root / "devices-desired.json"
         self.device_status_path = self.root / "devices-status.json"
+        self.bridge_restart_request_dir = self.root / "bridge-restart-requests"
+        self.bridge_restart_status_dir = self.root / "bridge-restart-status"
         self.generated = self.root / "sing-box.json"
         self.xray_generated = self.root / "xray.json"
         self.cache = self.root / "subscription.yaml"
@@ -537,6 +539,116 @@ class Orchestrator:
         self._serial_mode = False
         # device id -> the exact command its bridge runs, for the support bundle.
         self._bridge_commands: dict[str, list] = {}
+        # request id -> restart handshake. Separate request/status files let independent
+        # modems switch profiles concurrently without overwriting a singleton document.
+        self._bridge_restarts: dict[str, dict] = {}
+        for path in self.bridge_restart_status_dir.glob("*.json"):
+            value = read_json(path)
+            request_id = str(value.get("request_id") or "")
+            if request_id and value.get("state") not in {"channels_ready", "failed"}:
+                self._bridge_restarts[request_id] = value
+
+    def _bridge_restart_status(self, request: dict, state: str, **extra) -> dict:
+        value = {**request, **extra, "state": state, "updated_at": time.time()}
+        request_id = str(value["request_id"])
+        atomic_json(self.bridge_restart_status_dir / f"{request_id}.json", value)
+        self._bridge_restarts[request_id] = value
+        return value
+
+    def process_bridge_restart_requests(self):
+        """Consume scoped requests and stop only the selected modem bridge.
+
+        Completion is deliberately deferred until ``finish_bridge_restart_requests`` sees
+        metadata from the newly spawned PID with ready logical channels and the requested
+        ICCID. Merely terminating the old process or seeing a persistent pcscd reader name is
+        not proof that card access recovered.
+        """
+        self.bridge_restart_request_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for path in sorted(self.bridge_restart_request_dir.glob("*.json")):
+            request = read_json(path)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            request_id = str(request.get("request_id") or "")
+            device_id = str(request.get("device_id") or "")
+            expected_iccid_sha256 = str(request.get("expected_iccid_sha256") or "")
+            if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", request_id)
+                    or request_id != path.stem
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", device_id)
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected_iccid_sha256)):
+                if request_id and re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", request_id):
+                    self._bridge_restart_status(
+                        {"request_id": request_id, "device_id": device_id}, "failed",
+                        error="invalid bridge restart request")
+                continue
+            try:
+                requested_at = float(request.get("requested_at") or time.time())
+            except (TypeError, ValueError):
+                requested_at = time.time()
+            request = {
+                "request_id": request_id,
+                "device_id": device_id,
+                "expected_iccid_sha256": expected_iccid_sha256,
+                "requested_at": requested_at,
+                "started_at": time.time(),
+            }
+            self._bridge_restart_status(request, "stopping")
+            self.root.mkdir(parents=True, exist_ok=True)
+            (self.root / "pcsc-maintenance").write_text(
+                str(int(time.time())), encoding="ascii")
+            proc = self.bridges.pop(device_id, None)
+            self.bridge_ports.pop(device_id, None)
+            self._bridge_started.pop(device_id, None)
+            self._bridge_failures.pop(device_id, None)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            self._bridge_restart_status(request, "stopped")
+            self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
+
+    def finish_bridge_restart_requests(self, present_ids: set[str]):
+        """Advance stopped requests only when the replacement bridge is authoritative."""
+        now = time.time()
+        for request_id, request in list(self._bridge_restarts.items()):
+            state = str(request.get("state") or "")
+            if state in {"channels_ready", "failed"}:
+                self._bridge_restarts.pop(request_id, None)
+                continue
+            device_id = str(request.get("device_id") or "")
+            if device_id not in present_ids:
+                self._bridge_restart_status(
+                    request, "failed", error="modem disappeared during bridge rebuild")
+                continue
+            if now - float(request.get("started_at") or now) > 45:
+                self._bridge_restart_status(
+                    request, "failed", error="timed out rebuilding the VPCD bridge")
+                continue
+            proc = self.bridges.get(device_id)
+            if not proc or proc.poll() is not None:
+                continue
+            if state != "spawned":
+                request = self._bridge_restart_status(
+                    request, "spawned", bridge_pid=int(proc.pid))
+            identity = read_json(self.data / "modems" / f"{device_id}.json")
+            if int(identity.get("bridge_pid") or 0) != int(proc.pid):
+                continue
+            if identity.get("channel_status") != "ready":
+                continue
+            if int(identity.get("channel_allocated") or 0) < 1:
+                continue
+            expected = str(request.get("expected_iccid_sha256") or "")
+            actual = str(identity.get("iccid") or "")
+            if expected and hashlib.sha256(actual.encode()).hexdigest() != expected:
+                continue
+            self._bridge_restart_status(
+                request, "channels_ready", bridge_pid=int(proc.pid),
+                channel_allocated=int(identity.get("channel_allocated") or 0))
+            self.log(f"VPCD bridge ready after eUICC profile refresh: {device_id}")
 
     @staticmethod
     def service_active(name: str) -> bool:
@@ -564,6 +676,17 @@ class Orchestrator:
         version = str(request.get("version") or "")
         repository = str(request.get("repository") or "")
         network = request.get("network") or {}
+        raw_asset_sizes = request.get("asset_sizes") or {}
+        asset_sizes = {}
+        if isinstance(raw_asset_sizes, dict):
+            for name, size in raw_asset_sizes.items():
+                try:
+                    parsed_size = int(size)
+                except (TypeError, ValueError):
+                    continue
+                if re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", str(name)) \
+                        and 0 < parsed_size < 20 * 1024 * 1024 * 1024:
+                    asset_sizes[str(name)] = parsed_size
 
         def fail(reason: str):
             atomic_json(status_path, {"state": "failed", "phase": "launch", "error": reason,
@@ -573,30 +696,64 @@ class Orchestrator:
                 or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             fail("invalid update request")
             return
-        mode = str(network.get("proxy_mode") or "direct").lower()
-        proxy_url = ""
-        if mode == "manual":
-            proxy_url = str(network.get("proxy_url") or "").strip()
-            parsed = urllib.parse.urlsplit(proxy_url)
-            if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h"} \
-                    or not parsed.hostname or any(ch in proxy_url for ch in "\r\n"):
-                fail("invalid update proxy configuration")
-                return
-        elif mode == "country":
-            country = str(network.get("proxy_country") or "").strip().lower()
-            state = (read_json(self.status_path).get("exits") or {}).get(country) or {}
+        desired = read_json(self.desired_path)
+        proxy = desired.get("proxy") or {}
+        live = read_json(self.status_path).get("exits") or {}
+
+        def resolve_route(selection: dict) -> dict:
+            mode = str(selection.get("proxy_mode") or "direct").lower()
+            if mode == "direct":
+                return {"proxy_url": "", "route": "direct", "route_name": ""}
+            if mode != "library":
+                raise ValueError("invalid update proxy mode")
+            profile_id = str(selection.get("proxy_profile_id") or "").strip()
+            profile = (proxy.get("profiles") or {}).get(profile_id) or {}
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) or not profile:
+                raise ValueError("selected update proxy is not in the proxy library")
+            route_name = str(profile.get("name") or profile_id).strip()[:120]
+            if profile.get("type") == "socks5":
+                host = str(profile.get("server") or "").strip()
+                try:
+                    port = int(profile.get("port") or 1080)
+                except (TypeError, ValueError):
+                    port = 0
+                if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
+                    raise ValueError("selected SOCKS5 update proxy is invalid")
+                username = urllib.parse.quote(str(profile.get("username") or ""), safe="")
+                password = urllib.parse.quote(str(profile.get("password") or ""), safe="")
+                auth = f"{username}:{password}@" if username or password else ""
+                proxy_url = f"socks5h://{auth}{host}:{port}"
+            else:
+                exits = proxy.get("exits") or {}
+                state = next((live.get(country) or {} for country, exit_cfg in exits.items()
+                              if isinstance(exit_cfg, dict) and exit_cfg.get("enabled")
+                              and exit_cfg.get("profile_id") == profile_id
+                              and (live.get(country) or {}).get("ready")), {})
+                try:
+                    proxy_port = int(state.get("proxy_port") or 0)
+                except (TypeError, ValueError):
+                    proxy_port = 0
+                proxy_host = str(state.get("proxy_host") or "").strip()
+                if proxy_host != COUNTRY_PROXY_LISTEN or not 1 <= proxy_port <= 65535:
+                    raise ValueError("selected update proxy has no ready country exit")
+                proxy_url = f"socks5h://{proxy_host}:{proxy_port}"
+            return {"proxy_url": proxy_url, "route": "library", "route_name": route_name}
+
+        requested_routes = request.get("networks")
+        selections = requested_routes if isinstance(requested_routes, list) else [network]
+        routes, route_error = [], ""
+        for selection in selections:
+            if not isinstance(selection, dict):
+                continue
             try:
-                proxy_port = int(state.get("proxy_port") or 0)
-            except (TypeError, ValueError):
-                proxy_port = 0
-            proxy_host = str(state.get("proxy_host") or "").strip()
-            if not re.fullmatch(r"[a-z]{2}", country) or not state.get("ready") \
-                    or proxy_host != COUNTRY_PROXY_LISTEN or not 1 <= proxy_port <= 65535:
-                fail("selected update country exit is not ready")
-                return
-            proxy_url = f"socks5h://{proxy_host}:{proxy_port}"
-        elif mode != "direct":
-            fail("invalid update proxy mode")
+                resolved = resolve_route(selection)
+            except ValueError as exc:
+                route_error = str(exc)
+                continue
+            if not any(item["proxy_url"] == resolved["proxy_url"] for item in routes):
+                routes.append(resolved)
+        if not routes:
+            fail(route_error or "no usable update download route")
             return
         if self.dry_run:
             fail("dry-run orchestrator does not apply updates")
@@ -610,7 +767,11 @@ class Orchestrator:
             network_path = runner.parent / "network.json"
             # Proxy credentials stay in a root-only file and never appear in systemd's command
             # line, unit metadata, progress status or journal output.
-            atomic_json(network_path, {"proxy_url": proxy_url})
+            atomic_json(network_path, {"proxy_url": routes[0]["proxy_url"],
+                                      "route": routes[0]["route"],
+                                      "route_name": routes[0]["route_name"],
+                                      "routes": routes,
+                                      "asset_sizes": asset_sizes})
         except OSError as exc:
             fail(f"could not stage the updater: {exc}")
             return
@@ -665,7 +826,9 @@ class Orchestrator:
                 present and (target_data_active != observed_data_active or
                              (backend_active and radio_enabled is not None and
                               bool(wanted.get("flight_mode")) == radio_enabled) or
-                             (bool(desired_devices) and not backend_active))))
+                             (not self._serial_mode
+                              and not bool(wanted.get("flight_mode"))
+                              and not backend_active))))
             devices[device_id] = {
                 "id": device_id,
                 "name": assignment.get("name") or "USB modem",
@@ -681,7 +844,8 @@ class Orchestrator:
                            # Which path is carrying SIM traffic, so a modem serving VoWiFi
                            # without any cellular capability is not read as half-broken.
                            "vowifi_backend": ("direct-serial"
-                                              if degraded or self._serial_mode else
+                                              if degraded or self._serial_mode or
+                                              (vowifi_actual and not mm_active) else
                                               "modemmanager" if vowifi_actual else ""),
                            # False only in configured serial mode: cellular is then a
                            # capability this host does not have, and the control plane
@@ -833,6 +997,14 @@ class Orchestrator:
         self._bridge_failures[hwid] = {"count": count, "at": time.time(), "reason": reason,
                                        "returncode": proc.returncode,
                                        "uptime": round(uptime, 1)}
+        lowered = reason.casefold()
+        if count >= 3 and "logical channel allocation failed" in lowered and \
+                ("phonefailure" in lowered or "phone failure" in lowered):
+            self._degraded[hwid] = (
+                "ModemManager owns the modem but its AT command path cannot access the SIM; "
+                "using direct serial for the VoWiFi bridge while cellular data stays disabled.")
+            self.log(f"ModemManager SIM access failed repeatedly for {hwid}; "
+                     "falling back to direct serial")
         self.log(f"SIM bridge for {hwid} exited after {uptime:.0f}s "
                  f"(rc={proc.returncode}, attempt {count})"
                  + (f": {reason}" if reason else ""))
@@ -907,6 +1079,11 @@ class Orchestrator:
             return False
         if plan["cellular_devices"]:
             return True
+        # With RF deliberately disabled, ModemManager has no remaining job: data is off and
+        # direct serial can continue serving the UICC/VoWiFi path. It is brought back before
+        # RF is enabled again, so the transition remains explicit and reversible.
+        if present_ids and set(present_ids) <= set(plan.get("flight_mode_devices") or []):
+            return False
         if not plan["cellular_backend_required"]:
             return False
         if present_ids and set(present_ids) <= set(self._degraded):
@@ -1322,6 +1499,15 @@ class Orchestrator:
     def apply_device_radios(self, discovered: list[dict], desired_devices: dict,
                             through_modemmanager: bool):
         """Apply independent RF (flight mode) and cellular-data intent per modem."""
+        # Configured serial mode is VoWiFi-only: the UI publishes both cellular data and
+        # flight mode as unsupported, and the direct SIM bridge must be the sole owner of
+        # the AT port.  Opening the port here just to send AT+CFUN=1 is therefore both
+        # contradictory and harmful.  In particular, QEMU USB passthrough may reject the
+        # pyserial DTR/RTS control transfer with EPROTO; the subsequent bridge then inherits
+        # an unresponsive port and times out on ATE0.  The bridge has its own virtualisation-
+        # tolerant serial implementation, so leave the modem entirely to it in this mode.
+        if self._serial_mode:
+            return
         for modem in discovered:
             device_id = modem["id"]
             wanted = desired_devices.get(device_id) or {}
@@ -2172,10 +2358,64 @@ class Orchestrator:
         except OSError as exc:
             print(f"could not retire identity document for {old_id}: {exc}", flush=True)
 
-    def reader_stanza(self, modem: dict, base: int) -> str:
+    def vpcd_library(self) -> Path:
+        """Return the installed upstream VPCD IFD handler.
+
+        ``MDD_VPCD_LIBRARY`` is primarily a relocatable-install/test hook.  Instance copies
+        are deliberately excluded from discovery by looking for the exact upstream basename.
+        """
+        configured = os.environ.get("MDD_VPCD_LIBRARY", "").strip()
+        if configured:
+            return Path(configured)
         candidates = list(Path("/usr/local/lib").glob("**/libifdvpcd.so"))
         candidates += list(Path("/usr/lib").glob("**/libifdvpcd.so"))
-        library = str(candidates[0]) if candidates else "/usr/local/lib/libifdvpcd.so"
+        return candidates[0] if candidates else Path("/usr/local/lib/libifdvpcd.so")
+
+    def isolated_vpcd_library(self, base: int, config_path: Path) -> Path:
+        """Give each modem its own loaded copy of libifdvpcd.
+
+        Upstream libifdvpcd stores its connections in a process-global ``ctx[slot]`` array
+        and indexes it with only the low (slot) half of the PC/SC LUN.  If two configured
+        readers load the same shared object, their slot 0/1/2 contexts alias: the later
+        modem can overwrite the earlier modem even though pcscd still lists both readers and
+        every bridge TCP socket remains established.  A distinct shared-object file per base
+        port gives the dynamic loader a separate data segment and therefore a separate slot
+        array for every modem.
+        """
+        source = self.vpcd_library()
+        directory = Path(os.environ.get(
+            "MDD_VPCD_DRIVER_INSTANCE_DIR",
+            str(config_path.parent / ".mdd-vpcd-drivers"),
+        ))
+        target = directory / f"libifdvpcd-mdd-{int(base):04x}.so"
+        if self.dry_run:
+            return target
+        if not source.is_file():
+            # The installer already reports a missing driver. Avoid repeating the same
+            # warning on every reconciliation cycle while retaining its expected path in
+            # the generated definition for when the package is repaired.
+            return source
+        try:
+            source_bytes = source.read_bytes()
+            if target.is_file() and target.read_bytes() == source_bytes:
+                return target
+            directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+            os.chmod(directory, 0o755)
+            temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            temporary.write_bytes(source_bytes)
+            os.chmod(temporary, 0o755)
+            os.replace(temporary, target)
+            return target
+        except OSError as exc:
+            # A single-modem deployment still works with the original library.  Keep the
+            # gateway available and make the isolation failure explicit in the journal.
+            print(f"could not isolate VPCD driver for port {base}: {exc}; using {source}",
+                  flush=True)
+            return source
+
+    def reader_stanza(self, modem: dict, base: int, config_path: Path | None = None) -> str:
+        config_path = config_path or self.reader_config_path
+        library = self.isolated_vpcd_library(base, config_path)
         return (f"FRIENDLYNAME \"VoWiFi Modem {modem['id']}\"\n"
                 f"DEVICENAME /dev/null:0x{base:04X}\nLIBPATH {library}\n"
                 f"CHANNELID 0x{base:04X}\n")
@@ -2245,15 +2485,19 @@ class Orchestrator:
         # dialling a port pcscd will never listen on for the life of the process.
         slots = max(1, min(VPCD_CHANNEL_CAPACITY, self.driver_slots(),
                            int(hardware.get("vpcd_slots") or VPCD_CHANNEL_CAPACITY)))
-        # Keep reader definitions stable for every detected modem. A capability toggle only
-        # starts/stops that modem's bridge; it must not restart pcscd and disturb other lines.
-        reader_config = "\n".join(self.reader_stanza(m, assignments[m["id"]]["base_port"])
-                                  for m in modems)
         # Resolved per cycle, not cached: the path is an environment override and tests (and
         # a relocated install) expect a change to take effect without a restart.
         config_path = Path(os.environ.get(
             "MDD_VPCD_READER_CONFIG", "/etc/reader.conf.d/mdd-sim-gateway-modems"))
         self.reader_config_path = config_path
+        # Keep reader definitions stable for every detected modem. A capability toggle only
+        # starts/stops that modem's bridge; it must not restart pcscd and disturb other lines.
+        # Each definition points at its own copy of libifdvpcd because the upstream driver has
+        # process-global per-slot state and cannot isolate two modems in one shared object.
+        reader_config = "\n".join(
+            self.reader_stanza(m, assignments[m["id"]]["base_port"], config_path)
+            for m in modems
+        )
         legacy_config = config_path.with_name("vowifi-modems")
         legacy_present = legacy_config.exists() and legacy_config != config_path
         distro_disabled = self.disable_distro_vpcd_reader(config_path)
@@ -2357,6 +2601,7 @@ class Orchestrator:
         self.root.mkdir(parents=True, exist_ok=True)
         while not self.stop:
             self.process_update_request()
+            self.process_bridge_restart_requests()
             self.retire_obsolete_services()
             self.reconcile_timezone()
             desired = read_json(self.desired_path)
@@ -2434,6 +2679,7 @@ class Orchestrator:
             # for stable enumeration, but never receive a bridge process or usable SIM channel.
             assignments = self.reconcile_hardware(
                 desired, active_desired, through_modemmanager=cellular_required)
+            self.finish_bridge_restart_requests(present_ids)
             self.publish_device_status(desired_devices, assignments)
             self.publish_host_diagnostics(discovered, assignments, mm_active,
                                           cellular_required, vowifi_required)
@@ -2449,7 +2695,8 @@ class Orchestrator:
         """Cheap change detector for the documents an operator action writes."""
         stamps = []
         for path in (self.desired_path, self.device_desired_path,
-                     self.data / "config.yaml", self.reselect_path):
+                     self.data / "config.yaml", self.reselect_path,
+                     self.bridge_restart_request_dir):
             try:
                 stamps.append(path.stat().st_mtime)
             except OSError:

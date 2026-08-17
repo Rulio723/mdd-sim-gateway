@@ -2,6 +2,95 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [Unreleased]
+
+## [1.3.12] - 2026-08-17
+
+### Added
+
+- Added a guarded PVE helper that rebinds exactly two `2c7c:0125` modems by stable physical
+  USB topology after a port change. It refuses ambiguous hardware, unrelated target-VM
+  settings, and devices configured in or still held by another VM before changing anything.
+
+### Fixed
+
+- eSIM operations now work on a cellular module's own SIM. Each modem VPCD slot emulates the
+  LPA's exact `MANAGE CHANNEL` OPEN/CLOSE handshake over its preallocated physical channel:
+  OPEN returns the channel the slot already owns and CLOSE succeeds without releasing it,
+  preventing duplicate allocation or closure of the bridge-owned channel. When the LPA closes
+  that channel the bridge restores the plain USIM view, because the slot is shared with the PIN
+  keeper and the engine, which select ADF.USIM on the same real UICC channel.
+- A repeated MANAGE CHANNEL OPEN answer no longer takes the SIM down. It was treated as proof
+  that the UICC had no channels left, so the bridge exited within seconds of every start and
+  stopped both lines; a late AT reply read as the answer to the next command produces the same
+  symptom with a healthy SIM. The port is settled and the channel requested again, and only a
+  duplicate that survives the retries is reported as an allocation failure.
+- A disabled line no longer serves the last observation taken while it ran, which left a device
+  reading "no SIM card" after VoWiFi was switched off until the next poll overwrote it.
+- Flight-mode-only VoWiFi can settle on a direct-serial SIM bridge without keeping
+  ModemManager active. Three consecutive ModemManager `PhoneFailure` logical-channel
+  allocation failures also trigger that fail-closed fallback while cellular data stays off.
+- VoWiFi-only serial mode no longer probes or controls modem radio ports after it has claimed
+  the SIM AT port, preventing ModemManager-style contention and empty `ATE0` replies on
+  virtualized USB passthrough.
+- Saved lines now follow their SIM by ICCID/IMEI when a modem is replugged onto a different USB
+  path. Provisioning can recover from persisted modem metadata when live APDU access is not yet
+  available, while preserving each line's PIN, SWu and AMI virtual-reader slots. Every manual
+  start and health-policy rebuild revalidates the complete virtual-reader group against the
+  bridge's current ICCID metadata before creating the engine, so a stale live reader name cannot
+  send one carrier's IMS-AKA challenge to the other modem's SIM (`SW=9862`).
+- Engine PIN and IMS authentication workers now honor the exact per-modem virtual PC/SC reader
+  names supplied by the control plane instead of falling back to a global reader index.
+- Each modem now loads an isolated VPCD driver copy. This prevents the driver's process-global
+  slot table from making two identical modems overwrite one another, which previously left both
+  lines reporting `NO_CARD` even though all bridge sockets were connected.
+- The sidebar Star count is no longer erased by the one-minute system-status refresh. Its
+  GitHub metadata lookup now has an independent cached retry path instead of waiting up to
+  six hours for the next release check after a transient network failure.
+- Switching a saved eSIM profile in a cellular modem now stops that modem's old lines,
+  rebuilds only its VPCD bridge, waits for a new ready logical-channel generation, verifies
+  every exposed virtual reader against the target profile and starts only the matching line.
+  Failed LPA operations restore the exact previous running snapshot; post-switch recovery
+  failures stay stopped instead of authenticating an old line against the new card identity.
+- Proxy node names render in the UI font instead of the emoji-flag font, and the call log's
+  remaining English strings are translated.
+- Support bundles now carry the per-line diagnostic records instead of blanking them. A
+  record embeds its tunnel log tail, and one routine engine message inside that tail matched
+  the log redactor's key-material rules — which blanked the whole record and the two records
+  after it, emptying the one file written to survive a rebuild loop. Records are now redacted
+  as structure, so only the offending log lines go and the registration, SIP and host evidence
+  beside them survives.
+- Support bundles now state each line's status, classified reason and retry-budget position.
+  Tunnel logs that all end at `CONNECTED` cannot explain why a line kept being rebuilt; the
+  reason code and how long the line has been failing can.
+- Release cross-builds compile the architecture-independent WebUI on the runner's native
+  platform, avoiding an indefinitely slow `npm ci` under ARM64 QEMU on GitHub-hosted runners.
+- The update dialog now exposes every host-side stage, install mode, selected download route,
+  current Release asset, byte progress, speed, elapsed time, live reload activity and the exact
+  failed stage instead of presenting a generic spinner. The detached updater publishes a
+  heartbeat throughout downloads and service reloads.
+- Auto update networking now falls through its remaining proxy-library routes when an asset
+  download fails or the current route remains too slow, then reuses the route that succeeded
+  for the checksum and Docker control-image assets.
+
+## [1.3.11] - 2026-08-16
+
+### Changed
+
+- Software updates now default to direct-first Auto networking and fall back through the
+  shared proxy library, reusing the successful check route for downloads. Docker-mode updates
+  import a checksummed ARM64 control-image Release asset through that route instead of asking
+  the Docker daemon to pull it.
+
+### Fixed
+
+- Proxy node country flags now use the bundled Twemoji Mozilla font across overview, detail,
+  status and selection surfaces, so regional-indicator sequences remain flags on platforms
+  that otherwise render them as country-code letters. Proxy source types also use recognizable
+  Emoji icons.
+- The sidebar Star count keeps a stable slot to the right of its icon and retains the last
+  successful value when a later GitHub metadata request fails.
+
 ## [1.3.10] - 2026-08-16
 
 ### Added
@@ -94,6 +183,16 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   switch stays disabled until one does — a fresh module could never be provisioned, and
   turning VoWiFi off to run an eSIM operation emptied the reader instead. Bridges now follow
   the hardware: every connected module has one.
+- Answered MANAGE CHANNEL inside the module SIM bridge instead of refusing it. An LPA opens a
+  logical channel before it can select the ISD-R, and lpac reports that refusal as a bare
+  `euicc_init`, so eSIM management over a cellular module could never start. The slot already
+  owns a UICC channel, so OPEN now reports it and CLOSE is acknowledged without releasing it.
+  Closing that channel also restores the USIM file system, because the slot is shared with
+  PIN keeping and the engine and an eUICC application left selected there reads as no card.
+- Stopped a device from reporting the last problem of a line that was just switched off.
+  The status cache kept serving that observation until the next poll, which is how a module
+  could read "no SIM card" with its SIM in the reader. A disabled line now reports stopped
+  immediately, and switching VoWiFi off records the stop the way an explicit stop does.
 - Stopped reporting "this card is not an eUICC" for a reader that simply holds no card, and
   added `install.sh diagnose`: one masked report covering reader definitions, live readers,
   bridges, sockets, orchestrator state and an lpac read per module reader.

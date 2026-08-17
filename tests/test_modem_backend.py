@@ -5,12 +5,83 @@ from unittest.mock import patch
 
 from host import mdd_orchestrator
 from host.mdd_orchestrator import Orchestrator
-from host.vpcd_modem_bridge import (ModemError, ModemManagerCard,
+from host.vpcd_modem_bridge import (ModemCard, ModemError, ModemManagerCard,
                                     allocate_logical_channels,
                                     logical_channel_metadata, serve_slot)
 
 
+class ManageChannelTests(unittest.TestCase):
+    """An LPA opens a logical channel before it can select the ISD-R. The slot is already
+    on one, opened with AT+CCHO, and the modem cannot nest another inside it — so the
+    bridge answers MANAGE CHANNEL itself. Refusing it failed every eSIM read on a module
+    with a bare `euicc_init`, exactly as lpac's PC/SC driver reports that failure."""
+
+    OPEN = bytes.fromhex("0070000001")      # lpac's APDU_OPENLOGICCHANNEL
+    @staticmethod
+    def close(channel):
+        return bytes((0x00, 0x70, 0x80, channel, 0x00))
+
+    def test_open_reports_the_channel_this_slot_already_holds(self):
+        rewritten, response = ModemCard.on_channel(self.OPEN, 2)
+        self.assertIsNone(rewritten)                       # never reaches the modem
+        self.assertEqual(response, bytes.fromhex("029000"))  # lpac requires 3 bytes, SW 9x
+
+    def test_close_is_acknowledged_without_releasing_the_slot(self):
+        rewritten, response = ModemCard.on_channel(self.close(2), 2)
+        self.assertIsNone(rewritten)
+        self.assertEqual(response, bytes.fromhex("9000"))
+
+    def test_closing_the_channel_restores_the_usim_file_system(self):
+        """The LPA leaves the ISD-R selected on a channel pin_keeper shares, and pcscd only
+        power-cycles the card once every client is gone — so the next ADF.USIM select would
+        fail and the line would report NO_CARD with a perfectly good SIM in the reader."""
+        card = ModemCard.__new__(ModemCard)
+        selected = []
+        card.select_mf = lambda channel: selected.append(channel)
+
+        self.assertEqual(card.transmit(self.close(2), 2), bytes.fromhex("9000"))
+        self.assertEqual(selected, [2])
+
+    def test_opening_a_channel_does_not_disturb_the_selection(self):
+        card = ModemCard.__new__(ModemCard)
+        card.select_mf = lambda channel: self.fail("MF must not be reselected on open")
+
+        self.assertEqual(card.transmit(self.OPEN, 1), bytes.fromhex("019000"))
+
+    def test_a_select_after_the_open_is_forced_onto_the_real_channel(self):
+        select = bytes.fromhex("01A40400" + "10" + "A0000005591010FFFFFFFF8900000100")
+        rewritten, response = ModemCard.on_channel(select, 3)
+        self.assertIsNone(response)
+        self.assertEqual(rewritten[0], 0x03)
+        self.assertEqual(rewritten[1:], select[1:])
+
+    def test_an_unknown_manage_channel_variant_is_still_refused(self):
+        _rewritten, response = ModemCard.on_channel(bytes.fromhex("0070400001"), 1)
+        self.assertEqual(response, bytes.fromhex("6A86"))
+
+
 class ModemBackendTests(unittest.TestCase):
+    def test_preallocated_slot_emulates_manage_channel_open_and_its_exact_close(self):
+        card = ModemCard.__new__(ModemCard)
+        with patch.object(card, "csim") as csim, \
+                patch.object(card, "select_mf") as select_mf:
+            self.assertEqual(
+                card.transmit(bytes.fromhex("0070000001"), 2),
+                bytes.fromhex("029000"))
+            self.assertEqual(
+                card.transmit(bytes.fromhex("0070800200"), 2),
+                bytes.fromhex("9000"))
+        csim.assert_not_called()
+        select_mf.assert_called_once_with(2)
+
+    def test_preallocated_slot_rejects_wrong_or_malformed_manage_channel_commands(self):
+        card = ModemCard.__new__(ModemCard)
+        with patch.object(card, "csim") as csim:
+            for apdu in ("0070010001", "0070800100", "0070000000", "0070"):
+                self.assertEqual(card.transmit(bytes.fromhex(apdu), 2),
+                                 bytes.fromhex("6A86"))
+        csim.assert_not_called()
+
     def test_logical_channel_metadata_exposes_capacity_roles_and_ids(self):
         value = logical_channel_metadata([1, 2, 3])
         self.assertEqual(value["channel_capacity"], 3)
@@ -23,22 +94,37 @@ class ModemBackendTests(unittest.TestCase):
         ])
 
     def test_partial_logical_channel_allocation_is_released_with_clear_error(self):
-        class Card:
-            def __init__(self):
-                self.values = iter((1, 1))
-                self.closed = []
-
-            def open_channel(self):
-                return next(self.values)
-
-            def close_channel(self, channel):
-                self.closed.append(channel)
-
-        card = Card()
+        card = self.FakeCard((1, 1, 1))
         with self.assertRaisesRegex(ModemError,
                                     "SIM logical channel allocation failed \\(1/3 allocated\\)"):
             allocate_logical_channels(card, 3)
         self.assertEqual(card.closed, [1])
+        # Only a channel that stays duplicated across settle+retry is a real allocation failure.
+        self.assertEqual(card.settled, 2)
+
+    def test_a_repeated_channel_number_is_retried_before_the_bridge_gives_up(self):
+        """A late AT reply read as the answer to the next command repeats the previous
+        channel. Failing on the first sighting took both lines down over a transport
+        artefact; settling the port and asking again recovers the same SIM."""
+        card = self.FakeCard((1, 1, 2, 3))
+        self.assertEqual(allocate_logical_channels(card, 3), [1, 2, 3])
+        self.assertEqual(card.settled, 1)
+        self.assertEqual(card.closed, [])
+
+    class FakeCard:
+        def __init__(self, values):
+            self.values = iter(values)
+            self.closed = []
+            self.settled = 0
+
+        def open_channel(self):
+            return next(self.values)
+
+        def close_channel(self, channel):
+            self.closed.append(channel)
+
+        def settle(self):
+            self.settled += 1
 
     def test_modemmanager_command_backend(self):
         card = ModemManagerCard.__new__(ModemManagerCard)

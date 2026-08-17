@@ -92,6 +92,7 @@ export const api = {
   systemStatus: () => j('GET', '/api/system/status'),
   clearHostAlerts: () => j('DELETE', '/api/system/host-alerts'),
   checkUpdate: (force = false) => j('GET', `/api/system/update/check${force ? '?force=true' : ''}`),
+  repositoryStars: (force = false) => j('GET', `/api/system/repository/stars${force ? '?force=true' : ''}`),
   applyUpdate: () => j('POST', '/api/system/update/apply', {}),
   updateProgress: () => j('GET', '/api/system/update/progress'),
   createBackup: () => j('POST', '/api/system/backups', {}),

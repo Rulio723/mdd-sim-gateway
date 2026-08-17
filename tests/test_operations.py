@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 import zipfile
 from io import BytesIO
@@ -8,6 +9,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from control.app import config, operations
+
+try:
+    from control.app import main
+except ImportError:      # the Docker SDK is a manager runtime dependency this does not need
+    main = None
 
 
 class OperationsTests(unittest.TestCase):
@@ -172,6 +178,87 @@ class OperationsTests(unittest.TestCase):
                     "logs/sim1-charon-20260807-110000.log").decode()
             self.assertIn("STATE 2", retained)
 
+    def test_diagnostic_records_survive_redaction_instead_of_being_blanked(self):
+        # engine.capture_diagnostics embeds the tunnel log tail in each record, and swu_ike
+        # prints "received decoded message" on every fragmented exchange. Under the line
+        # rules that one phrase blanked the record and, via the two-line lookahead, the two
+        # records after it — so every record of every bundle came out empty.
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
+            logs = Path(temp) / "instances" / "sim1" / "logs"
+            logs.mkdir(parents=True)
+            records = [
+                {"ts": 1786894085, "reason": "health-freeze:reg_unanswered",
+                 "registration": "unregistered", "pcscf": "fd00:976a:2:147::5",
+                 "charon": {"retransmits": 3, "tail": ["received decoded message",
+                                                       "SK_ei: 0011223344556677",
+                                                       "tunnel CONNECTED"]},
+                 "sip": ["SIP/2.0 401 Unauthorized"]},
+                {"ts": 1786894200, "reason": "health-freeze:registering",
+                 "registration": "unregistered", "charon": {"tail": ["STATE 4"]},
+                 "sip": []},
+                {"ts": 1786894300, "reason": "health-freeze:registering",
+                 "registration": "unregistered", "charon": {"tail": ["STATE 4"]},
+                 "sip": []},
+            ]
+            logs.joinpath("diagnostics.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in records) + "\n")
+
+            content = operations.support_bundle({})
+
+            with zipfile.ZipFile(BytesIO(content)) as archive:
+                text = archive.read("logs/sim1-diagnostics.jsonl").decode()
+        parsed = [json.loads(line) for line in text.splitlines() if line.strip()]
+        self.assertEqual(len(parsed), 3)
+        # The evidence that names the failure is what has to survive.
+        self.assertEqual(parsed[0]["registration"], "unregistered")
+        self.assertEqual(parsed[0]["reason"], "health-freeze:reg_unanswered")
+        self.assertEqual(parsed[0]["sip"], ["SIP/2.0 401 Unauthorized"])
+        self.assertEqual(parsed[0]["charon"]["retransmits"], 3)
+        # Only the offending tail lines go, and the lookahead never reaches later records.
+        tail = parsed[0]["charon"]["tail"]
+        self.assertEqual(tail[0], "<redacted cryptographic material>")
+        self.assertEqual(tail[1], "<redacted cryptographic material>")
+        self.assertEqual(tail[2], "tunnel CONNECTED")
+        self.assertEqual(parsed[1]["charon"]["tail"], ["STATE 4"])
+        self.assertEqual(parsed[2]["charon"]["tail"], ["STATE 4"])
+
+    def test_diagnostic_redaction_still_removes_identifiers_and_bad_records(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
+            logs = Path(temp) / "instances" / "sim1" / "logs"
+            logs.mkdir(parents=True)
+            logs.joinpath("diagnostics.jsonl").write_text(
+                json.dumps({"usim": {"imsi": "001010123456789", "iccid": "8944000000000000000"},
+                            "note": "peer 0011223344556677889900aabbccddeeff"}) + "\n"
+                "not json at all: SKEYSEED: 00112233445566778899\n")
+
+            content = operations.support_bundle({})
+
+            with zipfile.ZipFile(BytesIO(content)) as archive:
+                text = archive.read("logs/sim1-diagnostics.jsonl").decode()
+        self.assertNotIn("001010123456789", text)
+        self.assertNotIn("8944000000000000000", text)
+        self.assertNotIn("0011223344556677889900aabbccddeeff", text)
+        # A line that will not parse must not become a hole in the redaction.
+        self.assertNotIn("00112233445566778899", text)
+        self.assertIn("<redacted cryptographic material>", text.splitlines()[-1])
+
+    def test_plain_logs_keep_the_strict_whole_line_rules(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
+            run = Path(temp) / "instances" / "sim1" / "run"
+            run.mkdir(parents=True)
+            run.joinpath("charon.log").write_text(
+                "IKEv2 DECRYPTION TABLE\n"
+                "0011223344556677\n"
+                "8899aabbccddeeff\n"
+                "tunnel CONNECTED\n")
+
+            content = operations.support_bundle({})
+
+            with zipfile.ZipFile(BytesIO(content)) as archive:
+                lines = archive.read("logs/sim1-charon.log").decode().splitlines()
+        self.assertEqual(lines[:3], ["<redacted cryptographic material>"] * 3)
+        self.assertEqual(lines[3], "tunnel CONNECTED")
+
     def test_sensitive_config_files_are_owner_only(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(config, "DATA_DIR", temp), \
@@ -194,6 +281,54 @@ class OperationsTests(unittest.TestCase):
         inst["ami_secret"] = "random-ami-secret"
         with self.assertRaisesRegex(ValueError, "WebRTC credential"):
             config.render_instance_json(inst, {})
+
+
+@unittest.skipIf(main is None, "manager runtime dependencies are unavailable")
+class LineDiagnosticsTests(unittest.TestCase):
+    """The per-line verdict the bundle carries beside the logs."""
+
+    def setUp(self):
+        main.hub.status_cache.clear()
+        main.hub.health.clear()
+        main.hub.ok_since.clear()
+
+    def test_summary_names_the_reason_and_how_far_the_retry_budget_has_run(self):
+        main.hub.status_cache["1"] = {
+            "state": "REGISTERING", "reason_code": "reg_unanswered",
+            "reason": "The carrier's IMS stopped answering registration.",
+            "retry": {"count": 2, "max": 3},
+            "detail": {"registration": "unregistered", "active_channels": 0},
+        }
+        main.hub.health["1"] = {"fail_start": time.monotonic() - 61.0, "frozen_code": None}
+
+        entry = main._line_diagnostics({"id": "1", "name": "T-MOBILE"})
+
+        self.assertEqual(entry["reason_code"], "reg_unanswered")
+        self.assertEqual(entry["registration"], "unregistered")
+        self.assertEqual(entry["active_channels"], 0)
+        self.assertEqual(entry["retry"], {"count": 2, "max": 3})
+        # Monotonic readings mean nothing to a reader; their distance from now is the story.
+        self.assertGreaterEqual(entry["failing_for_seconds"], 61.0)
+        self.assertIsNone(entry["ok_for_seconds"])
+
+    def test_summary_carries_no_subscriber_identifiers(self):
+        main.hub.status_cache["1"] = {
+            "state": "OK", "reason_code": "ok", "reason": "", "retry": {},
+            "detail": {"registration": "registered", "msisdn": "+12025550123",
+                       "imsi": "001010123456789"},
+        }
+
+        entry = operations.redact(main._line_diagnostics({"id": "1", "name": "T-MOBILE"}))
+
+        self.assertNotIn("+12025550123", json.dumps(entry))
+        self.assertNotIn("001010123456789", json.dumps(entry))
+        self.assertEqual(entry["registration"], "registered")
+
+    def test_a_line_the_sampler_has_not_reached_says_so(self):
+        entry = main._line_diagnostics({"id": "9", "name": "NEW"})
+        # An absent verdict must not read as a healthy one.
+        self.assertNotIn("state", entry)
+        self.assertIn("no status sampled", entry["note"])
 
 
 if __name__ == "__main__":

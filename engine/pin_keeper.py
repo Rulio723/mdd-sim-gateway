@@ -11,7 +11,8 @@ which pcscd does not serialize as groups).
 
 Config via env (set by entrypoint from /config/instance.json):
   USIM_PIN        - the CHV1 PIN (digits). If empty/"none", PIN is assumed disabled.
-  USIM_READER     - "imsi:<IMSI>" (preferred) or integer reader index. Default 0.
+  USIM_READER     - exact PC/SC reader name, "imsi:<IMSI>", "iccid:<ICCID>", or
+                    integer reader index. Default 0.
   MDD_RUNDIR   - status dir (default /run/mdd-sim-gateway)
 
 Writes JSON status to $MDD_RUNDIR/pin_status.json:
@@ -276,6 +277,7 @@ def find_reader(reader_spec):
                         (works only once PIN is already satisfied) and finally the first
                         readable card.
       - iccid:<ICCID> -> match by ICCID (always readable, no PIN).
+      - <reader name> -> exact PC/SC reader-name match.
       - <index>      -> that reader index.
     """
     rlist = readers()
@@ -346,11 +348,23 @@ def find_reader(reader_spec):
         _close_others(candidates, conn)
         return r, conn
 
+    # Modem-backed lines deliberately bind PIN, SWu and IMS to separate VPCD logical
+    # channels.  Those bindings are persisted as full PC/SC reader names (for example
+    # "VoWiFi Modem ... 00 00").  Falling through to int() used to turn every such name
+    # into index 0, so the second modem opened the first modem's PIN slot and reported
+    # NO_CARD forever.  Match the exact name before accepting a legacy numeric index.
+    if isinstance(reader_spec, str):
+        wanted = reader_spec.strip()
+        for r in rlist:
+            if str(r) == wanted:
+                conn = _open(r)
+                return (r, conn) if conn else (None, None)
+
     try:
         idx = int(reader_spec)
     except (TypeError, ValueError):
-        idx = 0
-    if idx >= len(rlist):
+        return None, None
+    if idx < 0 or idx >= len(rlist):
         return None, None
     conn = _open(rlist[idx])
     return (rlist[idx], conn) if conn else (None, None)

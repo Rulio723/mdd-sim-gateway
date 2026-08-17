@@ -11,7 +11,7 @@ import unittest
 from types import SimpleNamespace
 import requests
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from control.app import config, update_check
 from host import mdd_orchestrator
@@ -36,16 +36,17 @@ class RequestApplyTests(unittest.TestCase):
         self.status_path = os.path.join(self.tmp.name, "orchestrator", "update-status.json")
 
     def test_request_is_published_with_version_and_repository(self):
-        with patch.object(update_check, "check", return_value=dict(_AVAILABLE)), \
-                patch.object(update_check, "_network_selection", return_value={
-                    "proxy_mode": "country", "proxy_url": "", "proxy_country": "us"}):
+        available = {**_AVAILABLE, "network": {
+            "proxy_mode": "library", "proxy_profile_id": "primary"}}
+        with patch.object(update_check, "check", return_value=available):
             result = update_check.request_apply()
         self.assertTrue(result["ok"])
         with open(self.request_path, encoding="utf-8") as handle:
             request = json.load(handle)
         self.assertEqual(request["version"], "9.9.9")
         self.assertEqual(request["repository"], update_check.repository())
-        self.assertEqual(request["network"]["proxy_country"], "us")
+        self.assertEqual(request["network"]["proxy_profile_id"], "primary")
+        self.assertEqual(request["networks"][0]["proxy_profile_id"], "primary")
         with open(self.status_path, encoding="utf-8") as handle:
             status = json.load(handle)
         self.assertEqual(status["state"], "running")
@@ -104,14 +105,52 @@ class UpdaterTests(unittest.TestCase):
         proxy = "socks5h://user:secret@127.0.0.1:1080"
         env = mdd_update.network_environment(proxy)
         self.assertEqual(env["ALL_PROXY"], proxy)
-        completed = type("Completed", (), {"returncode": 0, "stderr": ""})()
+        process = SimpleNamespace(returncode=0)
+        process.poll = Mock(side_effect=[None, 0])
+        process.communicate = Mock(return_value=("", ""))
         with tempfile.TemporaryDirectory() as tmp, patch.object(
-                mdd_update.subprocess, "run", return_value=completed) as run:
+                mdd_update.subprocess, "Popen", return_value=process) as popen, \
+                patch.object(mdd_update.time, "sleep"):
+            status = mdd_update.Status(Path(tmp, "status.json"), "9.9.9")
             mdd_update.download("https://example.invalid/release.tar.gz",
-                                Path(tmp, "release.tar.gz"), env, proxy)
-        args = run.call_args.args[0]
+                                Path(tmp, "release.tar.gz"), env, proxy, status=status,
+                                artifact="release.tar.gz", total_bytes=1234,
+                                route="library", route_name="Primary")
+            published = json.loads(Path(tmp, "status.json").read_text())
+        args = popen.call_args.args[0]
         self.assertNotIn(proxy, args)
-        self.assertEqual(run.call_args.kwargs["env"]["HTTPS_PROXY"], proxy)
+        self.assertEqual(popen.call_args.kwargs["env"]["HTTPS_PROXY"], proxy)
+        self.assertEqual(published["phase"], "downloading")
+        self.assertEqual(published["artifact"], "release.tar.gz")
+        self.assertEqual(published["total_bytes"], 1234)
+        self.assertEqual(published["route_name"], "Primary")
+
+    def test_verified_control_image_is_loaded_and_identity_checked(self):
+        completed = lambda code=0, out="", err="": type(
+            "Completed", (), {"returncode": code, "stdout": out, "stderr": err})()
+        calls = [completed(0, "sha256:old\n"), completed(), completed(0, "Loaded image\n"),
+                 completed(0, "arm64|9.9.9\n")]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(mdd_update.platform, "machine", return_value="aarch64"), \
+                patch.object(mdd_update.subprocess, "run", side_effect=calls) as run:
+            artifact = Path(tmp, "control.tar.gz")
+            artifact.write_bytes(b"image")
+            mdd_update.load_control_image(artifact, "9.9.9")
+        self.assertEqual(run.call_args_list[2].args[0][:3], ["docker", "load", "--input"])
+
+    def test_control_image_mismatch_restores_previous_tag(self):
+        completed = lambda code=0, out="", err="": type(
+            "Completed", (), {"returncode": code, "stdout": out, "stderr": err})()
+        calls = [completed(0, "sha256:old\n"), completed(), completed(),
+                 completed(0, "amd64|9.9.9\n"), completed()]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(mdd_update.platform, "machine", return_value="aarch64"), \
+                patch.object(mdd_update.subprocess, "run", side_effect=calls) as run:
+            with self.assertRaises(mdd_update.UpdateError):
+                mdd_update.load_control_image(Path(tmp, "control.tar.gz"), "9.9.9")
+        self.assertEqual(run.call_args_list[-1].args[0], [
+            "docker", "tag", "mdd-sim-gateway/control:previous",
+            "mdd-sim-gateway/control"])
 
     def test_apply_tree_preserves_installation_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,13 +216,12 @@ class UpdaterTests(unittest.TestCase):
             (repo / "VERSION").write_text("1.3.4\n", encoding="utf-8")
             status = mdd_update.Status(data / "orchestrator/status.json", "9.9.9")
 
-            def fake_download(_url, destination, _env, _proxy=""):
+            def fake_download(_url, destination, _env, _proxy="", **_kwargs):
                 shutil.copy2(sums if destination.name == "SHA256SUMS" else archive,
                              destination)
 
-            completed = type("Completed", (), {"returncode": 0})()
             with patch.object(mdd_update, "download", side_effect=fake_download), \
-                    patch.object(mdd_update.subprocess, "run", return_value=completed):
+                    patch.object(mdd_update, "reload_services", return_value=0):
                 mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status)
 
             self.assertEqual((repo / "VERSION").read_text().strip(), "9.9.9")
@@ -197,17 +235,59 @@ class UpdaterTests(unittest.TestCase):
             with self.assertRaises(mdd_update.UpdateError):
                 mdd_update.perform(Path(tmp), Path(tmp), "1.0.2", "MddIdd/x/../y", status)
 
+    def test_asset_download_falls_back_and_reuses_the_successful_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, data, source = base / "repo", base / "data", base / "source"
+            repo.mkdir(); data.mkdir()
+            (repo / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+            (source / "webui/dist").mkdir(parents=True)
+            (source / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+            (source / "webui/dist/index.html").write_text("ok", encoding="utf-8")
+            (source / "webui/dist/.mdd-release-version").write_text(
+                "9.9.9\n", encoding="utf-8")
+            attempts = []
+
+            def fake_download(_url, destination, _env, proxy_url="", **_kwargs):
+                attempts.append(proxy_url)
+                if not proxy_url:
+                    raise mdd_update.UpdateError("direct route stalled")
+                destination.write_bytes(b"ok")
+
+            status = mdd_update.Status(data / "orchestrator/status.json", "9.9.9")
+            routes = [
+                {"proxy_url": "", "route": "direct", "route_name": ""},
+                {"proxy_url": "socks5h://127.0.0.1:1080", "route": "library",
+                 "route_name": "Primary"},
+            ]
+            with patch.object(mdd_update, "download", side_effect=fake_download), \
+                    patch.object(mdd_update, "verify_release_archive"), \
+                    patch.object(mdd_update, "extract", return_value=source), \
+                    patch.object(mdd_update, "backup", return_value=base / "backup.tar.gz"), \
+                    patch.object(mdd_update, "apply_tree"), \
+                    patch.object(mdd_update, "reload_services", return_value=0):
+                mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status,
+                                   routes=routes)
+
+            self.assertEqual(attempts[0], "")
+            self.assertEqual(attempts[1:], ["socks5h://127.0.0.1:1080"] * 2)
+
 
 class OrchestratorUpdateTests(unittest.TestCase):
-    def test_country_proxy_is_resolved_into_private_file_not_command_line(self):
+    def test_library_proxy_is_resolved_into_private_file_not_command_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
             root = data / "orchestrator"
             root.mkdir()
             (root / "update-request.json").write_text(json.dumps({
                 "version": "9.9.9", "repository": "MddIdd/mdd-sim-gateway",
-                "network": {"proxy_mode": "country", "proxy_country": "us"},
+                "network": {"proxy_mode": "library", "proxy_profile_id": "primary"},
+                "asset_sizes": {"release.tar.gz": 1234, "../invalid": 999},
             }), encoding="utf-8")
+            (root / "desired.json").write_text(json.dumps({"proxy": {
+                "profiles": {"primary": {"name": "Primary", "type": "node"}},
+                "exits": {"us": {"enabled": True, "profile_id": "primary"}},
+            }}), encoding="utf-8")
             (root / "proxy-status.json").write_text(json.dumps({"exits": {"us": {
                 "ready": True, "proxy_host": mdd_orchestrator.COUNTRY_PROXY_LISTEN,
                 "proxy_port": 22538,
@@ -221,6 +301,11 @@ class OrchestratorUpdateTests(unittest.TestCase):
             network_path = data / "update" / "network.json"
             self.assertEqual(json.loads(network_path.read_text())["proxy_url"],
                              f"socks5h://{mdd_orchestrator.COUNTRY_PROXY_LISTEN}:22538")
+            self.assertEqual(json.loads(network_path.read_text())["route"], "library")
+            self.assertEqual(json.loads(network_path.read_text())["route_name"], "Primary")
+            self.assertEqual(json.loads(network_path.read_text())["asset_sizes"],
+                             {"release.tar.gz": 1234})
+            self.assertEqual(len(json.loads(network_path.read_text())["routes"]), 1)
             command = run.call_args_list[-1].args[0]
             self.assertNotIn("socks5h://", " ".join(command))
             self.assertEqual(network_path.stat().st_mode & 0o777, 0o600)
@@ -231,8 +316,11 @@ if __name__ == "__main__":
 
 
 class StarCountTests(unittest.TestCase):
-    """The count decorates a link. It must never turn a working update check into an error,
-    and an unreadable count must stay absent rather than being reported as zero."""
+    """The count decorates a link and keeps its last successful value across outages."""
+
+    def setUp(self):
+        update_check._stars_cache = None
+        update_check._stars_checked_at = 0
 
     def test_a_failed_star_lookup_leaves_the_release_check_intact(self):
         session = SimpleNamespace(get=lambda *a, **k: (_ for _ in ()).throw(
@@ -258,6 +346,10 @@ class StarCountTests(unittest.TestCase):
         value = update_check._stargazers(SimpleNamespace(get=get), {}, "owner/repo")
         self.assertEqual(value, 13300)
         self.assertEqual(calls, ["https://api.github.com/repos/owner/repo"])
+
+        offline = SimpleNamespace(get=lambda *a, **k: (_ for _ in ()).throw(
+            requests.RequestException("offline")))
+        self.assertEqual(update_check._stargazers(offline, {}, "owner/repo"), 13300)
 
     def test_a_malformed_star_count_is_absent_rather_than_zero(self):
         class Response:

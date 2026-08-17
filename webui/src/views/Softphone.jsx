@@ -10,6 +10,20 @@ const KEYS = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'],
 
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
+// Call-history dispositions as recorded by the backend (_call_disposition), mapped to
+// translatable labels.
+const CALL_STATUS_LABEL = {
+  answered: 'Answered', missed: 'Missed', rejected: 'Declined', busy: 'Busy',
+  'no answer': 'No answer', cancelled: 'Cancelled', failed: 'Failed',
+  ringing: 'Ringing', dialing: 'Dialing', unknown: 'Unknown',
+}
+
+// SIP registration states reported by the JsSIP wrapper.
+const REG_LABEL = {
+  idle: 'Idle', connecting: 'Connecting', registered: 'Registered',
+  unregistered: 'Unregistered', disconnected: 'Disconnected', failed: 'Registration failed',
+}
+
 export const normalizeDialTarget = (value) => {
   let number = String(value || '').replace(/[\s().-]/g, '')
   // Carrier service short codes (balance, voicemail, support, etc.) are intentionally
@@ -366,7 +380,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
           </label> : <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>{t('Softphone')}</div>}
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: regColor }}>
             <span style={{ width: 8, height: 8, borderRadius: 999, background: callTransport === 'cellular' ? '#f59e0b' : regColor }} />
-            {callTransport === 'cellular' ? t('No audio') : reg}
+            {callTransport === 'cellular' ? t('No audio') : t(REG_LABEL[reg] || reg)}
           </div>
         </div>
 
@@ -502,7 +516,10 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             const s = (c.status || '').toLowerCase()
             const color = s === 'answered' ? GREEN : (s === 'rejected' || s === 'busy' || s === 'failed') ? RED
               : (s === 'no answer' || s === 'cancelled' || s === 'missed') ? '#eab308' : 'var(--text-dim)'
-            const dlabel = c.direction === 'in' ? '↙ Incoming' : '↗ Outgoing'
+            const dlabel = c.direction === 'in' ? `↙ ${t('Incoming')}` : `↗ ${t('Outgoing')}`
+            // Dispositions the backend records are translated; an unmapped one (a raw
+            // DIALSTATUS from an unusual hangup) is shown as recorded rather than hidden.
+            const statusKey = CALL_STATUS_LABEL[s || 'ringing']
             const checked = callSel.has(c.id)
             return (
               <div key={c.id} onClick={() => callSelMode && toggleCallSel(c.id)} className="hover-row"
@@ -515,7 +532,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                   <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel} · {new Date(c.start_ts * 1000).toLocaleString()}{c.transport === 'cellular' ? ` · ${t('Cellular modem')}` : ''}</div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <span style={{ color, fontWeight: 600, textTransform: 'capitalize' }}>{c.status || 'ringing'}</span>
+                  <span style={{ color, fontWeight: 600, ...(statusKey ? {} : { textTransform: 'capitalize' }) }}>
+                    {statusKey ? t(statusKey) : c.status}</span>
                   {!callSelMode && <>
                     <button className="btn btn-ghost" style={{ padding: '5px 10px' }}
                       disabled={callTransport === 'vowifi' ? reg !== 'registered' : !cellularReady}

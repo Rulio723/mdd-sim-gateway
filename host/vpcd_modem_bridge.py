@@ -38,6 +38,13 @@ LOGICAL_CHANNEL_ROLES = ("pin", "swu", "ims")
 # outage is logged, so a genuinely broken slot is still visible without the repetition.
 SLOT_RETRY_SECONDS = 1.0
 SLOT_RETRY_CEILING_SECONDS = 60.0
+# MANAGE CHANNEL OPEN answering with a channel this bridge already holds is not proof that the
+# UICC is out of channels. On virtualized USB passthrough a late reply can be read as the answer
+# to the next command, so the previous OPEN's channel number comes back verbatim. Settle the port
+# and ask again before declaring the SIM unusable — the alternative is a bridge that exits and
+# takes both lines down over a transport artefact.
+CHANNEL_OPEN_ATTEMPTS = 3
+CHANNEL_SETTLE_SECONDS = 0.5
 
 
 class ModemError(RuntimeError):
@@ -66,6 +73,14 @@ def allocate_logical_channels(card, count):
     try:
         for _slot in range(int(count)):
             channel = card.open_channel()
+            for attempt in range(2, CHANNEL_OPEN_ATTEMPTS + 1):
+                if channel not in channels:
+                    break
+                print("[bridge] MANAGE CHANNEL OPEN returned channel %d again; settling the "
+                      "AT port and retrying (attempt %d/%d)" %
+                      (channel, attempt, CHANNEL_OPEN_ATTEMPTS), flush=True)
+                card.settle()
+                channel = card.open_channel()
             if channel in channels:
                 raise ModemError("duplicate logical channel allocated: %d" % channel)
             channels.append(channel)
@@ -125,6 +140,16 @@ class ModemCard:
         while time.monotonic() < deadline:
             if not self.ser.read(4096):
                 break
+
+    def settle(self):
+        """Discard whatever the modem is still sending, so the next reply is the next reply.
+
+        Subclasses that do not own a serial port inherit the pause without the read.
+        """
+        time.sleep(CHANNEL_SETTLE_SECONDS)
+        if getattr(self, "ser", None) is not None:
+            with self.lock:
+                self._drain()
 
     def _at(self, command):
         with self.lock:
@@ -216,16 +241,42 @@ class ModemCard:
         if apdu[0] == 0xFF:
             return None, bytes.fromhex("6D00")
         if apdu[1] == 0x70:
-            return None, bytes.fromhex("6881")
+            # MANAGE CHANNEL. Each VPCD slot already owns one physical UICC logical channel,
+            # opened when the bridge starts. PC/SC eUICC clients such as lpac still perform
+            # the standard handshake, but forwarding it would allocate a different channel
+            # or close the bridge-owned one behind its back. Emulate only the exact OPEN and
+            # CLOSE forms lpac uses: OPEN reports the channel this slot already holds, while
+            # CLOSE succeeds without releasing it. Reject every malformed/unsupported variant
+            # with Incorrect parameters (6A86) so no ambiguous command reaches the modem.
+            if apdu == bytes.fromhex("0070000001"):
+                return None, bytes((channel, 0x90, 0x00))
+            if apdu == bytes((0x00, 0x70, 0x80, channel, 0x00)):
+                return None, bytes.fromhex("9000")
+            return None, bytes.fromhex("6A86")
         # 0xA0 is the legacy GSM class and has no logical-channel encoding.
         if apdu[0] == 0xA0:
             return None, bytes.fromhex("6881")
         rewritten = bytes(((apdu[0] & 0xFC) | channel,)) + apdu[1:]
         return rewritten, None
 
+    @staticmethod
+    def closes_logical_channel(apdu, channel) -> bool:
+        return apdu == bytes((0x00, 0x70, 0x80, channel, 0x00))
+
     def transmit(self, apdu, channel):
         rewritten, local_response = self.on_channel(apdu, channel)
         if local_response is not None:
+            if self.closes_logical_channel(apdu, channel):
+                # An LPA leaves the ISD-R selected here when it closes its channel, but the
+                # slot is shared: pin_keeper and the engine come back to the same real UICC
+                # channel expecting the plain USIM view, and their ADF.USIM select fails
+                # against an eUICC application. pcscd only power-cycles the card when every
+                # client is gone, so restore the file system now instead of waiting for it.
+                try:
+                    self.select_mf(channel)
+                except ModemError as exc:
+                    print("[bridge] slot channel %d could not restore MF after an LPA "
+                          "session: %s" % (channel, exc), flush=True)
             return local_response
         try:
             return self.csim(rewritten)
@@ -400,6 +451,9 @@ def main():
     identity = card.identity()
     static_metadata = {
         "version": 1,
+        # Lets the orchestrator prove that a ready metadata document came from the
+        # replacement bridge, rather than accepting the previous process's last write.
+        "bridge_pid": os.getpid(),
         "modem": os.path.realpath(args.modem),
         "base_port": args.base_port,
         "slots": args.slots,
