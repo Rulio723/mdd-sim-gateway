@@ -155,23 +155,46 @@ jobs:
 
           echo "Safety checks passed."
 
-      - name: Merge safe upstream changes
+      - name: Apply exact upstream tree to main
         shell: bash
         run: |
           set -euo pipefail
 
           upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          sync_index="${RUNNER_TEMP}/safe-upstream-sync.index"
+          rm -f "${sync_index}"
 
-          if git merge-base --is-ancestor "${upstream_ref}" HEAD; then
-            echo "Fork is already up to date."
+          # Start from the exact upstream main tree in a temporary index.
+          GIT_INDEX_FILE="${sync_index}" git read-tree "${upstream_ref}"
+
+          # Never copy upstream workflow files: GITHUB_TOKEN cannot update them,
+          # and this fork must keep its own protected sync/CI workflows.
+          while IFS= read -r -d '' path; do
+            GIT_INDEX_FILE="${sync_index}" git update-index --force-remove -- "${path}"
+          done < <(GIT_INDEX_FILE="${sync_index}" git ls-files -z -- '.github/workflows')
+
+          # Reinsert this fork's workflow subtree unchanged.
+          GIT_INDEX_FILE="${sync_index}" git read-tree \
+            --prefix=.github/workflows/ \
+            HEAD:.github/workflows
+
+          sync_tree=$(GIT_INDEX_FILE="${sync_index}" git write-tree)
+          head_tree=$(git rev-parse 'HEAD^{tree}')
+
+          if [[ "${sync_tree}" == "${head_tree}" ]]; then
+            echo "Fork content is already up to date (workflows are preserved locally)."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # A conflict stops the job before push, preserving the fork.
-          git merge --no-edit "${upstream_ref}"
+          new_commit=$(
+            printf 'chore: sync main from %s\n' "${UPSTREAM_REPOSITORY}" |
+              git commit-tree "${sync_tree}" -p HEAD
+          )
+
+          git reset --hard "${new_commit}"
           git push origin "HEAD:${FORK_BRANCH}"
 
-          echo "Upstream changes merged into ${FORK_BRANCH}." >> "${GITHUB_STEP_SUMMARY}"
+          echo "Upstream ${UPSTREAM_BRANCH} tree applied to ${FORK_BRANCH}; fork workflows were preserved." >> "${GITHUB_STEP_SUMMARY}"
