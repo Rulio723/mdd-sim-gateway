@@ -4,6 +4,23 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.3.15] - 2026-08-20
+
+### Fixed
+
+- A line whose SIM is reached through a modem bridge could stop registering after the engine
+  was rebuilt. The card-binding check introduced in 1.3.13 reads EF.ICCID through a call that
+  has no timeout; on a bridge channel that read does not fail but hangs, and every caller's
+  "a card that will not answer is a fault, not proof of a swap" rule only applies once the
+  read comes back. The line then rebuilt every couple of minutes with its tunnel established
+  each time, so nothing pointed at the real cause. Card reads are now bounded, and the binding
+  question is settled once when the SIM bridge starts rather than on every authentication —
+  the carrier allows three seconds for that exchange, and re-checking a settled question
+  inside it was enough to lose the registration on its own. The check keeps its full force on
+  every reader: two look-alike modems swapping USB ports is exactly what it exists to catch.
+  Only installations that rebuilt their engine image were affected; a self-update preserves
+  the existing image and could not reach this.
+
 ## [1.3.14] - 2026-08-20
 
 ### Added

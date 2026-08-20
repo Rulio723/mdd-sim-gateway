@@ -2,6 +2,7 @@
 # Derived from fasferraz/SWu-IKEv2 (GPL-3.0); modified for MDD Sim Gateway.
 import serial
 import struct
+import threading
 import socket
 import random
 import time
@@ -5959,6 +5960,47 @@ def bcd(chars):
         bcd_string += chars[1+2*i] + chars[2*i]
     return bcd_string
 
+# EF.ICCID is read with pcsc-lite's blocking transmit(), which takes no timeout. On a VPCD
+# logical channel that read can HANG rather than fail: the bridge multiplexes several channels
+# onto one physical SIM, so a channel it has not wired up leaves transmit() parked forever and
+# reader_holds_foreign_card() below never reaches its "only a successful read convicts"
+# fallback. Bound the read and surface the deadline as the exception that handler already
+# catches, so the tunnel proceeds instead of stalling.
+#
+# The check itself stays in force on every reader, VPCD included: two serial-less modems that
+# swap USB paths is precisely the mix-up it exists to catch.
+# Asterisk allows the whole AKA exchange SIM_TIMEOUT = 3s, so nothing on a card path may
+# block longer than that; this probe runs once at startup rather than per authentication.
+ICCID_READ_TIMEOUT = 2.0
+
+
+class CardReadTimeout(Exception):
+    """EF.ICCID did not answer within the deadline."""
+
+
+def _with_deadline(fn, timeout=None):
+    """Run a blocking card read on a daemon thread and give up after `timeout` seconds."""
+    # Resolved per call, not bound as a default, so the module constant stays adjustable at
+    # runtime (and patchable in tests) instead of being frozen when this function is defined.
+    timeout = ICCID_READ_TIMEOUT if timeout is None else timeout
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa - handed back to the calling thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise CardReadTimeout("EF.ICCID read did not answer within %gs" % timeout)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 def read_iccid_at_index(reader_index):
     """Read EF.ICCID from a reader index. No PIN needed; None when the card will not answer."""
     r = readers()
@@ -5990,7 +6032,7 @@ def reader_holds_foreign_card(reader_index, expected_iccid):
     if not expected_iccid:
         return None
     try:
-        actual = read_iccid_at_index(reader_index)
+        actual = _with_deadline(lambda: read_iccid_at_index(reader_index))
     except Exception as e:  # noqa - PC/SC hiccup is not evidence of a swapped card
         swu_log("reader bind: could not read EF.ICCID at index %s (%r)" % (reader_index, e))
         return None

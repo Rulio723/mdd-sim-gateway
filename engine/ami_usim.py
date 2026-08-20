@@ -15,6 +15,7 @@ import configparser
 import json
 import os
 import sys
+import threading
 import time
 
 from panoramisk import Manager
@@ -221,6 +222,54 @@ def make_connection_index(reader_index):
     return connection
 
 
+# EF.ICCID is read with pcsc-lite's blocking transmit(), which takes no timeout. On a VPCD
+# logical channel that read can HANG rather than fail: the bridge multiplexes several channels
+# onto one physical SIM, so a channel it has not wired up leaves transmit() parked forever and
+# the caller never returns. Every ICCID check here is written to let an unreadable card through
+# -- a card that will not answer is a fault, not proof of a swap -- but that rule can only run
+# if the read comes back at all. Bound it, and surface the deadline as the exception those
+# handlers already treat as "could not read", so the line proceeds exactly as intended.
+#
+# The check itself stays in force on every reader, VPCD included: two serial-less modems that
+# swap USB paths is precisely the mix-up it exists to catch.
+# Asterisk allows the whole AKA exchange SIM_TIMEOUT = 3s (res_pjsip_outbound_registration.c),
+# so any card read on that path must finish well inside it — see probe_foreign_card_once(),
+# which is why this budget is only ever spent at startup.
+ICCID_READ_TIMEOUT = 2.0
+
+
+class CardReadTimeout(Exception):
+    """EF.ICCID did not answer within the deadline."""
+
+
+def _with_deadline(fn, timeout=None):
+    """Run a blocking card read on a throwaway thread and give up after `timeout` seconds.
+
+    The worker is a daemon: when the card never answers it stays parked inside pcsc-lite
+    instead of holding up shutdown. A timed-out read is reported as unreadable, and callers
+    must not reuse its result -- there is none.
+    """
+    # Resolved per call, not bound as a default, so the module constant stays adjustable at
+    # runtime (and patchable in tests) instead of being frozen when this function is defined.
+    timeout = ICCID_READ_TIMEOUT if timeout is None else timeout
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa - handed back to the calling thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise CardReadTimeout("EF.ICCID read did not answer within %gs" % timeout)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 def read_iccid(connection):
     """Read EF.ICCID (no PIN required). Returns None when the card will not answer."""
     connection.transmit(toBytes("00a40004023f0000"))
@@ -246,10 +295,41 @@ def foreign_iccid(connection):
     if connection is None or not expected:
         return None
     try:
-        actual = read_iccid(connection)
+        actual = _with_deadline(lambda: read_iccid(connection))
     except Exception:  # noqa - unreadable EF.ICCID is not evidence of a swap
         return None
     return actual if actual and actual != expected else None
+
+
+# Whether the bound slot holds another line's SIM is decided ONCE, at startup, and reused.
+#
+# It used to be re-decided on every AKA challenge, inside the 3s Asterisk allows for the whole
+# exchange. A card that answers slowly -- or, on a VPCD channel, not at all -- then turned a
+# diagnostic read into a failed registration: Asterisk gave up before AuthResponse was sent.
+# A slot cannot begin holding a different SIM midway through a registration; a swap needs a
+# re-enumeration, which restarts this process anyway. So decide before serving traffic, and
+# keep the AKA path free of card reads it does not need.
+_foreign_verdict = None
+_foreign_decided = False
+
+
+def probe_foreign_card_once(reader_spec):
+    """Read EF.ICCID once and remember whether this slot holds a foreign card."""
+    global _foreign_verdict, _foreign_decided
+    if _foreign_decided:
+        return _foreign_verdict
+    _foreign_decided = True
+    connection = open_usim(reader_spec)
+    if connection is None:
+        return _foreign_verdict                # no card yet: the AKA path reports NO_CARD
+    try:
+        _foreign_verdict = foreign_iccid(connection)
+    finally:
+        try:
+            connection.disconnect()
+        except Exception:
+            pass
+    return _foreign_verdict
 
 
 def make_connection_name(reader_name):
@@ -393,10 +473,12 @@ def read_res_ck_ik(reader_spec, rand, autn):
     if conn is None:
         write_status(state="NO_CARD")
         return res, ck, ik, auts
-    # Every open_usim branch resolves a SLOT; this is the one place that checks the CARD, so it
-    # covers the USB-port, exact-name and index bindings at once. Naming both ICCIDs turns what
-    # would surface as an SW=9862 "carrier rejected us" into a binding fault anyone can act on.
-    intruder = foreign_iccid(conn)
+    # The CARD check itself happened at startup (probe_foreign_card_once): it covers the
+    # USB-port, exact-name and index bindings at once, and naming both ICCIDs turns what would
+    # surface as an SW=9862 "carrier rejected us" into a binding fault anyone can act on. Only
+    # the verdict is consulted here — reading the card again would spend part of the 3s
+    # Asterisk allows for this exchange on a question already answered.
+    intruder = _foreign_verdict
     if intruder:
         write_status(state="WRONG_CARD", iccid=intruder,
                      detail=f"reader holds ICCID {intruder}, this line is "
@@ -458,6 +540,11 @@ def main():
     cfg_secret = config.get(cfg_endpoint, "secret")
     print(f"Endpoint={cfg_endpoint} reader={cfg_reader} host={cfg_host} user={cfg_username}")
     write_status(state="STARTING")
+    # Settle the binding question here, off the AKA path and before Asterisk can ask anything.
+    intruder = probe_foreign_card_once(cfg_reader)
+    if intruder:
+        print(f"reader holds ICCID {intruder}, this line is "
+              f"{os.environ.get('USIM_ICCID', '').strip()} -- refusing to authenticate")
 
     manager = Manager(loop=asyncio.get_event_loop(), host=cfg_host,
                       username=cfg_username, secret=cfg_secret)

@@ -25,6 +25,7 @@ manager can surface it (it will retry on next card insert).
 import json
 import os
 import sys
+import threading
 import time
 
 from smartcard.System import readers
@@ -169,6 +170,53 @@ def verify_pin(conn, pin):
     return s1, s2
 
 
+# EF.ICCID is read with pcsc-lite's blocking transmit(), which takes no timeout. On a VPCD
+# logical channel that read can HANG rather than fail: the bridge multiplexes several channels
+# onto one physical SIM, so a channel it has not wired up leaves transmit() parked forever and
+# the caller never returns. Every ICCID check here is written to let an unreadable card through
+# -- a card that will not answer is a fault, not proof of a swap -- but that rule can only run
+# if the read comes back at all. Bound it, and surface the deadline as the exception those
+# handlers already treat as "could not read", so the line proceeds exactly as intended.
+#
+# The check itself stays in force on every reader, VPCD included: two serial-less modems that
+# swap USB paths is precisely the mix-up it exists to catch.
+# Asterisk allows the whole AKA exchange SIM_TIMEOUT = 3s, so nothing on a card path may
+# block longer than that; this probe runs once at startup rather than per authentication.
+ICCID_READ_TIMEOUT = 2.0
+
+
+class CardReadTimeout(Exception):
+    """EF.ICCID did not answer within the deadline."""
+
+
+def _with_deadline(fn, timeout=None):
+    """Run a blocking card read on a throwaway thread and give up after `timeout` seconds.
+
+    The worker is a daemon: when the card never answers it stays parked inside pcsc-lite
+    instead of holding up shutdown. A timed-out read is reported as unreadable, and callers
+    must not reuse its result -- there is none.
+    """
+    # Resolved per call, not bound as a default, so the module constant stays adjustable at
+    # runtime (and patchable in tests) instead of being frozen when this function is defined.
+    timeout = ICCID_READ_TIMEOUT if timeout is None else timeout
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa - handed back to the calling thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise CardReadTimeout("EF.ICCID read did not answer within %gs" % timeout)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 def read_iccid(conn):
     conn.transmit(toBytes("00a40004023f0000"))
     conn.transmit(toBytes("00a40004022fe200"))
@@ -210,7 +258,7 @@ def _accept(reader, conn, expected):
     if not expected:
         return reader, conn, None
     try:
-        actual = read_iccid(conn)
+        actual = _with_deadline(lambda: read_iccid(conn))
     except Exception:  # noqa - unreadable EF.ICCID is not evidence; let the line proceed
         return reader, conn, None
     if not actual or actual == expected:
