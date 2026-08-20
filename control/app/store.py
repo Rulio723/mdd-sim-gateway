@@ -78,6 +78,21 @@ def init():
                     bound_ts INTEGER,
                     cancelled INTEGER NOT NULL DEFAULT 0
                 );
+                -- Parts of a multi-part (concatenated) inbound SMS, held only until the
+                -- whole message can be assembled. The SMSC delivers each part as its own
+                -- SMS-DELIVER, out of order and seconds apart; the primary key absorbs the
+                -- duplicates it re-pushes when an RP-ACK is missed.
+                CREATE TABLE IF NOT EXISTS sms_segments (
+                    instance TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    concat_ref INTEGER NOT NULL,
+                    total INTEGER NOT NULL,
+                    seq INTEGER NOT NULL,
+                    body TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL,
+                    PRIMARY KEY(instance, peer, concat_ref, total, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sms_segments_age ON sms_segments(created_ts);
                 CREATE TABLE IF NOT EXISTS calls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     instance TEXT NOT NULL,
@@ -264,6 +279,69 @@ def migrate_legacy_history(instance_aliases: dict[str, str]) -> dict:
 def set_message_status(mid: int, status: str, error: str | None = None):
     with _lock, _conn() as c:
         c.execute("UPDATE messages SET status=?, error=? WHERE id=?", (status, error, mid))
+
+
+# A part that never gets its siblings must not be lost, so the caller flushes stale groups
+# after this many seconds and stores whatever arrived. Carriers deliver the parts of one text
+# within seconds; a gap this long means the rest is not coming.
+SEGMENT_TIMEOUT = 180
+
+
+def add_sms_segment(instance: str, peer: str, concat_ref: int, total: int, seq: int,
+                    body: str, ts: int | None = None) -> list[str] | None:
+    """Buffer one part of a concatenated SMS.
+
+    Returns the full ordered list of part bodies once the LAST missing part arrives (and drops
+    the group from the buffer), or None while parts are still outstanding. Re-delivery of a
+    part already held is absorbed by the primary key and never completes a group twice: the
+    row count only reaches `total` when every distinct seq is present."""
+    ts = int(ts or time.time())
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT INTO sms_segments(instance,peer,concat_ref,total,seq,body,created_ts) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(instance,peer,concat_ref,total,seq) DO NOTHING",
+            (str(instance), peer, int(concat_ref), int(total), int(seq), body, ts))
+        rows = c.execute(
+            "SELECT seq,body FROM sms_segments "
+            "WHERE instance=? AND peer=? AND concat_ref=? AND total=? ORDER BY seq",
+            (str(instance), peer, int(concat_ref), int(total))).fetchall()
+        if len(rows) < int(total):
+            return None
+        c.execute(
+            "DELETE FROM sms_segments WHERE instance=? AND peer=? AND concat_ref=? AND total=?",
+            (str(instance), peer, int(concat_ref), int(total)))
+    return [r["body"] for r in rows]
+
+
+def take_stale_sms_segments(timeout: int = SEGMENT_TIMEOUT,
+                            now: int | None = None) -> list[dict]:
+    """Remove every part group whose FIRST part arrived more than `timeout` seconds ago and
+    return what each one had collected, so an incomplete message is still shown rather than
+    silently dropped. Each entry carries the ordered bodies plus the seq numbers present, so
+    the caller can mark which parts are missing."""
+    now = int(now or time.time())
+    cutoff = now - int(timeout)
+    out: list[dict] = []
+    with _lock, _conn() as c:
+        groups = c.execute(
+            "SELECT instance,peer,concat_ref,total,MIN(created_ts) AS first_ts "
+            "FROM sms_segments GROUP BY instance,peer,concat_ref,total "
+            "HAVING MIN(created_ts) <= ?", (cutoff,)).fetchall()
+        for g in groups:
+            key = (g["instance"], g["peer"], g["concat_ref"], g["total"])
+            rows = c.execute(
+                "SELECT seq,body FROM sms_segments "
+                "WHERE instance=? AND peer=? AND concat_ref=? AND total=? ORDER BY seq",
+                key).fetchall()
+            c.execute(
+                "DELETE FROM sms_segments "
+                "WHERE instance=? AND peer=? AND concat_ref=? AND total=?", key)
+            out.append({"instance": g["instance"], "peer": g["peer"],
+                        "concat_ref": g["concat_ref"], "total": int(g["total"]),
+                        "first_ts": int(g["first_ts"]),
+                        "seqs": [int(r["seq"]) for r in rows],
+                        "bodies": [r["body"] for r in rows]})
+    return out
 
 
 def add_message(instance: str, direction: str, peer: str, body: str, status: str = "ok",

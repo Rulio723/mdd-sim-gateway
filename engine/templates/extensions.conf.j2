@@ -48,7 +48,10 @@ same => n,Return()
 exten => {{ any_extension }},1,NoOp(Incoming SMS from ${MESSAGE(from)})
 same => n,Set(NL=${BASE64_DECODE(Cg==)})
 same => n,Set(FILE(/logs/messages.txt,,,a)=IN SMS from ${MESSAGE(from)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)}:${NL}${MESSAGE(body)}${NL}=====${NL})
-same => n,TrySystem(/usr/local/bin/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" &)
+; The trailing three arguments carry the concatenated-SMS segment triplet (ref/total/seq)
+; that res_pjsip_messaging exposes for a multi-part text (see patches/asterisk/mt_concat_udh.py).
+; They are EMPTY for an ordinary single-part SMS; the manager reassembles the parts.
+same => n,TrySystem(/usr/local/bin/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" "${MESSAGE_DATA(SMS_CONCAT_REF)}" "${MESSAGE_DATA(SMS_CONCAT_TOTAL)}" "${MESSAGE_DATA(SMS_CONCAT_SEQ)}" &)
 {% for t in msg_targets %}
 same => n,MessageSend(pjsip:{{ t }},${MESSAGE(from)},sip:{{ t }})
 {% endfor %}

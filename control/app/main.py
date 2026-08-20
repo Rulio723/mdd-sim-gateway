@@ -1413,6 +1413,75 @@ HOST_ALERT_TEXT = {
 }
 
 
+# A text longer than one SMS is split by the SMSC into several SMS-DELIVER PDUs, each tagged
+# in its User Data Header with (reference, total, sequence). The engine's Asterisk exposes that
+# triplet (patches/asterisk/mt_concat_udh.py) and the dialplan appends it to the sms_in event,
+# so the parts can be put back together here rather than surfacing as N separate messages.
+# A gap left by a part that never arrives is marked with this, so a message that lost one reads
+# as incomplete instead of quietly losing text. Language-neutral: the UI is bilingual and the
+# message body is stored as the carrier sent it.
+SMS_GAP_MARK = "[…]"
+
+
+def _concat_triplet(args: list) -> tuple[int, int, int] | None:
+    """Parse the (ref, total, seq) segment triplet trailing an sms_in event.
+
+    Returns None for an ordinary single-part SMS — where the dialplan passes three empty
+    strings — and for anything malformed, so such a message takes the normal path and is
+    stored on its own. Also None for an older engine image that does not send the fields at
+    all, which keeps the manager compatible with an engine that has not been rebuilt yet."""
+    if len(args) < 5:
+        return None
+    try:
+        ref, total, seq = (int(str(a).strip()) for a in args[2:5])
+    except (TypeError, ValueError):
+        return None
+    if total < 2 or not 1 <= seq <= total:
+        return None
+    return ref, total, seq
+
+
+def _join_sms_parts(bodies: list[str], seqs: list[int], total: int) -> str:
+    """Concatenate parts in sequence order, marking each run of missing ones."""
+    have = dict(zip(seqs, bodies))
+    out: list[str] = []
+    in_gap = False
+    for i in range(1, total + 1):
+        if i in have:
+            out.append(have[i])
+            in_gap = False
+        elif not in_gap:
+            out.append(SMS_GAP_MARK)
+            in_gap = True
+    return "".join(out)
+
+
+async def sms_segment_reaper():
+    """Store what a multi-part SMS collected when the rest of its parts never arrive.
+
+    Carriers deliver the parts of one text within seconds, so a group still incomplete after
+    store.SEGMENT_TIMEOUT is not going to be completed. Publishing the partial text (with the
+    gaps marked) is strictly better than holding it forever: the user still sees who wrote and
+    most of what they said."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            stale = await asyncio.to_thread(store.take_stale_sms_segments)
+        except Exception as exc:  # noqa
+            log.debug("SMS segment sweep failed: %r", exc)
+            continue
+        for group in stale:
+            iid = str(group["instance"])
+            body = _join_sms_parts(group["bodies"], group["seqs"], group["total"])
+            log.info("incomplete multi-part SMS on line %s from %s: parts %s of %d — storing "
+                     "what arrived", iid, group["peer"],
+                     ",".join(str(n) for n in group["seqs"]), group["total"])
+            rec = await asyncio.to_thread(store.add_message, iid, "in", group["peer"], body,
+                                          ts=group["first_ts"])
+            await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+            _dispatch_push(notify_push.EV_INCOMING_SMS, iid, group["peer"], body)
+
+
 async def allowance_reminder_poller():
     """Send one reminder per line/expiry/day at 3, 2 and 1 days before expiry."""
     while True:
@@ -2106,6 +2175,7 @@ async def lifespan(app: FastAPI):
     sms_poller = asyncio.create_task(cellular_sms_poller())
     host_poller = asyncio.create_task(host_health_poller())
     allowance_poller = asyncio.create_task(allowance_reminder_poller())
+    segment_reaper = asyncio.create_task(sms_segment_reaper())
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
@@ -2114,10 +2184,11 @@ async def lifespan(app: FastAPI):
     sms_poller.cancel()
     host_poller.cancel()
     allowance_poller.cancel()
+    segment_reaper.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
     await asyncio.gather(poller, monitor, sms_poller, host_poller, allowance_poller,
-                         return_exceptions=True)
+                         segment_reaper, return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
         await c.close()
@@ -4972,7 +5043,22 @@ async def api_engine_event(payload: dict):
         #      short-codes like 20023). These are operator/service payloads for the SIM, not texts.
         # A genuine text always has a non-empty decoded body, so dropping on empty-body never
         # loses a real message. (An empty body with a normal sender is likewise nothing to show.)
-        if not text.strip():
+        # One part of a multi-part text: buffer it and wait for its siblings. The empty-body
+        # rule below is deliberately NOT applied to a part — the sources it guards against
+        # (IMS signalling, OTA payloads) never carry a concatenation header, whereas dropping
+        # a part that decoded to nothing would leave the whole message forever incomplete.
+        segment = _concat_triplet(args)
+        if segment:
+            ref, total, seq = segment
+            parts = await asyncio.to_thread(store.add_sms_segment, iid, sender, ref, total,
+                                            seq, text)
+            if parts is None:
+                log.info("buffered part %d/%d of a multi-part SMS from %s (ref %d)",
+                         seq, total, sender, ref)
+                return {"ok": True, "buffered": f"{seq}/{total}"}
+            log.info("reassembled a %d-part SMS from %s (ref %d)", total, sender, ref)
+            text = "".join(parts)
+        elif not text.strip():
             log.info("dropping empty-body inbound SMS (internal signalling / binary/OTA "
                      "SIM message — no displayable text)")
             return {"ok": True, "dropped": "empty_body"}

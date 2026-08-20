@@ -4,7 +4,20 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.3.14] - 2026-08-20
+
 ### Added
+
+- A text longer than one SMS now arrives as one message instead of several. The SMSC splits
+  such a text into separate SMS-DELIVER PDUs, each carrying a header that says which part it is;
+  Asterisk unpacked that header but discarded it, so every part surfaced as its own message —
+  out of order, since the parts are not delivered in sequence, and each one raising its own
+  notification. The engine now exposes the part's reference/total/sequence and the control plane
+  buffers the parts until the whole text can be assembled, then stores and notifies once. Parts
+  the carrier re-pushes when an acknowledgement is missed are absorbed rather than duplicated.
+  If a part never arrives, the rest is still shown after three minutes with the gap marked, so
+  nothing is held back indefinitely. Requires a rebuilt engine image; an older engine keeps the
+  previous per-part behaviour.
 
 - Added a read-only USB passthrough diagnostic for gateways running inside a Proxmox VM. The
   support bundle answers the card-path questions from inside the gateway, but a VM cannot see

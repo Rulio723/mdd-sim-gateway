@@ -67,16 +67,17 @@ SOFTWARE.
 
 ## Files that are not GPL-3.0-only
 
-MDD Sim Gateway defaults to GPL-3.0-only, but two sets of files are derivative works of
+MDD Sim Gateway defaults to GPL-3.0-only, but some files are derivative works of
 upstream projects and keep the upstream license instead. A derivative of GPL-2.0-only code
 cannot be relicensed to GPL-3.0, so these are tracked explicitly:
 
 | Path | License | Derived from |
 |---|---|---|
 | `engine/patches/asterisk/mt_rpack_routing.py` | GPL-2.0-only | Asterisk `send_rpack()` (GPL-2.0-only) |
+| `engine/patches/asterisk/mt_concat_udh.py` | GPL-2.0-only | Asterisk `parse_tpdu()` (GPL-2.0-only) |
 | `patches/ccid/*.patch` | LGPL-2.1-or-later | LudovicRousseau/CCID (LGPL-2.1-or-later) |
 
-Both patch the upstream source at build time. The patched Asterisk runs as a separate
+All of them patch the upstream source at build time. The patched Asterisk runs as a separate
 process inside the engine container and communicates with the GPL-3.0-only control plane
 over AMI and HTTP only; the patched CCID driver is loaded by pcscd as a separate component.
 No GPL-3.0-only code is linked into either. Redistributing a built image or host install
