@@ -120,6 +120,9 @@ export const api = {
 
   threads: (id) => j('GET', `/api/instances/${id}/messages/threads`),
   messages: (id, peer) => j('GET', `/api/instances/${id}/messages/${encodeURIComponent(peer)}`),
+  // Payloads that were filed instead of shown: binary / SIM-addressed SMS. Kept reachable so a
+  // misclassified real text cannot vanish silently.
+  binarySms: (id) => j('GET', `/api/instances/${id}/messages/binary`),
   sendSms: (id, to, body, transport = 'auto') => j(
     'POST',
     `/api/instances/${id}/sms/send`,

@@ -16,6 +16,10 @@ const CALL_STATUS_LABEL = {
   answered: 'Answered', missed: 'Missed', rejected: 'Declined', busy: 'Busy',
   'no answer': 'No answer', cancelled: 'Cancelled', failed: 'Failed',
   ringing: 'Ringing', dialing: 'Dialing', unknown: 'Unknown',
+  // Service codes are scored on their own scale by the control plane: whether the carrier
+  // acted on the request, not whether a conversation happened.
+  'code accepted': 'Carrier accepted', 'code unsupported': 'Not supported by carrier',
+  'code rejected': 'Carrier refused', 'code failed': 'Carrier could not handle it',
 }
 
 // SIP registration states reported by the JsSIP wrapper.
@@ -24,15 +28,28 @@ const REG_LABEL = {
   unregistered: 'Unregistered', disconnected: 'Disconnected', failed: 'Registration failed',
 }
 
+// MMI codes a handset answers by itself: they are never sent to the network. Here the
+// "handset" is the engine, so these are answered from the line's own provisioning — dialling
+// them out would only wait for a response no carrier ever sends. Maps code -> instance field.
+export const LOCAL_MMI = { '*#06#': 'imei' }
+
 export const normalizeDialTarget = (value) => {
   let number = String(value || '').replace(/[\s().-]/g, '')
   // Carrier service short codes (balance, voicemail, support, etc.) are intentionally
   // dialled as-is and are not E.164 numbers. Keep the bound tight so a normal national
   // number is not accidentally sent without its country code.
   if (/^\d{2,6}$/.test(number)) return number
+  // Supplementary-service and USSD codes (*21*<number>#, *#21#, #225#). What they mean is
+  // decided by the carrier's IMS, not here, so pass them through verbatim. The 180-character
+  // ceiling is the USSD limit from 3GPP TS 22.030.
+  if (/^[*#][*#\d]{1,180}$/.test(number)) return number
   if (number.startsWith('00')) number = `+${number.slice(2)}`
   return /^\+[1-9]\d{6,14}$/.test(number) ? number : ''
 }
+
+// A service code is signalling, not a number: it has no audio path and the cellular backend
+// dials it as a voice call, so it must not be routed there.
+export const isServiceCode = (target) => /[*#]/.test(String(target || ''))
 
 function Avatar({ label, color = 'var(--primary)', size = 96 }) {
   return (
@@ -98,7 +115,16 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   // if the list empties (own delete, or another client's clear-all over WS), leave select
   // mode so the toolbar/checkbox UI can't get stranded on an empty list.
   useEffect(() => { if (!calls.length) { setCallSelMode(false); setCallSel(new Set()) } }, [calls.length])
-  useEffect(() => subscribe && subscribe((m) => { if (m.type === 'call' && m.instance === id) loadCalls() }), [subscribe, id, loadCalls])
+  // A carrier's answer to a service code arrives after the call is already tearing down (it
+  // rides the BYE), so it reaches the browser over the websocket rather than through JsSIP.
+  // Graft it onto the call still on screen so the user sees the reply where they asked.
+  useEffect(() => subscribe && subscribe((m) => {
+    if (m.type !== 'call' || m.instance !== id) return
+    if (m.call?.ussd_text) {
+      setCall((c) => (c && c.number === m.call.peer ? { ...c, ussdText: m.call.ussd_text } : c))
+    }
+    loadCalls()
+  }), [subscribe, id, loadCalls])
 
   const toast = (m) => (showToast ? showToast(m) : null)
   const toggleCallSel = (cid) => setCallSel((s) => { const n = new Set(s); n.has(cid) ? n.delete(cid) : n.add(cid); return n })
@@ -150,7 +176,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       else if (type === 'ws') setReg((r) => data === 'connected' ? (r === 'registered' ? r : 'connecting') : 'disconnected')
       else if (type === 'regfail') setReg('failed')
       else if (type === 'incoming') setCall({ dir: 'in', number: data.from || 'Unknown', state: 'incoming', transport: 'vowifi' })
-      else if (type === 'calling') setCall({ dir: 'out', number: data.to, state: 'calling', transport: 'vowifi' })
+      else if (type === 'calling') setCall({ dir: 'out', number: data.to, state: 'calling', transport: 'vowifi', serviceCode: isServiceCode(data.to) })
       // 'progress' fires for BOTH directions. On an incoming call JsSIP auto-sends 180 and
       // emits progress('local'); mapping that to 'ringing' would blow away the 'incoming'
       // state and hide the Answer/Decline overlay. Only an OUTGOING call still in the
@@ -254,7 +280,21 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
     if (!number) return
     const target = normalizeDialTarget(number)
     if (!target) { toast(t('Use a service short code or international format, for example +8613800138000.')); return }
+    // Answer local MMI codes here instead of dialling them; the carrier never replies to these.
+    const localField = LOCAL_MMI[target]
+    if (localField) {
+      const value = String(selected?.[localField] || '')
+      toast(value ? `${target} \u2192 ${value}` : t('This line has no value provisioned for that code.'))
+      setNum('')
+      return
+    }
     if (callTransport === 'cellular') {
+      // The cellular backend places a voice call. A service code is supplementary-service
+      // signalling, which needs AT+CUSD instead, so fail loudly rather than dialling nonsense.
+      if (isServiceCode(target)) {
+        toast(t('Service codes can only be dialled over VoWiFi, not the cellular modem.'))
+        return
+      }
       if (!cellularReady) { toast(t('Turn on 4G and wait for the cellular modem to become ready first.')); return }
       if (!window.confirm(t('Place this call through the cellular modem? This experimental mode has no browser audio; the called phone may ring and normal call charges may apply.'))) return
       setCellularBusy(true)
@@ -328,7 +368,20 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
 
   const regColor = reg === 'registered' ? GREEN : reg === 'failed' || reg === 'disconnected' ? RED : '#eab308'
   const inCall = call && (call.state === 'active' || call.state === 'calling' || call.state === 'ringing' || call.state === 'incoming' || call.state === 'ended')
-  const endLabel = (c) => t(c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended')
+  // A service code is answered and torn down immediately, so every call-shaped ending would
+  // misdescribe it. JsSIP's cause carries the SIP response that decided the outcome, which is
+  // the only place the carrier says whether it serves the code at all.
+  const SERVICE_CODE_END_LABEL = {
+    'Not Found': 'The carrier does not recognise this code.',
+    'Address Incomplete': 'The carrier rejected this code as malformed.',
+    'Incompatible SDP': 'The carrier will not serve this code on this line.',
+    Rejected: 'The carrier refused this code.',
+    Unavailable: 'The carrier could not serve this code right now.',
+    Canceled: 'Cancelled before the carrier answered.',
+  }
+  const endLabel = (c, isCode) => (isCode
+    ? t(SERVICE_CODE_END_LABEL[c] || 'The carrier gave no usable answer to this code.')
+    : t(c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended'))
 
   // Google-Voice-style incoming-call overlay (prominent, full-panel)
   const IncomingOverlay = call?.state === 'incoming' ? (
@@ -370,16 +423,24 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       <style>{`@keyframes ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>
       {/* ---- Phone panel (Google-Voice style) ---- */}
       <div className="card" style={{ padding: 24, minHeight: 520, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-          {cellularAvailable ? <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, color: 'var(--text-dim)' }}>
-            {t('Call via')}
-            <select value={callTransport} disabled={Boolean(inCall)} onChange={(event) => setCallTransport(event.target.value)} style={{ width: 'auto' }}>
+        {/* One row in a 380px panel. A <select> sized 'auto' takes its width from the LONGEST
+            option, which is long enough here to squeeze both labels until they wrapped one
+            character per line. So: labels never wrap and never shrink, and the select absorbs
+            whatever width is left. */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          {cellularAvailable ? <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12,
+            color: 'var(--text-dim)', flex: 1, minWidth: 0 }}>
+            <span style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>{t('Call via')}</span>
+            <select value={callTransport} disabled={Boolean(inCall)} onChange={(event) => setCallTransport(event.target.value)}
+              style={{ flex: 1, minWidth: 0, textOverflow: 'ellipsis' }}>
               <option value="vowifi">VoWiFi</option>
               <option value="cellular" disabled={!cellularReady}>{t('Cellular modem (experimental, no audio)')}{!cellularReady ? ` — ${t('4G off')}` : ''}</option>
             </select>
-          </label> : <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>{t('Softphone')}</div>}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: regColor }}>
-            <span style={{ width: 8, height: 8, borderRadius: 999, background: callTransport === 'cellular' ? '#f59e0b' : regColor }} />
+          </label> : <div style={{ fontSize: 13, color: 'var(--text-dim)', flex: 1, minWidth: 0 }}>{t('Softphone')}</div>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: regColor,
+            whiteSpace: 'nowrap', flexShrink: 0 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 999, flexShrink: 0,
+              background: callTransport === 'cellular' ? '#f59e0b' : regColor }} />
             {callTransport === 'cellular' ? t('No audio') : t(REG_LABEL[reg] || reg)}
           </div>
         </div>
@@ -401,7 +462,9 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             <Avatar label={call.number} />
             <div>
               <div className="mono" style={{ fontSize: 22, fontWeight: 700 }}>{call.number}</div>
-              <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 4 }}>{call.state === 'ringing' ? 'Ringing…' : 'Calling…'}</div>
+              <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 4 }}>{call.serviceCode
+                ? t('Sending the code to the carrier…')
+                : (call.state === 'ringing' ? t('Ringing…') : t('Calling…'))}</div>
             </div>
             <div style={{ display: 'flex', justifyContent: 'center', marginTop: 10 }}>
               <RoundBtn icon="✕" label={t('End')} color="#fff" bg={RED} onClick={hangup} />
@@ -415,7 +478,9 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             <Avatar label={call.number} color={GREEN} size={84} />
             <div>
               <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
-              <div style={{ fontSize: 15, color: GREEN, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{fmtDur(dur)}</div>
+              {call.serviceCode
+                ? <div style={{ fontSize: 13, color: GREEN, marginTop: 4 }}>{call.ussdText || t('Carrier accepted the code. Waiting for its reply…')}</div>
+                : <div style={{ fontSize: 15, color: GREEN, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{fmtDur(dur)}</div>}
               {call.transport === 'cellular' && <div style={{ fontSize: 12, color: '#f59e0b', marginTop: 5 }}>{t('Cellular call connected · browser audio unavailable')}</div>}
               {recording && <div style={{ fontSize: 12, color: RED, marginTop: 2 }}>● Recording</div>}
             </div>
@@ -452,7 +517,13 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 12 }}>
             <Avatar label={call.number} color={call.endCause === 'Rejected' ? RED : 'var(--text-mute)'} />
             <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
-            <div style={{ fontSize: 14, color: call.endCause === 'Rejected' ? RED : 'var(--text-mute)' }}>{endLabel(call.endCause)}</div>
+            {call.ussdText && (
+              <div style={{ maxWidth: 320, margin: '0 auto', padding: '12px 14px', borderRadius: 10,
+                background: 'var(--input-bg)', border: '1px solid var(--border-strong)',
+                fontSize: 14, lineHeight: 1.5, textAlign: 'left', whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word', color: 'var(--text)' }}>{call.ussdText}</div>
+            )}
+            <div style={{ fontSize: 14, color: call.endCause === 'Rejected' ? RED : 'var(--text-mute)' }}>{endLabel(call.endCause, call.serviceCode)}</div>
           </div>
         )}
 
@@ -530,6 +601,10 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div className="mono" style={{ fontWeight: 600 }}>{c.peer}</div>
                   <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel} · {new Date(c.start_ts * 1000).toLocaleString()}{c.transport === 'cellular' ? ` · ${t('Cellular modem')}` : ''}</div>
+                  {c.ussd_text && (
+                    <div title={c.ussd_text} style={{ fontSize: 11.5, marginTop: 3, color: 'var(--text-soft)',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.ussd_text}</div>
+                  )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <span style={{ color, fontWeight: 600, ...(statusKey ? {} : { textTransform: 'capitalize' }) }}>

@@ -930,8 +930,14 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         "imeisv": inst.get("imeisv", "") or imeisv_from_imei(inst.get("imei", ""), inst.get("imeisv", "")),
         "pin": inst.get("pin", ""),
         "reader": inst.get("reader") or f"imsi:{inst['imsi']}",
-        "pin_reader": inst.get("pin_reader", "0"),
-        "ami_reader": inst.get("ami_reader", "2"),
+        # PIN keeping, SWu authentication and Asterisk/IMS-AKA each open their own card
+        # channel. Only a modem VPCD line has separate slots to give them (0/1/2 of one
+        # three-slot bridge), and only that line stores explicit names here. A native PC/SC
+        # reader exposes a single slot, so all three roles must address THIS line's reader:
+        # the old fixed "0"/"2" fallback pointed ami_usim at slot 2, which does not exist on
+        # a one-reader host -- the SIM reads as USIM = NO_CARD and IMS-AKA never runs.
+        "pin_reader": inst.get("pin_reader") or str(inst.get("reader_index", 0)),
+        "ami_reader": inst.get("ami_reader") or str(inst.get("reader_index", 0)),
         # PC/SC reader index the engine addresses the SIM by (passed to swu_ike as -m / pin_keeper
         # / ami_usim). MUST be emitted: without it the engine's render.py defaults to 0, so a line
         # on any reader other than 0 authenticates against the wrong physical SIM (USIM AUTHENTICATE

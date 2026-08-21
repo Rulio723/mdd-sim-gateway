@@ -186,8 +186,12 @@ export class Softphone {
       pcConfig: { rtcpMuxPolicy: 'require', iceServers: [] },
     }
     this.emit('calling', { to: number })
+    // '#' is not a legal SIP URI user character (RFC 3261 25.1), and JsSIP rejects the whole
+    // URI rather than escaping it, so service codes like #225# would never leave the browser.
+    // Asterisk percent-decodes the user part before dialplan matching, so EXTEN is unchanged.
+    const user = String(number).replace(/#/g, '%23')
     try {
-      this.session = this.ua.call(`sip:${number}@${domain}`, opts)
+      this.session = this.ua.call(`sip:${user}@${domain}`, opts)
       this.handleSession({ session: this.session })
     } catch (err) {
       // ua.call() can throw synchronously (bad target, no media, etc.) before any session

@@ -638,7 +638,6 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
         inst = {"id": "5", "name": "voxi", "msisdn": stored, "msisdn_source": source}
         with patch.object(main, "extract_msisdn", return_value=observed), \
                 patch.object(main.engine, "exec_cli") as exec_cli, \
-                patch.object(main, "MSISDN_VERIFY_SETTLE_SECONDS", 0), \
                 patch.object(main.cfg, "upsert_instance",
                              side_effect=lambda x: {**inst, **x}) as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
@@ -658,43 +657,43 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
         # verification interval (CI runners and newly booted gateways commonly have).
         with patch.object(main, "MSISDN_VERIFY_INTERVAL_SECONDS", float("inf")):
             upsert, restart, dispatch, exec_cli = await self._verify(
-                "+447767629230", "+447516734101")
-        self.assertEqual(upsert.call_args.args[0]["msisdn"], "+447516734101")
+                "+447700900456", "+447700900123")
+        self.assertEqual(upsert.call_args.args[0]["msisdn"], "+447700900123")
         # The dialplan is a snapshot from container start, so the line must be rebuilt or it
         # keeps presenting the old number as caller identity.
         restart.assert_called_once()
         dispatch.assert_called_once()
         self.assertEqual(dispatch.call_args.args[1], main.notify_push.EV_NUMBER_CHANGED)
-        self.assertIn("+447767629230", dispatch.call_args.args[4])
-        self.assertEqual([call.args[1] for call in exec_cli.mock_calls],
-                         ["pjsip set logger on", "pjsip send register volte_ims",
-                          "pjsip set logger off"])
+        self.assertIn("+447700900456", dispatch.call_args.args[4])
+        # Nothing is asked of the carrier. Forcing a REGISTER to produce a readable identity
+        # is what issue #8 reported: some IMS cores answer it with 503, Asterisk reports a
+        # rejected registration, and the health policy takes a working line down.
+        exec_cli.assert_not_called()
 
     async def test_an_unchanged_number_does_nothing(self):
         upsert, restart, dispatch, _ = await self._verify(
-            "+447516734101", "+447516734101")
+            "+447700900123", "+447700900123")
         upsert.assert_not_called()
         restart.assert_not_called()
         dispatch.assert_not_called()
 
     async def test_a_manually_entered_number_is_never_overridden(self):
         upsert, restart, _, exec_cli = await self._verify(
-            "+440000000000", "+447516734101", source="manual")
+            "+440000000000", "+447700900123", source="manual")
         upsert.assert_not_called()
         restart.assert_not_called()
         exec_cli.assert_not_called()
 
     async def test_an_unreadable_registration_is_not_treated_as_a_change(self):
-        upsert, restart, _, _ = await self._verify("+447767629230", None)
+        upsert, restart, _, _ = await self._verify("+447700900456", None)
         upsert.assert_not_called()
         restart.assert_not_called()
 
     async def test_a_failed_rebuild_does_not_commit_the_new_number(self):
-        inst = {"id": "5", "name": "voxi", "msisdn": "+447767629230",
+        inst = {"id": "5", "name": "voxi", "msisdn": "+447700900456",
                 "msisdn_source": "ims"}
-        with patch.object(main, "extract_msisdn", return_value="+447516734101"), \
+        with patch.object(main, "extract_msisdn", return_value="+447700900123"), \
                 patch.object(main.engine, "exec_cli"), \
-                patch.object(main, "MSISDN_VERIFY_SETTLE_SECONDS", 0), \
                 patch.object(main.cfg, "upsert_instance") as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
                 patch.object(main, "_start_engine_checked", side_effect=RuntimeError("docker")), \
@@ -712,6 +711,26 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
                 "P-Associated-Uri: <tel:+447700000001>\n"
                 "P-Associated-Uri: <sip:+447700000002@example.invalid>\n")):
             self.assertEqual(main.extract_msisdn("5"), "+447700000002")
+
+    def test_the_number_is_read_from_an_ordinary_registration(self):
+        """The patched engine announces the identity of every REGISTER it makes, so no SIP
+        packet logger and no extra REGISTER are needed to see it."""
+        with patch.object(main.engine, "logs", return_value=(
+                "[Aug 21 09:00:00] NOTICE[123] res_pjsip_outbound_registration.c: "
+                "IMS public identity: <sip:+447700000001@ims.example.invalid>\n")):
+            self.assertEqual(main.extract_msisdn("5"), "+447700000001")
+
+    def test_an_imsi_derived_identity_does_not_hide_the_dialable_number(self):
+        """Carriers list every public identity. The IMSI-derived IMPU comes first and carries
+        no number; the line's number is in a later entry of the same header."""
+        with patch.object(main.engine, "logs", return_value=(
+                "NOTICE[123]: IMS public identity: <sip:234100000000001@ims.example.invalid>,"
+                "<tel:+447700000003>\n")):
+            self.assertEqual(main.extract_msisdn("5"), "+447700000003")
+
+    def test_an_engine_that_never_announced_one_reports_nothing(self):
+        with patch.object(main.engine, "logs", return_value="Registration successful\n"):
+            self.assertIsNone(main.extract_msisdn("5"))
 
 
 class SustainedAlertTests(unittest.TestCase):

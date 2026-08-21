@@ -115,6 +115,45 @@ class EngineReaderBindingTests(unittest.TestCase):
         self.assertEqual(connection.name, str(target))
         self.assertTrue(connection.connected)
 
+    def test_ami_usim_uses_the_only_reader_when_the_stored_index_is_out_of_range(self):
+        """A one-reader host has exactly one card this line can mean. Refusing an index past
+        the end reported USIM = NO_CARD while the SIM sat readable in the only reader present
+        (issue #8: a line rendered with the old fixed ami_reader of 2)."""
+        only = _Reader("Alcor Link AK9563 00 00")
+        with patch.object(self.ami_usim, "readers", return_value=[only]), \
+                patch.object(self.ami_usim, "index_for_port", return_value=None), \
+                patch.dict(self.ami_usim.os.environ, {"USIM_READER_PORT": ""}):
+            connection = self.ami_usim.open_usim("2")
+        self.assertEqual(connection.name, str(only))
+        self.assertTrue(connection.connected)
+
+    def test_ami_usim_still_refuses_an_out_of_range_index_when_readers_are_ambiguous(self):
+        readers_list = [_Reader("reader one"), _Reader("reader two")]
+        with patch.object(self.ami_usim, "readers", return_value=readers_list), \
+                patch.object(self.ami_usim, "index_for_port", return_value=None), \
+                patch.dict(self.ami_usim.os.environ, {"USIM_READER_PORT": ""}):
+            self.assertIsNone(self.ami_usim.open_usim("5"))
+
+    def test_ami_usim_uses_the_only_reader_for_an_imsi_binding(self):
+        """IMSI cannot be read before the PIN is verified, so scanning for it on the single
+        card present would only burn that card's PIN tries."""
+        only = _Reader("Alcor Link AK9563 00 00")
+        with patch.object(self.ami_usim, "readers", return_value=[only]), \
+                patch.object(self.ami_usim, "index_for_port", return_value=None), \
+                patch.dict(self.ami_usim.os.environ, {"USIM_READER_PORT": ""}):
+            connection = self.ami_usim.open_usim("imsi:234100000000000")
+        self.assertEqual(connection.name, str(only))
+        self.assertTrue(connection.connected)
+
+    def test_ami_usim_honours_the_usb_port_binding_on_a_single_reader_host(self):
+        only = _Reader("Alcor Link AK9563 00 00")
+        with patch.object(self.ami_usim, "readers", return_value=[only]), \
+                patch.object(self.ami_usim, "index_for_port", return_value=0), \
+                patch.dict(self.ami_usim.os.environ, {"USIM_READER_PORT": "1-1.4.2"}):
+            connection = self.ami_usim.open_usim("2")
+        self.assertEqual(connection.name, str(only))
+        self.assertTrue(connection.connected)
+
     def test_unknown_exact_reader_name_fails_closed(self):
         available = _Reader("VoWiFi Modem first 00 00")
         with patch.object(self.pin_keeper, "readers", return_value=[available]), \
@@ -133,8 +172,8 @@ class ForeignCardRefusalTests(unittest.TestCase):
     subscriber, so the fault gets attributed upstream and the line rebuilds forever.
     """
 
-    OURS = "8901260444723809824"
-    THEIRS = "8944303773524072104"
+    OURS = "8900000000000000022"
+    THEIRS = "8900000000000000031"
 
     @classmethod
     def setUpClass(cls):
@@ -209,7 +248,7 @@ class ForeignCardRefusalTests(unittest.TestCase):
         # Falling back to "the first card-bearing reader" is the same silent mis-bind by
         # another route: every card said who it was, and none of them was ours.
         one = _Reader("Reader A", iccid=self.THEIRS)
-        two = _Reader("Reader B", iccid="8944303773524072999")
+        two = _Reader("Reader B", iccid="8900000000000000040")
         with self.assertRaises(self.pin_keeper.WrongCard):
             self._find("imsi:310260123456789", [one, two], self.OURS)
 

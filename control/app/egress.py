@@ -28,6 +28,7 @@ _ORCH_DIR = os.path.join(cfg.DATA_DIR, "orchestrator")
 _DESIRED = os.path.join(_ORCH_DIR, "desired.json")
 _STATUS = os.path.join(_ORCH_DIR, "proxy-status.json")
 _RESELECT = os.path.join(_ORCH_DIR, "exit-reselect.json")
+_STALLED = os.path.join(_ORCH_DIR, "exit-stalled.json")
 # A line healthy at least this long has proved its exit node can carry IMS.
 RESELECT_MIN_STABLE_SECONDS = float(os.environ.get("MDD_EXIT_RESELECT_MIN_STABLE", "600"))
 
@@ -360,6 +361,35 @@ def request_reselect(inst: dict, reason: str, stable_for: float = 0.0) -> str:
                           "line": str(inst.get("id") or "")}
     _atomic_json(_RESELECT, {"version": 1, "countries": countries})
     return country
+
+
+def report_stalled_exit(country: str, node: str, reason: str, line: str) -> bool:
+    """Tell the host this country's exit is holding connections that carry nothing.
+
+    Deliberately weaker than request_reselect: that one says "this node is bad, move off it",
+    which tears down every tunnel on it. This says "the node may well be fine — but the
+    sessions pinned to it are dead, close them so the next packet dials again".
+
+    It exists because a stalled session cannot time out on its own. sing-box retires a UDP
+    session on an IDLE timer, and a line rebuilding its tunnel retransmits IKE every few
+    seconds; each retransmit refreshes the timer on the very session whose outbound already
+    died. The line then retries forever against a connection that can never carry a packet.
+
+    The caller must have attributed the failure to the exit AND established that no sibling
+    line is registered over it, so this never disturbs a working tunnel. Returns True when a
+    report was written.
+    """
+    country = str(country or "").strip().lower()
+    if not country:
+        return False
+    document = _read_json(_STALLED)
+    countries = document.get("countries")
+    if not isinstance(countries, dict):
+        countries = {}
+    countries[country] = {"ts": time.time(), "reason": str(reason or ""),
+                          "node": str(node or ""), "line": str(line or "")}
+    _atomic_json(_STALLED, {"version": 1, "countries": countries})
+    return True
 
 
 def ensure_line(inst: dict, settings: dict, timeout: float = 18.0) -> dict:

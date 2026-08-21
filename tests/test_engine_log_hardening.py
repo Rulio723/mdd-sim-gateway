@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -115,6 +117,71 @@ class AsteriskModulePolicyTests(unittest.TestCase):
         swu = (root / "engine" / "swu_ike.py").read_text()
 
         self.assertIn('multiprocessing.set_start_method("fork", force=True)', swu)
+
+
+class RegisteredIdentityLogTests(unittest.TestCase):
+    """Reading a line's phone number must not require SIP tracing or an extra REGISTER.
+
+    The packet logger writes authentication headers to the container log, and the forced
+    re-registration it existed to produce is answered with 503 by some IMS cores (issue #8),
+    which Asterisk reports as a rejected registration and the health policy acts on. The
+    patched engine announces the identity of the registrations it makes anyway.
+    """
+
+    PATCHER = (Path(__file__).resolve().parent.parent / "engine" / "patches" / "asterisk"
+               / "ims_public_identity_log.py")
+
+    PROLOGUE = (
+        "static int store_volte_p_associated_uri(struct registration_response *response)\n"
+        "{\n"
+        "\tstruct ast_sip_transport_state *transport_state = NULL;\n"
+        "\tint ret = -1;\n"
+        "\n"
+    )
+    REST = (
+        "\tif (get_endpoint_transport_transport_state(response->client_state, NULL, NULL, "
+        "&transport_state))\n"
+        "\t\tgoto out;\n"
+        "out:\n"
+        "\treturn ret;\n"
+        "}\n"
+    )
+
+    def _apply(self, source):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "res" / "res_pjsip_outbound_registration.c"
+            target.parent.mkdir(parents=True)
+            target.write_text(source)
+            first = subprocess.run([sys.executable, str(self.PATCHER)],
+                                   env={**os.environ, "AST_SRC": temp},
+                                   capture_output=True, text=True)
+            patched = target.read_text() if target.exists() else source
+            second = subprocess.run([sys.executable, str(self.PATCHER)],
+                                    env={**os.environ, "AST_SRC": temp},
+                                    capture_output=True, text=True)
+            return first, patched, target.read_text() if target.exists() else source, second
+
+    def test_the_registered_identity_is_logged_on_the_ordinary_path(self):
+        first, patched, twice, second = self._apply(self.PROLOGUE + self.REST)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('ast_log(LOG_NOTICE, "IMS public identity: %s', patched)
+        # Every associated identity, not just the first: carriers list the IMSI-derived IMPU
+        # ahead of the dialable number.
+        self.assertIn("pjsip_msg_find_hdr_by_name", patched)
+        self.assertIn("pau ? pau->next : NULL", patched)
+        # Nothing may be sent: the log line is emitted from the response handler itself.
+        self.assertNotIn("pjsip_endpt_send_request", patched)
+        # Re-running the build must not stack a second copy.
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(twice, patched)
+
+    def test_an_upstream_refactor_fails_the_build_instead_of_being_skipped(self):
+        first, _patched, _twice, _second = self._apply(
+            "static int store_volte_p_associated_uri(void)\n{\n\treturn -1;\n}\n")
+
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("prologue not found", first.stderr)
 
 
 if __name__ == "__main__":

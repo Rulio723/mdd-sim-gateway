@@ -4,6 +4,125 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-22
+
+### Added
+
+- The dialler now accepts carrier service codes such as `*21*<number>#` (divert), `*#21#`
+  (check divert) and `#225#` (balance). Three separate layers rejected them before, each
+  looking like the last: the browser validated the input as either a short numeric code or an
+  E.164 number, JsSIP refused to build a request URI because `#` is not a legal user character
+  in a SIP URI, and the dialplan's outgoing extension pattern matched only `+` or a digit in
+  first position. All three now pass the code through untouched, escaping `#` for transport and
+  restoring it on the way out, so what reaches the network is what was dialled. What a code
+  then means is the carrier's IMS to decide, not this gateway's: supplementary-service codes
+  are the ones a TAS normally answers, whereas USSD codes need a USSI gateway the carrier may
+  no longer operate, and a carrier that has moved self-service into an app may simply decline.
+  Codes a handset answers by itself, currently `*#06#`, are answered from the line's own
+  provisioning instead of being dialled, since no network ever replies to those. Service codes
+  are refused on the cellular-modem transport rather than dialled as a voice call, which is all
+  that path can do; reaching them through a modem would need `AT+CUSD`, which is not built.
+
+- A dialled service code now reports whether the carrier served it. Because the code travels
+  as a call, the outcome used to arrive on a call's vocabulary — "declined", "no answer", a
+  running duration timer — none of which describe a request that is answered and torn down in
+  the same second, and all of which hide the one thing worth knowing: whether this carrier
+  supports the code at all. The Q.850 cause already reaching the control plane distinguishes
+  the cases, so codes are now scored on their own scale. An unknown code (404 Not Found),
+  a malformed one (484) and an unimplemented service (501/488) read as not supported; a 403
+  or 603 reads as refused, which is a different problem with a different fix — the request
+  reached the carrier and was declined by account policy rather than missing from the network.
+  Silence stays "no response" instead of being reported as unsupported, since nothing came
+  back to justify that claim.
+
+- A service code now shows what the carrier actually replied. The answer to `#225#` or `*#21#`
+  is not audio: the carrier puts it in the body of a SIP request inside the established dialog
+  — T-Mobile US uses the BYE — which is why such a "call" is silent and over in under a second.
+  That body was discarded, so an accepted code could confirm only that the carrier acted, never
+  what it said. The engine now copies the `application/vnd.3gpp.ussd+xml` payload onto the
+  channel and the control plane parses it (3GPP TS 24.390), storing the text with the call so
+  the balance or divert status appears where the code was dialled. The payload is bounded on
+  both sides — the engine refuses a body larger than 4 KB before copying it onto the stack, and
+  the parser caps the text it will store — and a body that is not decodable text is logged and
+  ignored rather than stored. Carriers that namespace the XML differently are handled; one that
+  returns no payload at all still reports the outcome as before.
+
+### Fixed
+
+- A line could retransmit forever against an exit connection that had already died. When the
+  exit is blamed but cannot be moved — strikes still short, pool exhausted, or the node pinned
+  — holding is the right call for node selection, but it used to leave one recoverable failure
+  unattended. sing-box keys a UDP session on its 5-tuple and retires it on an idle timer, and a
+  line rebuilding its tunnel refreshes that timer with every IKE retransmit: a session whose
+  outbound is dead is held open by the very retries meant to recover it, every later packet
+  goes to the same dead connection, no new session is ever created, and nothing is logged.
+  Rebuilding the container does not help, because it produces the same 5-tuple and lands on the
+  same dead session. Seen after a self-update restarted the orchestrator: two lines sharing the
+  only GB exit dialled before the route was up, got "no route to host", and stayed stuck for
+  twenty minutes while their tunnels reported CONNECTING and the exit itself tested fine. The
+  control plane now names the country when it blames an exit and declines to move it, and the
+  orchestrator closes that country's connections so the next packet has to dial afresh. This is
+  deliberately the weaker sibling of switching nodes: it changes no node, respects a pin, and
+  is gated on the same check, so an exit carrying a registered sibling line is never touched.
+
+- A service code beginning with `#` produced no call-log entry at all. The dialplan reports a
+  call through a shell, where an unquoted `#` at the start of a word opens a comment: dialling
+  `#225#` therefore discarded the number and every argument after it, and the record was never
+  created — not stuck in a wrong state, simply absent. `*#21#` was unaffected, its `#` falling
+  mid-word, which is why the failure looked arbitrary. The argument is now quoted.
+
+- A very short call could stay on "dialing" in the call log forever. The dialplan reports a
+  call's start and its outcome from separate backgrounded processes, so nothing orders the two:
+  when a call ends in under a second, the outcome can reach the manager before the record it is
+  meant to close, and it was then dropped silently — the call never left "dialing" even though
+  it had completed. A dialled service code answered on the BYE does exactly that, which is how
+  this surfaced, but the race was never specific to service codes and had been latent for any
+  short call. The outcome now waits briefly for the record it belongs to instead of being
+  discarded.
+
+- A SIM in an ordinary USB smart-card reader could report NO_CARD with the tunnel already up
+  (issue #8). A modem bridge presents one SIM on three logical slots so PIN keeping, tunnel
+  authentication and IMS-AKA can work independently; an ordinary reader has a single slot and
+  does all three through it. The engine contract nevertheless filled the unset slot numbers with
+  the modem layout, sending IMS-AKA to slot 2 — which on a one-reader gateway does not exist, so
+  the SIM read as absent while the same card answered the tunnel perfectly. Each role now
+  follows the reader the line is actually bound to, and the engine falls back to the only reader
+  present rather than refusing a slot number that names nothing. A modem line keeps its
+  dedicated channels. Gateways with two or more readers were unaffected: the stable USB-port
+  binding already resolved the right one there.
+
+- Learning a line's phone number no longer risks the connection it just made (issue #8). WiFi
+  Calling came up, held for a few seconds and was then torn down and re-established, with the
+  carrier answering "503 Service Unavailable" — the number was learned by enabling SIP tracing
+  and sending an extra REGISTER purely to produce a response that could be read, and some
+  carrier IMS cores decline an unsolicited re-registration seconds after accepting one. Asterisk
+  reports that as a rejected registration, and the health policy acts on rejections. The carrier
+  already announces the number in the registration the line makes anyway, so the engine now
+  records it from that response and the control plane reads it from the log: nothing extra is
+  sent, and SIP tracing — which also writes authentication headers into the container log — is
+  no longer switched on to ask a line for its own number. The same applies to the six-hourly
+  ported-number check. Every public identity the carrier lists is recorded, so a network that
+  puts an IMSI-derived identity ahead of the dialable number is read correctly. Requires a
+  rebuilt engine image; an older engine keeps a number already learned but cannot learn a new
+  one, which a manually entered number covers.
+
+- Binary SMS no longer appear in your conversations as walls of mojibake. Not every message is
+  meant for a person: carriers and services also send machine payloads — SIM data-download,
+  silent app pushes — whose content is arbitrary bytes rather than characters. The PDU says so
+  in its header, but Asterisk unpacks 8-bit data one byte per character and hands back a
+  string, so these landed in the message list looking like a text with a broken encoding, and
+  raised a notification each time. The engine now reports the message's TP-PID, TP-DCS, user
+  data header and raw PDU, and the control plane files anything that is 8-bit, addressed to the
+  SIM (message class 2) or marked as SIM data-download into a separate store instead of showing
+  it. Payloads already in the database are moved there on startup — nothing is discarded, and
+  the bytes are kept verbatim, since identifying an encrypted payload needs the PDU as it
+  arrived rather than a decode of it. Messages gains a collapsed "Non-text payloads" section
+  listing what was filed, with the reason it was filed and the raw bytes: the classification
+  reads the PDU header, so a carrier that mislabels a real text's data-coding scheme would
+  otherwise hide it for good with no way to notice. A rebuilt engine image is what supplies the
+  header fields; until then the control plane falls back to recognising a payload by its
+  content, which catches most but not all of them.
+
 ## [1.3.15] - 2026-08-20
 
 ### Fixed

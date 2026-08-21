@@ -10,8 +10,8 @@ try:
 except ImportError:      # the Docker SDK is a manager runtime dependency naming does not need
     main = None
 
-ICCID_A = "8944110068783494409"
-ICCID_B = "8944110068783491234"
+ICCID_A = "8944000000000004409"
+ICCID_B = "8944000000000001234"
 
 
 class TempConfig:

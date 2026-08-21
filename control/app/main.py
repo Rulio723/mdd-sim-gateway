@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
-               sysinfo, failover, carrier_id, allowance, cellular_call)
+               sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd)
 from .version import VERSION
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -54,13 +54,20 @@ REG_UNANSWERED_RECOVERY_DELAY_SECONDS = float(
     os.environ.get("MDD_REG_UNANSWERED_RECOVERY_DELAY", "10"))
 REG_UNANSWERED_MIN_INTERVAL_SECONDS = float(
     os.environ.get("MDD_REG_UNANSWERED_MIN_INTERVAL", "300"))
-# Number portability is a rare administrative event. Verification forces one REGISTER so the
-# carrier emits a fresh public identity; six-hour cadence detects a change promptly without
-# perturbing every healthy IMS registration every ten minutes.
+# Number portability is a rare administrative event. Verification re-reads the public identity
+# from the registrations the line makes anyway, so it costs one log read; a six-hour cadence
+# detects a change promptly without re-reading every healthy line's log every ten minutes.
 MSISDN_VERIFY_INTERVAL_SECONDS = float(os.environ.get("MDD_MSISDN_VERIFY", "21600"))
 MSISDN_VERIFY_FAILURE_RETRY_SECONDS = float(
     os.environ.get("MDD_MSISDN_VERIFY_FAILURE_RETRY", "600"))
-MSISDN_VERIFY_SETTLE_SECONDS = float(os.environ.get("MDD_MSISDN_VERIFY_SETTLE", "8"))
+# Spacing between the capped attempts to read a not-yet-learned number out of the engine log.
+# The identity is logged when the line registers, so the first attempt normally succeeds; the
+# retries only cover a log tail that has not caught up with a registration that just completed.
+MSISDN_LEARN_RETRY_SECONDS = float(os.environ.get("MDD_MSISDN_LEARN_RETRY", "30"))
+# How far back to look for the identity. It is re-announced on every registration refresh, so
+# the tail only has to outlast one refresh interval — generous here because the alternative,
+# not finding it, silently stops the ported-number check on a line whose engine talks a lot.
+MSISDN_LOG_TAIL_LINES = int(os.environ.get("MDD_MSISDN_LOG_TAIL", "4000"))
 # Conditions that are genuinely measured but routinely spike for one sample. Starting a
 # container on a memory-tight box pages a batch back in; that is the cost of the operation,
 # not a problem anyone can act on. Only a rate that holds across consecutive polls is one.
@@ -1079,20 +1086,39 @@ async def card_monitor():
         await asyncio.sleep(0.25)
 
 
+# Lines of the engine log that carry the public identity the carrier bound at registration.
+# "IMS public identity" is the patched Asterisk's own NOTICE (engine/patches/asterisk/
+# ims_public_identity_log.py), emitted on every ordinary REGISTER and refresh — reading it
+# costs nothing and perturbs nothing. The raw header is still matched so a container running
+# with Asterisk debug (SIP tracing) enabled is read just the same.
+_IMS_IDENTITY_LINE = re.compile(
+    r'^.*(?:IMS public identity:|P-Associated-Uri:).*$', re.I | re.M)
+_IMS_IDENTITY_NUMBER = re.compile(r'(?:tel|sip):(\+\d{5,})', re.I)
+
+
 def extract_msisdn(iid):
-    """Learn the registered MSISDN from the P-Associated-URI in the engine SIP logs."""
-    logs = engine.logs(iid, 1200)
-    matches = re.findall(r'P-Associated-Uri:\s*<(?:tel:|sip:)(\+\d+)', logs, re.I)
-    return matches[-1] if matches else None
+    """Learn the registered MSISDN from the P-Associated-URI the engine logged.
+
+    The newest identity wins: a ported number is the same SIM being answered with a different
+    public identity, so the last registration is the only one that still describes the line.
+    Within one line the first dialable URI wins — carriers list the IMSI-derived IMPU (no
+    number in it) alongside the E.164 identities, and the first `+` URI is the primary one.
+    """
+    logs = engine.logs(iid, MSISDN_LOG_TAIL_LINES)
+    for line in reversed(_IMS_IDENTITY_LINE.findall(logs)):
+        found = _IMS_IDENTITY_NUMBER.search(line)
+        if found:
+            return found.group(1)
+    return None
 
 
 def _needs_ims_msisdn_learning(inst: dict) -> bool:
-    """Whether IMS has to be asked for the line number, by re-registering to produce one.
+    """Whether the line number still has to be read out of the IMS registration.
 
     ModemManager OwnNumbers is only a hint: modems commonly retain a stale value across SIM
     swaps, omit the leading '+', or expose a service number instead of the IMS public identity.
     Only an unknown or hinted number justifies the initial learning loop; a number already learned
-    from IMS is re-checked on a much slower controlled cadence (see _verify_ims_msisdn).
+    from IMS is re-checked on a much slower cadence (see _verify_ims_msisdn).
     """
     return (not str(inst.get("msisdn") or "").strip()
             or inst.get("msisdn_source") == "modemmanager")
@@ -1103,9 +1129,12 @@ async def _verify_ims_msisdn(iid: str, inst: dict) -> None:
 
     A ported number is exactly this: the same SIM, registering normally, answered with a
     different public identity. Treating the first IMS answer as permanent left the line
-    presenting its previous number as caller identity indefinitely. PJSIP logs the identity only
-    while its packet logger is enabled, so the slow verification cadence performs one controlled
-    registration refresh and immediately disables packet logging again.
+    presenting its previous number as caller identity indefinitely.
+
+    This reads the identity the engine already logged for its own registrations. It used to
+    force one REGISTER with the SIP packet logger enabled instead, which some IMS cores answer
+    with "503 Service Unavailable" (issue #8) — a rejected registration that the health policy
+    then acts on, so asking a healthy line for its number was enough to take it down.
 
     A manually entered number is never overridden: that is a deliberate operator choice.
     """
@@ -1118,29 +1147,14 @@ async def _verify_ims_msisdn(iid: str, inst: dict) -> None:
             < MSISDN_VERIFY_INTERVAL_SECONDS):
         return
     hub._msisdn_checked[iid] = time.monotonic()
-    # P-Associated-URI is visible only while Asterisk's PJSIP packet logger is enabled. A
-    # container rebuild resets that runtime flag, so merely tailing old logs makes this feature
-    # silently stop working. Turn it on only for one controlled REGISTER (leaving it enabled would
-    # retain authentication headers), then immediately turn it off again.
-    logger_enabled = False
     try:
-        await asyncio.to_thread(engine.exec_cli, iid, "pjsip set logger on")
-        logger_enabled = True
-        await asyncio.to_thread(engine.exec_cli, iid, "pjsip send register volte_ims")
-        await asyncio.sleep(MSISDN_VERIFY_SETTLE_SECONDS)
         observed = await asyncio.to_thread(extract_msisdn, iid)
-    except Exception as exc:  # noqa: a transient CLI failure is retried on the next interval
+    except Exception as exc:  # noqa: a transient log read failure is retried on the next interval
         log.debug("IMS number verification failed for line %s: %s", iid, type(exc).__name__)
         hub._msisdn_checked[iid] = (
             time.monotonic() - MSISDN_VERIFY_INTERVAL_SECONDS
             + MSISDN_VERIFY_FAILURE_RETRY_SECONDS)
         return
-    finally:
-        if logger_enabled:
-            try:
-                await asyncio.to_thread(engine.exec_cli, iid, "pjsip set logger off")
-            except Exception:
-                pass
     stored = str(inst.get("msisdn") or "")
     if not observed or observed == stored:
         return
@@ -1178,38 +1192,51 @@ async def _verify_ims_msisdn(iid: str, inst: dict) -> None:
 
 
 async def learn_msisdn(iid):
-    """One-shot: enable the SIP logger, re-register to produce a fresh 200 OK, then parse
-    the P-Associated-URI. Capped attempts so we don't re-register forever."""
+    """Read the line number out of the identity the engine logged for its own registration.
+
+    Nothing is sent to the carrier. The previous implementation enabled the SIP packet logger
+    and forced an extra REGISTER to produce a 200 OK it could read; some IMS cores answer that
+    unsolicited re-registration with 503 (issue #8), which Asterisk reports as a rejected
+    registration and the health policy acts on — so a line that had just come up was dropped
+    purely by the attempt to learn its number. A registration the line makes anyway carries the
+    same P-Associated-URI.
+
+    An attempt that finds nothing holds the per-line learning slot for the retry interval, so
+    the capped retries in _poll_instance_status span the settling period instead of being spent
+    in one burst; each registration refresh re-announces the identity in any case.
+    """
     try:
-        await asyncio.to_thread(engine.exec_cli, iid, "pjsip set logger on")
-        await asyncio.to_thread(engine.exec_cli, iid, "pjsip send register volte_ims")
-        await asyncio.sleep(8)
         msisdn = await asyncio.to_thread(extract_msisdn, iid)
-        if msisdn:
-            current = cfg.get_instance(iid) or {}
-            # IMS registration is authoritative and may correct an OwnNumbers value
-            # previously learned from ModemManager. Never overwrite a manual value.
-            if current.get("msisdn") and current.get("msisdn_source") != "modemmanager":
-                return
-            identity_changed = str(current.get("msisdn") or "") != msisdn
-            updated = cfg.upsert_instance({"id": iid, "msisdn": msisdn,
-                                           "msisdn_source": "ims"})
-            c = hub.ami.get(iid)
-            if c:
-                c.msisdn = msisdn
-            log.info("learned line number for instance %s", iid)
-            # instance.json and Asterisk's pjsip/dialplan are snapshots from container start.
-            # When IMS corrected a ModemManager hint, persist-only is insufficient: outgoing
-            # INVITEs would keep sending the stale P-Preferred-Identity and the carrier would
-            # immediately terminate them (observed as 487 -> browser-side 603). Recreate the
-            # running engine once so registration, From and PPI all use the authoritative value.
-            if identity_changed and await asyncio.to_thread(engine.is_running, iid):
-                await hub.drop_ami(iid)
-                await asyncio.to_thread(_start_engine_checked, updated, cfg.get_settings(),
-                                        os.environ.get("MDD_DEV_MOUNTS", "") == "1")
-                hub.reset_health(iid)
-                log.info("restarted instance %s to apply IMS line identity", iid)
-            await hub.broadcast({"type": "engine", "instance": iid, "event": "msisdn", "args": [msisdn]})
+        if not msisdn:
+            # Hold this line's learning slot for the interval: the caller's attempt cap is
+            # what stops the loop, and spending it in one burst would give up seconds after
+            # the line registered instead of across the window a slow log tail needs.
+            await asyncio.sleep(MSISDN_LEARN_RETRY_SECONDS)
+            return
+        current = cfg.get_instance(iid) or {}
+        # IMS registration is authoritative and may correct an OwnNumbers value
+        # previously learned from ModemManager. Never overwrite a manual value.
+        if current.get("msisdn") and current.get("msisdn_source") != "modemmanager":
+            return
+        identity_changed = str(current.get("msisdn") or "") != msisdn
+        updated = cfg.upsert_instance({"id": iid, "msisdn": msisdn,
+                                       "msisdn_source": "ims"})
+        c = hub.ami.get(iid)
+        if c:
+            c.msisdn = msisdn
+        log.info("learned line number for instance %s", iid)
+        # instance.json and Asterisk's pjsip/dialplan are snapshots from container start.
+        # When IMS corrected a ModemManager hint, persist-only is insufficient: outgoing
+        # INVITEs would keep sending the stale P-Preferred-Identity and the carrier would
+        # immediately terminate them (observed as 487 -> browser-side 603). Recreate the
+        # running engine once so registration, From and PPI all use the authoritative value.
+        if identity_changed and await asyncio.to_thread(engine.is_running, iid):
+            await hub.drop_ami(iid)
+            await asyncio.to_thread(_start_engine_checked, updated, cfg.get_settings(),
+                                    os.environ.get("MDD_DEV_MOUNTS", "") == "1")
+            hub.reset_health(iid)
+            log.info("restarted instance %s to apply IMS line identity", iid)
+        await hub.broadcast({"type": "engine", "instance": iid, "event": "msisdn", "args": [msisdn]})
     except Exception as e:  # noqa
         log.debug("learn_msisdn error: %r", e)
     finally:
@@ -1749,7 +1776,26 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
                                     stable_for=stable_for)
         except Exception as exc:  # noqa
             log.warning("exit reselect request failed for line %s: %s", iid, exc)
-    elif action in (failover.GIVE_UP, failover.REPORT) or (
+    elif verdict == failover.BLAMES_EXIT and not peer_registered and country:
+        # The exit is at fault and we are NOT moving off it — either the strike count is still
+        # short, the pool is exhausted, or the node is pinned. Holding is right, but it leaves
+        # one recoverable failure unattended: a sing-box session whose outbound died is kept
+        # alive by this line's own IKE retransmits (each one refreshes the idle timer), so the
+        # rebuild loop feeds packets to a connection that can never answer and the line never
+        # recovers on its own. Ask the host to close that country's sessions so the next
+        # attempt dials afresh.
+        #
+        # Safe by construction against the failover principles: it changes no node, respects a
+        # pin, and the peer check above means no sibling line is registered over this exit, so
+        # nothing that currently works is torn down.
+        try:
+            egress.report_stalled_exit(country, node, f"health-freeze:{st['reason_code']}", iid)
+        except Exception as exc:  # noqa
+            log.debug("stalled-exit report failed for line %s: %r", iid, exc)
+    # Independent of the branch above, not an alternative to it: closing dead sessions and
+    # telling the operator the line is stuck are different jobs, and a backed-off line needs
+    # both. (Chaining this onto the same if/elif silently swallowed the notification.)
+    if action in (failover.GIVE_UP, failover.REPORT) or (
             action == failover.BACK_OFF and not was_backing_off):
         text = failover.summarise(ledger, action, country, pinned)
         log.warning("line %s: %s", iid, text)
@@ -3076,8 +3122,9 @@ async def api_provision(body: dict):
         # CFG request address family. Defaults to 'auto' (discovery ladder + carrier DB, seamless);
         # 'v6' Telus/EE, 'v4' Vodafone UK, 'dual'. Normalised in config.render_instance_json.
         "cp_mode": cfg.normalize_cp_mode(body.get("cp_mode", "")),
-        # Full Asterisk debug contains SIP identities. The control plane only enables the
-        # narrowly-scoped PJSIP logger temporarily when learning an IMS phone number.
+        # Full Asterisk debug writes SIP identities and authentication headers to the container
+        # log. Nothing the control plane does needs it: the line number is read from the
+        # identity Asterisk announces for its own registrations.
         "debug": {**(body.get("debug") or {}), "asterisk": False},
     }
     # A modem is represented as one UI device but has three internal logical channels so PIN
@@ -4527,6 +4574,21 @@ def api_threads(iid: str):
     return {"threads": store.list_threads(iid)}
 
 
+@app.get("/api/instances/{iid}/messages/binary")
+def api_binary_sms(iid: str, limit: int = 200):
+    """Non-text payloads received on this line: binary/SIM-addressed SMS that are kept out of
+    the conversations. Read-only and deliberately raw — identifying what an encrypted payload
+    belongs to needs the PDU as it arrived, not a decode of it.
+
+    Each row carries `tags` saying WHY it was filed. The UI needs that for more than curiosity:
+    the classification can be wrong (a carrier mislabelling a real text's TP-DCS would hide it
+    for good), so the reason has to be inspectable rather than implicit."""
+    rows = store.list_binary_sms(iid, limit)
+    for row in rows:
+        row["tags"] = sms_pdu.payload_tags(row.get("tp_pid"), row.get("tp_dcs"))
+    return {"payloads": rows}
+
+
 @app.get("/api/instances/{iid}/messages/{peer}")
 def api_messages(iid: str, peer: str):
     return {"messages": store.list_messages(iid, peer)}
@@ -4995,11 +5057,61 @@ def api_softphone(iid: str, request: Request):
 
 
 # ----------------------------- engine event hook -----------------------------
-def _call_disposition(dialstatus: str, cause: int, direction: str = "out") -> str:
+# Q.850 causes that mean "the network would not act on this request" rather than "the call
+# did not connect". Grouped rather than mapped one-to-one from SIP: Asterisk's SIP -> Q.850
+# translation differs per response, but every cause here arrives from a 4xx/5xx saying the
+# destination is unknown, malformed or unimplemented — which for a service code all mean the
+# same thing to the operator, namely that this carrier will not serve the code.
+SERVICE_CODE_UNSUPPORTED_CAUSES = {
+    1,    # unallocated number          <- 404 Not Found: the carrier does not know this code
+    28,   # invalid number format       <- 484 Address Incomplete
+    58,   # bearer capability not available
+    63,   # service or option not available
+    79,   # service or option not implemented   <- 501 Not Implemented
+    88,   # incompatible destination            <- 488 Not Acceptable Here
+}
+
+
+def _is_service_code(peer: str) -> bool:
+    """A dialled string carrying '*' or '#' is supplementary-service or USSD signalling."""
+    return any(ch in str(peer or "") for ch in "*#")
+
+
+def _service_code_disposition(dialstatus: str, cause: int) -> str:
+    """Score a service code (*21*<number>#, #225#) on its own scale rather than a call's.
+
+    These are signalling, not conversation: there is no audio in either direction, so the
+    call-shaped outcomes ('busy', 'no answer') would all misdescribe what happened. What is
+    knowable here is only whether the carrier acted on the request. The response CONTENT — a
+    balance, a divert status — rides in a USSD payload this gateway does not parse, so even an
+    accepted code shows no text; see the USSI note in the changelog.
+    """
+    if dialstatus == "ANSWER":
+        return "code accepted"
+    if cause in SERVICE_CODE_UNSUPPORTED_CAUSES:
+        return "code unsupported"
+    if cause == 21:                     # 403/603 — the carrier got it and refused it
+        return "code rejected"
+    if dialstatus == "CANCEL":
+        return "cancelled"
+    # Everything else: the carrier reacted but said nothing decisive. Observed in the field are
+    # cause 38 (network out of order, from SIP 503) and cause 127 (interworking, unspecified —
+    # Asterisk's fallback when a response has no Q.850 mapping), plus cause 0 when nothing came
+    # back at all. None of these distinguish "this carrier does not offer the code" from "it
+    # could not serve it right now", so do NOT report them as unsupported — that would send the
+    # operator chasing a permanent limitation that may just be a transient failure.
+    return "code failed"
+
+
+def _call_disposition(dialstatus: str, cause: int, direction: str = "out",
+                      peer: str = "") -> str:
     """Map Asterisk DIALSTATUS + Q.850 hangupcause to a friendly outcome. No retry — a
     rejected/busy/no-answer call is simply recorded as such. Incoming and outgoing read the
     same DIALSTATUS differently: for an inbound call the Dial targets our local softphone, so
-    BUSY/decline means WE declined and CANCEL/NOANSWER means we missed it."""
+    BUSY/decline means WE declined and CANCEL/NOANSWER means we missed it. An outgoing service
+    code is not a call and is scored separately."""
+    if direction == "out" and _is_service_code(peer):
+        return _service_code_disposition(dialstatus, cause)
     if dialstatus == "ANSWER":
         return "answered"
     if direction == "in":
@@ -5037,17 +5149,42 @@ async def api_engine_event(payload: dict):
         # real sources produce these, and neither is a text the user should see:
         #   1. IMS-internal signalling: the carrier's IP-SM-GW / SMSC sends non-user MESSAGEs
         #      whose From is a bare private-IP SIP URI (e.g. <sip:10.183.150.10>).
-        #   2. Binary / SIM-targeted SMS: OTA "SIM data-download" messages (3GPP TS 23.040
-        #      TP-DCS 0xF6 = 8-bit, message-class 2) and other non-text PDUs — Asterisk decodes
-        #      their user-data to an empty string because there is no displayable text (seen from
-        #      short-codes like 20023). These are operator/service payloads for the SIM, not texts.
+        #   2. A non-text PDU whose user data happens to decode to nothing (seen from short-codes
+        #      like 20023). Note this catches only the ones that decode to an EMPTY string —
+        #      most binary payloads decode to a non-empty run of mojibake and are caught by the
+        #      classifier below, which reads the PDU header instead of guessing from the body.
         # A genuine text always has a non-empty decoded body, so dropping on empty-body never
         # loses a real message. (An empty body with a normal sender is likewise nothing to show.)
+        # A payload that was never meant to be read — 8-bit binary, message class 2 (addressed
+        # to the SIM), TP-PID 0x7F — is filed away instead of becoming a message. Asterisk
+        # unpacks 8-bit user data one byte per character, so without this check it reaches the
+        # conversation view as a wall of mojibake (line 1 collected 16 from short-codes
+        # 2942/2939 that way). This precedes the concatenation buffer on purpose: a binary
+        # payload split across parts must not be text-joined, and its UDH — kept in the filed
+        # row — still holds the triplet needed to piece the bytes back together later.
+        # looks_binary() is the fallback for an engine image built before the header fields
+        # existed, where args carries no TP-DCS to judge by.
+        pdu = sms_pdu.parse_event_args(args)
+        segment = _concat_triplet(args)
+        if pdu.is_machine_payload or (not pdu.known and sms_pdu.looks_binary(text)):
+            rec = await asyncio.to_thread(
+                store.add_binary_sms, iid, sender,
+                tp_pid=pdu.tp_pid, tp_dcs=pdu.tp_dcs, concat=segment,
+                udh_hex=pdu.udh_hex, tpdu_hex=pdu.tpdu_hex,
+                body_hex=sms_pdu.body_to_hex(text))
+            log.info("filed a non-text SMS from %s on line %s (pid=%s dcs=%s, %d bytes) — "
+                     "not shown as a message", sender, iid, pdu.tp_pid, pdu.tp_dcs,
+                     len(rec["body_hex"]) // 2)
+            # Tell an open page to refresh its filed-payload count. Deliberately carries no
+            # "message" key: the toast in the web UI keys on that, and a payload nobody can read
+            # must not raise "SMS from …". No push notification either — see _dispatch_push
+            # below, which this path never reaches.
+            await hub.broadcast({"type": "sms", "instance": iid, "binary": True})
+            return {"ok": True, "stored": "binary", "id": rec["id"]}
         # One part of a multi-part text: buffer it and wait for its siblings. The empty-body
         # rule below is deliberately NOT applied to a part — the sources it guards against
         # (IMS signalling, OTA payloads) never carry a concatenation header, whereas dropping
         # a part that decoded to nothing would leave the whole message forever incomplete.
-        segment = _concat_triplet(args)
         if segment:
             ref, total, seq = segment
             parts = await asyncio.to_thread(store.add_sms_segment, iid, sender, ref, total,
@@ -5107,15 +5244,48 @@ async def api_engine_event(payload: dict):
             to = args[0]
             dialstatus = (args[1] if len(args) > 1 else "").upper()
             cause = int(args[2]) if len(args) > 2 and str(args[2]).isdigit() else 0
-        disp = _call_disposition(dialstatus, cause, direction)
+        disp = _call_disposition(dialstatus, cause, direction, to)
         rec = store.update_last_call(iid, direction, to, disp)
         if not rec and to:
             # exact peer didn't match an open record (e.g. 'h' lost the number to a
             # masquerade and call_out stored a different form) — finalize the latest open
             # call of this direction instead so it never stays stuck on dialing/ringing.
             rec = store.update_last_call(iid, direction, None, disp)
+        if not rec:
+            # The dialplan fires call_out and call_result from separate backgrounded
+            # notify.py processes ('&'), so nothing orders them. On a call that lasts under a
+            # second — a dialled service code answered on the BYE does exactly that — the
+            # result can land BEFORE the record it is meant to close, and used to be dropped
+            # silently, stranding the call on 'dialing' forever. call_out is already on its
+            # way, so wait briefly for it rather than discarding the outcome.
+            for _ in range(15):
+                await asyncio.sleep(0.2)
+                rec = (store.update_last_call(iid, direction, to, disp)
+                       or (store.update_last_call(iid, direction, None, disp) if to else None))
+                if rec:
+                    log.info("call_result for %s arrived before its record; applied on retry",
+                             to or direction)
+                    break
         if rec:
             await hub.broadcast({"type": "call", "instance": iid, "call": rec})
+    elif event == "ussd" and args:
+        # A carrier answers a service code in signalling rather than audio (T-Mobile puts it
+        # on the BYE), so this is reported by a hangup handler on the carrier's own leg —
+        # the caller's leg, where call_result comes from, never sees the payload.
+        peer = args[0] if args else ""
+        reply = ussd.parse(args[1] if len(args) > 1 else "")
+        if reply:
+            rec = store.set_ussd_for_peer(iid, peer, reply["text"])
+            if not rec:
+                # Same race as call_result above: this is fired from the carrier leg's hangup
+                # handler and can beat call_out to the manager.
+                for _ in range(15):
+                    await asyncio.sleep(0.2)
+                    rec = store.set_ussd_for_peer(iid, peer, reply["text"])
+                    if rec:
+                        break
+            if rec:
+                await hub.broadcast({"type": "call", "instance": iid, "call": rec})
     elif event == "cp_mode_resolved" and args:
         # CP auto-discovery success: the engine found the address family (v6/v4/dual) that yields a
         # usable PDN on this carrier. Repin the line from 'auto' to the resolved family so it stops

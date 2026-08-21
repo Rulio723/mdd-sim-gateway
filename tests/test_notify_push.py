@@ -201,20 +201,20 @@ class NumberChangeNotificationTests(unittest.TestCase):
     def _payload(self):
         return notify_push.build_payload(
             notify_push.EV_NUMBER_CHANGED,
-            {"id": "5", "name": "voxi", "msisdn": "+447516734101"},
-            "+447516734101", "+447767629230 → +447516734101")
+            {"id": "5", "name": "voxi", "msisdn": "+447700900123"},
+            "+447700900123", "+447700900456 → +447700900123")
 
     def test_it_is_not_rendered_as_a_call_or_an_sms(self):
         text = notify_push._telegram_text(self._payload())
         self.assertNotIn("Incoming call", text)
         self.assertNotIn("Incoming SMS", text)
         self.assertIn("号码已变更", text)
-        self.assertIn("+447516734101", text)
+        self.assertIn("+447700900123", text)
 
     def test_the_shared_builder_names_the_line(self):
         message = notify_push.build_notification_message(self._payload())
         self.assertIn("voxi", message["title"])
-        self.assertIn("+447767629230", message["content"])
+        self.assertIn("+447700900456", message["content"])
 
     def test_it_has_its_own_per_channel_toggle(self):
         enabled = notify_push._events_enabled({"events": {"number_changed": False}})

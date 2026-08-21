@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 VPCD = "VoWiFi Modem 2c7c-0125-1-1.4.4 00 00"
 VPCD_IMS = "VoWiFi Modem 2c7c-0125-1-1.4.4 00 02"
 PHYSICAL = "Alcor Link AK9563 01 00"
-OURS = "8901240497124794180"
-THEIRS = "8944303773524104097"
+OURS = "8900000000000000013"
+THEIRS = "8900000000000000059"
 
 
 def _iccid_apdu_bytes(iccid):

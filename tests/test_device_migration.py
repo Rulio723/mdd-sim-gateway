@@ -26,7 +26,7 @@ class DeviceMigrationTests(unittest.TestCase):
     def _desired(self):
         return json.loads(self.app.device_desired_path.read_text())["devices"]
 
-    def _identity(self, device_id, imei="866069053561567"):
+    def _identity(self, device_id, imei="350000000000027"):
         path = self.app.data / "modems" / f"{device_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         self._write(path, {"imei": imei})
@@ -66,7 +66,7 @@ class DeviceMigrationTests(unittest.TestCase):
         self.assertEqual(self._desired(), devices)
 
         # A different modem of the same USB model must not inherit this configuration.
-        self._identity("2c7c-0125-1-1.4", "866069053561568")
+        self._identity("2c7c-0125-1-1.4", "350000000000036")
         self.app.migrate_device_ids([_modem("2c7c-0125-1-1.4", "1-1.4")])
         self.assertEqual(self._desired(), devices)
 
@@ -111,7 +111,7 @@ class RetiredIdentityDocumentTests(unittest.TestCase):
     def tearDown(self):
         self._temp.cleanup()
 
-    def _identity(self, device_id, imei="866069053561567"):
+    def _identity(self, device_id, imei="350000000000027"):
         path = self.root / "modems" / f"{device_id}.json"
         path.write_text(json.dumps({"hardware_id": device_id, "imei": imei,
                                     "base_port": 35963}))
@@ -130,7 +130,7 @@ class RetiredIdentityDocumentTests(unittest.TestCase):
         self.app.retire_identity_document("2c7c-0125-1-1.2", "2c7c-0125-1-1.4")
         carried = json.loads((self.root / "modems" / "2c7c-0125-1-1.4.json").read_text())
         self.assertEqual(carried["hardware_id"], "2c7c-0125-1-1.4")
-        self.assertEqual(carried["imei"], "866069053561567")
+        self.assertEqual(carried["imei"], "350000000000027")
         self.assertEqual(carried["base_port"], 35963)
         self.assertFalse((self.root / "modems" / "2c7c-0125-1-1.2.json").exists())
 

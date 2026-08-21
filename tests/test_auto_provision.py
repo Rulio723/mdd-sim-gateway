@@ -145,6 +145,51 @@ class AutoProvisionTests(unittest.TestCase):
         self.assertTrue(rendered["sip"]["user_eq_phone"])
         self.assertIn("country=GB", rendered["sip"]["pani"])
 
+    def test_a_native_reader_gives_every_engine_role_the_line_s_own_slot(self):
+        """A USB PC/SC reader has one slot. The rendered PIN/IMS readers used to be fixed at
+        "0" and "2", so on a one-reader host ami_usim addressed a slot that does not exist and
+        the SIM read as USIM = NO_CARD while IMS-AKA never ran (issue #8)."""
+        base = {
+            "id": "3", "index": 0, "imsi": "234100000000000",
+            "mcc": "234", "mnc": "10", "iccid": "test-card", "reader_index": 0,
+            "imei": "490154203237518", "ami_secret": "test-secret",
+            "sip": {"webrtc": {"enable": True, "password": "test-password"}},
+        }
+
+        rendered = config.render_instance_json(base, {})
+
+        self.assertEqual(rendered["pin_reader"], "0")
+        self.assertEqual(rendered["ami_reader"], "0")
+
+    def test_a_native_reader_on_a_higher_index_is_followed_by_every_role(self):
+        base = {
+            "id": "3", "index": 0, "imsi": "234100000000000",
+            "mcc": "234", "mnc": "10", "iccid": "test-card", "reader_index": 3,
+            "imei": "490154203237518", "ami_secret": "test-secret",
+            "sip": {"webrtc": {"enable": True, "password": "test-password"}},
+        }
+
+        rendered = config.render_instance_json(base, {})
+
+        self.assertEqual(rendered["pin_reader"], "3")
+        self.assertEqual(rendered["ami_reader"], "3")
+
+    def test_a_modem_line_keeps_its_dedicated_logical_slots(self):
+        """A modem bridge really does expose three channels; the roles must stay apart."""
+        base = {
+            "id": "3", "index": 0, "imsi": "234100000000000",
+            "mcc": "234", "mnc": "10", "iccid": "test-card", "reader_index": 4,
+            "imei": "490154203237518", "ami_secret": "test-secret",
+            "pin_reader": "VoWiFi Modem 2c7c-0125-4-1 00 00",
+            "ami_reader": "VoWiFi Modem 2c7c-0125-4-1 00 02",
+            "sip": {"webrtc": {"enable": True, "password": "test-password"}},
+        }
+
+        rendered = config.render_instance_json(base, {})
+
+        self.assertEqual(rendered["pin_reader"], "VoWiFi Modem 2c7c-0125-4-1 00 00")
+        self.assertEqual(rendered["ami_reader"], "VoWiFi Modem 2c7c-0125-4-1 00 02")
+
     def test_blank_sip_identity_fields_restore_carrier_defaults(self):
         merged = config.merge_carrier_sip_defaults("234", "10", "test-card", {
             "pani": "", "access_type": "", "user_eq_phone": False,
@@ -350,7 +395,7 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
 class EsimProfileRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_active_profile_creates_line_and_schedules_auto_start(self):
         card = SimpleNamespace(
-            iccid="89441000400130120985", imsi="234100000000001",
+            iccid="89000000000000000067", imsi="234100000000001",
             mcc="234", mnc="10", pin_enabled=False, pin_tries=3,
             smsc="+447785016005",
         )

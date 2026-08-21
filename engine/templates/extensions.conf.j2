@@ -20,7 +20,7 @@ exten => {{ any_extension }},1,NoOp(Incoming call from ${CALLERID(num)})
 same => n,Set(CALLPEER=${CALLERID(num)})
 same => n,Progress()
 same => n,Set(FILE(/logs/calls.txt,,,a)=IN call from ${CALLERID(num)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
-same => n,TrySystem(/usr/local/bin/notify.py call_in ${CALLERID(num)} &)
+same => n,TrySystem(/usr/local/bin/notify.py call_in "${CALLERID(num)}" &)
 same => n,WaitForPrecondition(10,2000)
 same => n,Ringing()
 {% if dialstr %}
@@ -48,10 +48,16 @@ same => n,Return()
 exten => {{ any_extension }},1,NoOp(Incoming SMS from ${MESSAGE(from)})
 same => n,Set(NL=${BASE64_DECODE(Cg==)})
 same => n,Set(FILE(/logs/messages.txt,,,a)=IN SMS from ${MESSAGE(from)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)}:${NL}${MESSAGE(body)}${NL}=====${NL})
-; The trailing three arguments carry the concatenated-SMS segment triplet (ref/total/seq)
-; that res_pjsip_messaging exposes for a multi-part text (see patches/asterisk/mt_concat_udh.py).
+; Arguments 3-5 carry the concatenated-SMS segment triplet (ref/total/seq) that
+; res_pjsip_messaging exposes for a multi-part text (see patches/asterisk/mt_concat_udh.py).
 ; They are EMPTY for an ordinary single-part SMS; the manager reassembles the parts.
-same => n,TrySystem(/usr/local/bin/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" "${MESSAGE_DATA(SMS_CONCAT_REF)}" "${MESSAGE_DATA(SMS_CONCAT_TOTAL)}" "${MESSAGE_DATA(SMS_CONCAT_SEQ)}" &)
+; Arguments 6-9 carry the PDU's own header: TP-PID, TP-DCS, the UDH IE area and the raw PDU.
+; They say whether this is a text at all — an 8-bit or SIM-addressed payload decodes to a
+; mojibake-looking string that must NOT reach the conversation view (control/app/sms_pdu.py).
+; Every one of them is a plain integer or lowercase hex, so nothing here can be shell-injected
+; from the network; an empty value keeps its argument position so the manager stays compatible
+; with an engine image built before the fields existed.
+same => n,TrySystem(/usr/local/bin/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" "${MESSAGE_DATA(SMS_CONCAT_REF)}" "${MESSAGE_DATA(SMS_CONCAT_TOTAL)}" "${MESSAGE_DATA(SMS_CONCAT_SEQ)}" "${MESSAGE_DATA(SMS_TP_PID)}" "${MESSAGE_DATA(SMS_TP_DCS)}" "${MESSAGE_DATA(SMS_UDH_HEX)}" "${MESSAGE_DATA(SMS_TPDU_HEX)}" &)
 {% for t in msg_targets %}
 same => n,MessageSend(pjsip:{{ t }},${MESSAGE(from)},sip:{{ t }})
 {% endfor %}
@@ -61,11 +67,17 @@ same => n,Hangup()
 ; Single dial attempt (no auto-redial). The dial result (incl. far-end reject) is
 ; reported to the manager for the call log.
 [from-local]
-; _[+0-9]. (not _.) so the special h/i/t extensions never match here and log phantom calls
-exten => _[+0-9].,1,NoOp(Outgoing call to ${EXTEN} from ${CALLERID(num)})
+; _[+0-9*#]. (not _.) so the special h/i/t extensions never match here and log phantom calls.
+; '*' and '#' are in the class so supplementary-service and USSD codes (*21*<number>#, *#21#,
+; #225#) reach the carrier's IMS, which is what decides their meaning. h/i/t are pure letters
+; and still cannot match.
+exten => _[+0-9*#].,1,NoOp(Outgoing call to ${EXTEN} from ${CALLERID(num)})
 same => n,Set(CALLPEER=${EXTEN})
 same => n,Set(FILE(/logs/calls.txt,,,a)=OUT call to ${EXTEN} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
-same => n,TrySystem(/usr/local/bin/notify.py call_out ${EXTEN} &)
+; Quote ${EXTEN}: TrySystem runs this through a shell, where '#' starting a word begins a
+; comment. An unquoted #225# swallowed the argument and every following one, so the call
+; record was never created — while *#21# survived only because its '#' is mid-word.
+same => n,TrySystem(/usr/local/bin/notify.py call_out "${EXTEN}" &)
 ; Ring timeout {{ ring_timeout }}s (configurable): if the callee never answers, Asterisk
 ; CANCELs the outbound INVITE at this deadline instead of leaving it open. The carrier keeps
 ; the early dialog alive and RE-ALERTS the callee (repeated 180 Ringing) for as long as our
@@ -76,7 +88,14 @@ same => n,TrySystem(/usr/local/bin/notify.py call_out ${EXTEN} &)
 ; A 3GPP UE must select one of its registered public identities when originating
 ; a session. O2 UK otherwise accepts the INVITE at the P-CSCF (100 Trying) but
 ; has the TAS terminate it immediately with 487 Request Terminated.
-same => n,Dial(PJSIP/${EXTEN}@volte_ims,{{ ring_timeout }},b(ims-outbound-headers^s^1))
+; '#' must be percent-escaped again on the way out: PJSIP decoded it out of the inbound
+; request URI, and an unescaped '#' would truncate the outbound URI's user part. A plain
+; number contains no '#', so this is a no-op for ordinary calls. Log/notify keep raw ${EXTEN}.
+; Inheritable (leading _): the carrier leg needs to say WHICH code it is answering, and
+; a channel created by Dial() gets its own variable space otherwise.
+same => n,Set(_USSDPEER=${EXTEN})
+same => n,Set(DIALTARGET=${STRREPLACE(EXTEN,#,%23)})
+same => n,Dial(PJSIP/${DIALTARGET}@volte_ims,{{ ring_timeout }},b(ims-outbound-headers^s^1))
 ; Dial only returns here when the call was NEVER answered (reject/busy/no-answer/congestion);
 ; answered calls are bridged and tear down via BYE, never reaching this line.
 ; Save the REAL disposition for the call log BEFORE overriding the response (PJSIPHangup does
@@ -103,7 +122,20 @@ same => n,Return()
 
 [ims-outbound-headers]
 exten => s,1,Set(PJSIP_HEADER(add,P-Preferred-Identity)=<tel:{{ msisdn }}>)
+; A carrier answers a service code in the body of an in-dialog request — T-Mobile puts it on
+; the BYE — so ussd_body_capture.py writes USSD_RESPONSE onto THIS leg, the one talking to the
+; carrier. The 'h' handler runs on the CALLER's leg and cannot read another channel's
+; variables, which is why reporting it from there only ever produced an empty field. Push a
+; hangup handler onto this leg instead, so the payload is reported from where it lands.
+same => n,Set(CHANNEL(hangup_handler_push)=ussd-report,s,1)
 same => n,Return()
+
+[ussd-report]
+; Runs when the carrier leg is torn down, by which point the BYE that carried the payload has
+; already been processed. Ordinary calls reach here with USSD_RESPONSE empty and do nothing.
+exten => s,1,GotoIf($["${USSD_RESPONSE}" = ""]?done)
+same => n,TrySystem(/usr/local/bin/notify.py ussd "${USSDPEER}" "${BASE64_ENCODE(${USSD_RESPONSE})}" &)
+same => n(done),Return()
 
 ; ===== Outgoing SMS from a local endpoint =====
 [msg-from-local]

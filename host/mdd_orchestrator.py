@@ -468,6 +468,10 @@ class Orchestrator:
         self.exit_node_history = self.root / "exit-node-history.jsonl"
         self.reselect_path = self.root / "exit-reselect.json"
         self.reselect_handled_path = self.root / "exit-reselect-handled.json"
+        # Reports that a country's exit is carrying connections the control plane has proven
+        # dead. Separate from a reselect: the node is not being blamed, its sessions are.
+        self.stalled_path = self.root / "exit-stalled.json"
+        self.stalled_handled_path = self.root / "exit-stalled-handled.json"
         self.last_exit_node: dict[str, str] = {
             str(country): str(state.get("node") or "")
             for country, state in prior_exits.items()
@@ -484,6 +488,17 @@ class Orchestrator:
             for country, requested_at in handled.items():
                 try:
                     self.handled_reselect[str(country)] = float(requested_at)
+                except (TypeError, ValueError):
+                    pass
+        # Same watermark discipline for stalled-connection reports: the file is written by the
+        # control plane and kept for diagnostics, so a restart must not re-close sessions for a
+        # failure that was already dealt with.
+        stalled = (read_json(self.stalled_handled_path).get("countries") or {})
+        self.handled_stalled: dict[str, float] = {}
+        if isinstance(stalled, dict):
+            for country, requested_at in stalled.items():
+                try:
+                    self.handled_stalled[str(country)] = float(requested_at)
                 except (TypeError, ValueError):
                     pass
         # country -> retry state for the current request. Ranking is synchronous and each
@@ -1989,6 +2004,84 @@ class Orchestrator:
             print(f"exit reselect: cannot select {tag} for {country}: {exc}", flush=True)
             return False
 
+    def drop_exit_connections(self, country: str) -> int:
+        """Close the connections currently pinned to a country's exit. Returns how many.
+
+        sing-box keys a UDP session on its 5-tuple and retires it on an IDLE timeout. A line
+        rebuilding its tunnel retransmits IKE every few seconds, and every retransmit refreshes
+        that timer — so a session whose outbound died (a dial that lost the race with the
+        network coming back up, say) is held open by the very retries meant to recover it.
+        Each later packet is handed to the same dead connection, no NEW session is ever
+        created, and the failure becomes permanent while sing-box logs nothing at all.
+
+        Closing the session is the whole remedy: the next packet has to route and dial afresh.
+        This changes no node and touches no selector — the exit the operator chose stays
+        exactly where it is.
+        """
+        try:
+            with urllib.request.urlopen(f"http://{CLASH_API}/connections", timeout=3) as response:
+                payload = json.load(response) or {}
+        except Exception as exc:
+            print(f"exit cleanup: cannot list {country.upper()} connections: {exc}", flush=True)
+            return 0
+        prefix = f"exit-{country}"
+        dropped = 0
+        for conn in (payload.get("connections") or []):
+            # Match the country's selector and its members ("exit-gb", "exit-gb-0"), never
+            # another country whose tag merely starts the same way.
+            chains = [str(item) for item in (conn.get("chains") or [])]
+            if not any(tag == prefix or tag.startswith(prefix + "-") for tag in chains):
+                continue
+            identifier = str(conn.get("id") or "")
+            if not identifier:
+                continue
+            request = urllib.request.Request(
+                f"http://{CLASH_API}/connections/{urllib.parse.quote(identifier, safe='')}",
+                method="DELETE")
+            try:
+                with urllib.request.urlopen(request, timeout=3):
+                    dropped += 1
+            except Exception:
+                # Already gone, or the API blinked: the next report retries.
+                pass
+        return dropped
+
+    def process_stalled_reports(self, exits_state: dict):
+        """Clear a country exit's sessions once the control plane proves they carry nothing.
+
+        The control plane reports this only after attributing a line's failure to the exit AND
+        finding no sibling line registered over it, so nothing that works is torn down. It is
+        deliberately the weaker sibling of a reselect: a reselect says "this node is bad, move";
+        this says "the node may be fine, but the sessions on it are dead".
+        """
+        report = read_json(self.stalled_path) or {}
+        countries = report.get("countries") or {}
+        handled_changed = False
+        for country, entry in countries.items():
+            country = str(country)
+            requested_at = float((entry or {}).get("ts") or 0)
+            if requested_at <= self.handled_stalled.get(country, 0):
+                continue
+            # Stale evidence is no evidence: a report only describes the moment it was made.
+            if time.time() - requested_at > EXIT_RESELECT_MAX_AGE:
+                self.handled_stalled[country] = requested_at
+                handled_changed = True
+                continue
+            state = exits_state.get(country) or {}
+            if not state.get("ready") or state.get("mode") != "subscription":
+                continue
+            self.handled_stalled[country] = requested_at
+            handled_changed = True
+            dropped = self.drop_exit_connections(country)
+            if dropped:
+                print(f"exit cleanup: closed {dropped} stalled {country.upper()} connection(s) "
+                      f"on {state.get('node') or 'the current node'} "
+                      f"(line {entry.get('line') or '?'}: {entry.get('reason') or 'exit blamed'})",
+                      flush=True)
+        if handled_changed:
+            atomic_json(self.stalled_handled_path,
+                        {"version": 1, "countries": self.handled_stalled})
+
     def rank_and_select(self, country: str, state: dict, avoid: str = "", prefer: str = "") -> str:
         """Measure the candidates and move the selector to the best usable one.
 
@@ -2321,6 +2414,9 @@ class Orchestrator:
             # Ranking must come first: update_selected_nodes then reports the node this cycle
             # actually settled on, so proxy-status.json never shows the pre-selection default.
             self.process_reselect_requests(exits_state)
+            # After the reselect pass: a country that just moved node has fresh sessions, and
+            # nothing stale left worth closing.
+            self.process_stalled_reports(exits_state)
             self.update_selected_nodes(exits_state)
             for line in desired.get("lines") or []:
                 iid, country, host = str(line.get("id")), str(line.get("country") or "").lower(), str(line.get("epdg") or "")

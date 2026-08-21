@@ -395,9 +395,11 @@ def open_usim(reader_spec):
     if not rlist:
         return None
     # Highest priority: the stable USB-port binding. Open that physical reader directly so we
-    # don't probe/burn PIN tries on the wrong card when indices flipped.
+    # don't probe/burn PIN tries on the wrong card when indices flipped. Applied whatever the
+    # reader count is, exactly as pin_keeper does: a host with one reader is the case where a
+    # stale index hurts most, because there is no second slot for the fallbacks to land on.
     port = os.environ.get("USIM_READER_PORT", "").strip()
-    if port and len(rlist) > 1:
+    if port:
         pidx = index_for_port(port)
         if pidx is not None and pidx < len(rlist):
             try:
@@ -418,8 +420,14 @@ def open_usim(reader_spec):
                     return conn
                 except Exception:
                     return None
-    if isinstance(reader_spec, str) and reader_spec.startswith("imsi:") and len(rlist) > 1:
+    if isinstance(reader_spec, str) and reader_spec.startswith("imsi:"):
         target = reader_spec[5:]
+        if len(rlist) == 1:
+            # One reader holds the only card there is; IMSI cannot be read before the PIN is
+            # verified anyway, so scanning for it would just burn PIN tries on that same card.
+            conn = rlist[0].createConnection()
+            conn.connect()
+            return conn
         for r in rlist:
             try:
                 conn = r.createConnection()
@@ -442,6 +450,12 @@ def open_usim(reader_spec):
         idx = int(reader_spec)
     except (TypeError, ValueError):
         return None
+    if idx >= len(rlist) and len(rlist) == 1:
+        # An index past the end names no slot. On a host with a single reader there is still
+        # exactly one card this line can mean, and refusing it reports the SIM as NO_CARD while
+        # it sits readable in the only reader present (issue #8: a stored ami_reader of 2 on a
+        # one-reader host). With several readers the index is genuinely ambiguous -- refuse.
+        idx = 0
     if idx < 0 or idx >= len(rlist):
         return None
     conn = rlist[idx].createConnection()

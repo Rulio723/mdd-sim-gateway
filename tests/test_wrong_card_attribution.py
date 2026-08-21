@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 from control.app import failover, main
 
 
-OURS = "8901260444723809824"
-THEIRS = "8944303773524072104"
+OURS = "8900000000000000022"
+THEIRS = "8900000000000000031"
 BOUND = "VoWiFi Modem 2c7c-0125-4-1 00 00"
 OTHER = "VoWiFi Modem 2c7c-0125-1-1 00 00"
 

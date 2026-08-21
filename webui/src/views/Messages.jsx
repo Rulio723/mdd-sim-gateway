@@ -18,6 +18,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   const [sending, setSending] = useState(false)
   const [selMode, setSelMode] = useState(false)      // multi-select messages to delete
   const [selIds, setSelIds] = useState(() => new Set())
+  const [binary, setBinary] = useState([])           // filed non-text payloads (see BinaryPayloads)
   const activeId = useRef(id)
   const activePeer = useRef(peer)
   const threadsRequest = useRef(0)
@@ -47,6 +48,17 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     }
   }, [id])
 
+  // Filed payloads never arrive through the SMS websocket event (they are deliberately not
+  // broadcast), so they are fetched alongside the threads rather than pushed. A backend that
+  // predates the endpoint simply yields an empty list and the panel stays hidden.
+  const loadBinary = useCallback(async () => {
+    if (!id) return
+    try {
+      const r = await api.binarySms(id)
+      if (activeId.current === id) setBinary(r.payloads || [])
+    } catch { if (activeId.current === id) setBinary([]) }
+  }, [id])
+
   const loadMsgs = useCallback(async (p, showLoading = false) => {
     if (!id || !p) return
     const request = ++messagesRequest.current
@@ -67,9 +79,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   useEffect(() => {
     ++threadsRequest.current; ++messagesRequest.current
     setThreads([]); setPeer(null); setMsgs([]); setText(''); setNewTo(''); setTransport('auto')
+    setBinary([])
     setThreadsLoading(Boolean(id)); setMessagesLoading(false)
-    if (id) loadThreads(true)
-  }, [id, loadThreads])
+    if (id) { loadThreads(true); loadBinary() }
+  }, [id, loadThreads, loadBinary])
   useEffect(() => {
     if (!cellularAvailable && transport === 'cellular') setTransport('auto')
   }, [cellularAvailable, transport])
@@ -87,9 +100,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   useEffect(() => subscribe((msg) => {
     if (msg.type === 'sms' && msg.instance === id) {
       loadThreads()
+      loadBinary()
       if (peer) loadMsgs(peer)
     }
-  }), [subscribe, id, peer, loadThreads, loadMsgs])
+  }), [subscribe, id, peer, loadThreads, loadMsgs, loadBinary])
 
   const send = async () => {
     // React state is updated asynchronously, so `sending` alone leaves a short window where
@@ -203,6 +217,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         ))}
         {threadsLoading && <div aria-live="polite" style={{ color: 'var(--text-mute)', fontSize: 13, padding: 8 }}>{tr('Loading conversations…')}</div>}
         {!threadsLoading && threads.length === 0 && <div style={{ color: 'var(--text-mute)', fontSize: 13, padding: 8 }}>{tr('No conversations yet.')}</div>}
+        <BinaryPayloads payloads={binary} tr={tr} />
       </div>
 
       <div className="card" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
@@ -311,6 +326,85 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         </div>
       </div>
       </div>
+    </div>
+  )
+}
+
+// Payloads that were filed instead of shown: binary SMS, SIM-addressed messages, silent
+// service pushes. Deliberately reachable rather than invisible — the classification reads the
+// PDU header, and a carrier that mislabels a real text's TP-DCS would otherwise hide it for
+// good with no way to notice. Collapsed by default so it costs nothing when there is nothing
+// to see, and never renders at all when the line has received none.
+const PAYLOAD_TAG_LABEL = {
+  '8bit': '8-bit binary data',
+  sim_class: 'Addressed to the SIM (class 2)',
+  sim_download: 'SIM data download',
+  unreported: 'Classified by content — this engine does not report the PDU header',
+}
+
+function BinaryPayloads({ payloads, tr }) {
+  const [open, setOpen] = useState(false)
+  const [shown, setShown] = useState(() => new Set())
+  if (!payloads.length) return null
+  const toggle = (id) => setShown((prev) => {
+    const next = new Set(prev)
+    next.has(id) ? next.delete(id) : next.add(id)
+    return next
+  })
+  return (
+    <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
+      <div onClick={() => setOpen(!open)} role="button" tabIndex={0}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(!open) } }}
+        style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-mute)', display: 'flex', alignItems: 'center', gap: 6, padding: '4px 6px', borderRadius: 8 }}>
+        <span style={{ fontSize: 10 }}>{open ? '▾' : '▸'}</span>
+        <span style={{ flex: 1 }}>{tr('Non-text payloads')}</span>
+        <span className="mono">{payloads.length}</span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 4 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-mute)', padding: '2px 6px 8px', lineHeight: 1.5 }}>
+            {tr('Messages addressed to the SIM or to an application rather than to you. They are kept out of your conversations but not discarded.')}
+          </div>
+          {payloads.map((p) => (
+            <div key={p.id} style={{ padding: '6px 6px 7px', borderRadius: 8, marginBottom: 2, background: 'var(--hover)' }}>
+              <div onClick={() => toggle(p.id)} style={{ cursor: 'pointer', display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{p.peer}</span>
+                <span style={{ fontSize: 10, color: 'var(--text-mute)', flex: 1 }}>
+                  {new Date(p.ts * 1000).toLocaleString()}
+                </span>
+                <span className="mono" style={{ fontSize: 10, color: 'var(--text-mute)' }}>
+                  {tr('{n} bytes', { n: Math.floor((p.body_hex || '').length / 2) })}
+                </span>
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-mute)', marginTop: 2 }}>
+                {(p.tags || []).map((tag) => tr(PAYLOAD_TAG_LABEL[tag] || tag)).join(' · ')}
+                {p.concat_total ? ` · ${tr('part {seq}/{total}', { seq: p.concat_seq, total: p.concat_total })}` : ''}
+              </div>
+              {shown.has(p.id) && (
+                <div style={{ marginTop: 6 }}>
+                  {/* The bytes as they arrived. An encrypted payload can only be identified from
+                      the PDU itself, so this is shown raw rather than decoded into anything. */}
+                  <div style={{ fontSize: 10, color: 'var(--text-mute)', marginBottom: 2 }}>{tr('Payload')}</div>
+                  <div className="mono" style={{ fontSize: 10, wordBreak: 'break-all', lineHeight: 1.5, color: 'var(--text-mute)' }}>
+                    {p.body_hex || '—'}
+                  </div>
+                  {p.udh_hex && (
+                    <>
+                      <div style={{ fontSize: 10, color: 'var(--text-mute)', margin: '5px 0 2px' }}>{tr('User data header')}</div>
+                      <div className="mono" style={{ fontSize: 10, wordBreak: 'break-all', color: 'var(--text-mute)' }}>{p.udh_hex}</div>
+                    </>
+                  )}
+                  <div style={{ fontSize: 10, color: 'var(--text-mute)', marginTop: 5 }}>
+                    {p.tp_dcs === null || p.tp_dcs === undefined
+                      ? tr('TP-DCS not reported')
+                      : `TP-DCS 0x${Number(p.tp_dcs).toString(16).padStart(2, '0')} · TP-PID 0x${Number(p.tp_pid || 0).toString(16).padStart(2, '0')}`}
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

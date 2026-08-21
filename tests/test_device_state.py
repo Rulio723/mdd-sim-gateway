@@ -1007,7 +1007,7 @@ class ReaderRecordMigrationTests(unittest.TestCase):
     def test_the_record_follows_the_reader_to_its_new_port(self):
         device_state.set_hardware("reader-old", {
             "device_type": "reader", "name": self.NAME,
-            "imei": "860349057116642", "stable_path": "1-1.5"})
+            "imei": "350000000000018", "stable_path": "1-1.5"})
         moved = device_state.migrate_reader_records(
             {"reader-new": {"name": self.NAME, "reader_port": "1-1.4.1"}})
 
@@ -1016,12 +1016,12 @@ class ReaderRecordMigrationTests(unittest.TestCase):
         self.assertEqual(set(records), {"reader-new"})
         # The IMEI is what the line presents to the carrier and is refreshed from here on
         # every start; losing it would silently change the device identity.
-        self.assertEqual(records["reader-new"]["imei"], "860349057116642")
+        self.assertEqual(records["reader-new"]["imei"], "350000000000018")
         self.assertEqual(records["reader-new"]["stable_path"], "1-1.4.1")
 
     def test_an_unplugged_reader_keeps_its_record(self):
         device_state.set_hardware("reader-old", {
-            "device_type": "reader", "name": self.NAME, "imei": "860349057116642"})
+            "device_type": "reader", "name": self.NAME, "imei": "350000000000018"})
         self.assertEqual(device_state.migrate_reader_records({}), [])
         self.assertIn("reader-old", device_state.hardware())
 

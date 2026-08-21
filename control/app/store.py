@@ -13,6 +13,8 @@ import sqlite3
 import threading
 import time
 
+from . import sms_pdu
+
 DATA_DIR = os.environ.get("MDD_DATA", os.path.join(os.getcwd(), "data"))
 DB_PATH = os.path.join(DATA_DIR, "mdd-sim-gateway.sqlite")
 PREVIOUS_DB_PATH = os.path.join(DATA_DIR, "vowifi.sqlite")
@@ -93,6 +95,28 @@ def init():
                     PRIMARY KEY(instance, peer, concat_ref, total, seq)
                 );
                 CREATE INDEX IF NOT EXISTS idx_sms_segments_age ON sms_segments(created_ts);
+                -- Inbound SMS that were never meant to be read: 8-bit binary payloads, SIM
+                -- data-download, silent service pushes. They are kept out of `messages` so
+                -- they cannot reach a conversation, a notification or an export, but kept
+                -- verbatim — an encrypted payload cannot be identified from a decode, only
+                -- from the PDU as it arrived. tpdu_hex is the whole PDU; body_hex is the
+                -- user data alone, recovered from Asterisk's byte-per-character widen.
+                CREATE TABLE IF NOT EXISTS binary_sms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    transport TEXT NOT NULL DEFAULT 'vowifi',
+                    tp_pid INTEGER,
+                    tp_dcs INTEGER,
+                    concat_ref INTEGER,
+                    concat_total INTEGER,
+                    concat_seq INTEGER,
+                    udh_hex TEXT NOT NULL DEFAULT '',
+                    tpdu_hex TEXT NOT NULL DEFAULT '',
+                    body_hex TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_binary_sms_ts ON binary_sms(instance, ts);
                 CREATE TABLE IF NOT EXISTS calls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     instance TEXT NOT NULL,
@@ -170,6 +194,12 @@ def init():
             except Exception:
                 pass
             try:
+                # A carrier's answer to a dialled service code arrives as signalling, not
+                # audio, so it belongs on the call it answered rather than in the message log.
+                c.execute("ALTER TABLE calls ADD COLUMN ussd_text TEXT DEFAULT ''")
+            except Exception:
+                pass
+            try:
                 c.execute("ALTER TABLE line_allowances "
                           "ADD COLUMN activated_at TEXT NOT NULL DEFAULT ''")
             except Exception:
@@ -219,6 +249,70 @@ def init():
                 c.execute("ALTER TABLE line_states ADD COLUMN detail TEXT NOT NULL DEFAULT ''")
             except Exception:
                 pass
+            _sweep_binary_messages(c)
+
+
+def _sweep_binary_messages(c) -> int:
+    """Move machine payloads already sitting in `messages` into binary_sms.
+
+    Runs on every startup rather than once behind a migration flag, for two reasons: it is
+    self-limiting (a row it moves is no longer in `messages`, so the next sweep finds nothing),
+    and an engine image older than the PDU-header patch keeps producing these, so a one-shot
+    migration would strand everything that arrives before that image is rebuilt.
+
+    Nothing is discarded — the payload is preserved as hex, recoverable byte for byte. Only
+    inbound rows are examined; an outgoing message was composed here and is text by definition.
+    """
+    moved = 0
+    rows = c.execute("SELECT id,instance,peer,body,ts,transport FROM messages "
+                     "WHERE direction='in'").fetchall()
+    for row in rows:
+        body = row["body"] or ""
+        if not sms_pdu.looks_binary(body):
+            continue
+        c.execute("INSERT INTO binary_sms(instance,peer,ts,transport,body_hex) "
+                  "VALUES(?,?,?,?,?)",
+                  (str(row["instance"]), row["peer"], int(row["ts"]),
+                   row["transport"] or "vowifi", sms_pdu.body_to_hex(body)))
+        c.execute("DELETE FROM messages WHERE id=?", (row["id"],))
+        moved += 1
+    return moved
+
+
+def add_binary_sms(instance: str, peer: str, ts: int | None = None, *,
+                   transport: str = "vowifi", tp_pid: int | None = None,
+                   tp_dcs: int | None = None, concat: tuple[int, int, int] | None = None,
+                   udh_hex: str = "", tpdu_hex: str = "", body_hex: str = "") -> dict:
+    """File one non-text payload. Deliberately NOT a `messages` row: it must not reach a
+    conversation, a push notification or an export."""
+    ts = int(ts or time.time())
+    ref, total, seq = concat or (None, None, None)
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT INTO binary_sms(instance,peer,ts,transport,tp_pid,tp_dcs,"
+            "concat_ref,concat_total,concat_seq,udh_hex,tpdu_hex,body_hex) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(instance), peer, ts, transport, tp_pid, tp_dcs, ref, total, seq,
+             udh_hex, tpdu_hex, body_hex))
+        rid = cur.lastrowid
+    return {"id": rid, "instance": str(instance), "peer": peer, "ts": ts,
+            "transport": transport, "tp_pid": tp_pid, "tp_dcs": tp_dcs,
+            "concat_ref": ref, "concat_total": total, "concat_seq": seq,
+            "udh_hex": udh_hex, "tpdu_hex": tpdu_hex, "body_hex": body_hex}
+
+
+def list_binary_sms(instance: str | None = None, limit: int = 200) -> list[dict]:
+    """Filed payloads, newest first."""
+    limit = max(1, min(int(limit), 1000))
+    with _lock, _conn() as c:
+        if instance is None:
+            rows = c.execute("SELECT * FROM binary_sms ORDER BY ts DESC, id DESC LIMIT ?",
+                             (limit,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM binary_sms WHERE instance=? "
+                             "ORDER BY ts DESC, id DESC LIMIT ?",
+                             (str(instance), limit)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def migrate_legacy_history(instance_aliases: dict[str, str]) -> dict:
@@ -845,6 +939,31 @@ def update_call(cid: int, status: str, ended: bool = False):
                       (status, int(time.time()), cid))
         else:
             c.execute("UPDATE calls SET status=? WHERE id=?", (status, cid))
+
+
+def set_call_ussd(call_id: int, text: str) -> None:
+    """Attach a carrier's USSD reply to an existing call record."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE calls SET ussd_text=? WHERE id=?", (str(text or ""), int(call_id)))
+
+
+def set_ussd_for_peer(instance: str, peer: str, text: str) -> dict | None:
+    """Attach a USSD reply to the most recent outgoing call to this peer.
+
+    The reply is reported by a hangup handler on the carrier's leg, which races the 'h'
+    handler on the caller's leg that finalizes the record — so the record may be either still
+    open or already closed when this lands. Matching the most recent call to that peer covers
+    both, and a service code is not something a user dials twice in the same second.
+    """
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT id FROM calls WHERE instance=? AND direction='out' AND peer=? "
+            "ORDER BY start_ts DESC LIMIT 1", (str(instance), str(peer))).fetchone()
+        if not row:
+            return None
+        c.execute("UPDATE calls SET ussd_text=? WHERE id=?", (str(text or ""), row["id"]))
+        r = c.execute("SELECT * FROM calls WHERE id=?", (row["id"],)).fetchone()
+        return dict(r) if r else None
 
 
 def update_last_call(instance: str, direction: str, peer: str | None, status: str) -> dict | None:

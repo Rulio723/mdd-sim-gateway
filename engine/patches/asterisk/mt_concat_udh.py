@@ -24,6 +24,13 @@ import sys
 #
 # The vars are set ONLY for a well-formed segment of a real multi-part message, so an ordinary
 # single-part SMS leaves them empty and takes exactly the previous code path.
+#
+# PATCH_SMS_PDU_META: expose the PDU header fields too — TP-PID, TP-DCS, the UDH IE area and
+# the raw PDU. Stock parse_tpdu() drops all of them, which makes a binary SMS (8-bit user data,
+# or message class 2 addressed to the SIM) indistinguishable from a text: unpacksms() widens
+# each payload byte to one character and the manager stores the result as a message body. Line 1
+# collected 16 such payloads from short-codes 2942/2939, displayed to the user as mojibake. With
+# these vars the manager can file a machine payload away instead (control/app/sms_pdu.py).
 
 FIXED_FN = r'''static void parse_tpdu(struct ast_msg *msg, unsigned char *tpdu, int tpdu_len)
 {
@@ -45,10 +52,36 @@ FIXED_FN = r'''static void parse_tpdu(struct ast_msg *msg, unsigned char *tpdu, 
 	p += unpackaddress(oa, tpdu + p, sizeof(oa));
 	if (p + 9 > tpdu_len)
 		return;
-	/*int pid = tpdu[p++] */p++;
+	int pid = tpdu[p++];
 	int dcs = tpdu[p++];
 	struct timeval scts = unpackdate(tpdu + p);
 	p += 7;
+
+	/* PATCH_SMS_PDU_META: expose the header fields that say what KIND of message this is.
+	 * TP-DCS distinguishes text from binary user data and carries the message class (3GPP
+	 * TS 23.038 4); TP-PID marks a payload addressed to the SIM rather than the user
+	 * (TS 23.040 9.2.3.9). Neither survives the decode below — the 8-bit path in unpacksms()
+	 * widens each payload byte to one character, so a binary SMS reaches the manager looking
+	 * exactly like a text that happens to be mojibake, and lands in the conversation view.
+	 * SMS_TPDU_HEX carries the whole PDU verbatim so a payload we cannot classify yet can
+	 * still be examined later as it was on the wire, not through a lossy decode. */
+	char pdu_num[16];
+	snprintf(pdu_num, sizeof(pdu_num), "%d", pid);
+	ast_msg_set_var(msg, "SMS_TP_PID", pdu_num);
+	snprintf(pdu_num, sizeof(pdu_num), "%d", dcs);
+	ast_msg_set_var(msg, "SMS_TP_DCS", pdu_num);
+	{
+		/* An SMS-DELIVER tops out around 164 octets (header + 140 of user data); the cap is
+		 * applied anyway so a bogus tpdu_len can never walk past the buffer. */
+		char pdu_hex[2 * 200 + 1];
+		int hn = tpdu_len > 200 ? 200 : (tpdu_len < 0 ? 0 : tpdu_len);
+		int hi;
+		for (hi = 0; hi < hn; hi++) {
+			snprintf(pdu_hex + hi * 2, 3, "%02x", tpdu[hi]);
+		}
+		pdu_hex[hn * 2] = '\0';
+		ast_msg_set_var(msg, "SMS_TPDU_HEX", pdu_hex);
+	}
 	unsigned short ud[300];
 	/* Zero-initialised: on a malformed header unpacksms() can report a udhl longer than the
 	 * bytes it actually copied, and the IE walk below would otherwise read uninitialised
@@ -71,6 +104,19 @@ FIXED_FN = r'''static void parse_tpdu(struct ast_msg *msg, unsigned char *tpdu, 
 		int k = 0;
 		if (udhl > (int) sizeof(udh)) {
 			udhl = (int) sizeof(udh);
+		}
+		{
+			/* PATCH_SMS_PDU_META: the IE area verbatim. Port addressing (IEI 0x04/0x05) is
+			 * what identifies WHICH service a binary payload belongs to — WAP push, SIM
+			 * data download, a vendor's own port — and the walk below only looks for
+			 * concatenation, so without this the routing information is lost. */
+			char udh_hex[2 * sizeof(udh) + 1];
+			int hi;
+			for (hi = 0; hi < udhl; hi++) {
+				snprintf(udh_hex + hi * 2, 3, "%02x", udh[hi]);
+			}
+			udh_hex[udhl * 2] = '\0';
+			ast_msg_set_var(msg, "SMS_UDH_HEX", udh_hex);
 		}
 		while (k + 2 <= udhl) {
 			int iei = udh[k];
@@ -117,7 +163,9 @@ FIXED_FN = r'''static void parse_tpdu(struct ast_msg *msg, unsigned char *tpdu, 
 
 f = '/home/asterisk-build/asterisk/res/res_pjsip_messaging.c'
 s = open(f).read()
-if 'PATCH_CONCAT_UDH' in s:
+# Both markers: a tree carrying only the older concat-only patch still needs this run, and
+# the replacement below finds it by the same signature and swaps it wholesale.
+if 'PATCH_CONCAT_UDH' in s and 'PATCH_SMS_PDU_META' in s:
     print("already patched"); sys.exit(0)
 
 start = s.find('static void parse_tpdu(struct ast_msg *msg, unsigned char *tpdu, int tpdu_len)')
