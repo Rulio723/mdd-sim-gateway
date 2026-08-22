@@ -4,6 +4,23 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-22
+
+### Fixed
+
+- Dialling a carrier service code announced the wrong outcome while its answer was still on
+  its way. A code's verdict and its reply text reach the browser separately, and the screen
+  drew a conclusion from whichever arrived first — reporting that no reply was coming, or
+  that the code returns no text, a second before the text appeared. It now says it is waiting
+  until there is something to report, and distinguishes a code the carrier accepted (a reply
+  may follow) from one it refused (nothing more is coming).
+
+- The same screen could flip back and forth between outcomes. Every event refreshed the call
+  list, and those concurrent requests could return out of order, letting a stale response
+  overwrite a newer one — the result alternated between "waiting" and the answer. Refreshes
+  are now ordered so only the newest may take effect, and a verdict, once shown, is no longer
+  withdrawn.
+
 ## [1.4.0] - 2026-08-22
 
 ### Added

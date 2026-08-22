@@ -22,6 +22,26 @@ const CALL_STATUS_LABEL = {
   'code rejected': 'Carrier refused', 'code failed': 'Carrier could not handle it',
 }
 
+// A service code is answered and torn down immediately, so every call-shaped ending would
+// misdescribe it. JsSIP's cause carries the SIP response that decided the outcome, which is
+// the only place the carrier says whether it serves the code at all. A cause listed here is a
+// VERDICT — the carrier has spoken, so there is nothing left to wait for.
+const SERVICE_CODE_END_LABEL = {
+  'Not Found': 'The carrier does not recognise this code.',
+  'Address Incomplete': 'The carrier rejected this code as malformed.',
+  'Incompatible SDP': 'The carrier will not serve this code on this line.',
+  Rejected: 'The carrier refused this code.',
+  Unavailable: 'The carrier could not serve this code right now.',
+  Canceled: 'Cancelled before the carrier answered.',
+}
+
+// The service-code outcomes that are VERDICTS. 'dialing'/'ringing' are the call still being
+// in progress, not a conclusion — quoting one as the result printed "Dialing" on the screen
+// that reports how the call ended.
+const SETTLED_CODE_STATUS = new Set([
+  'code accepted', 'code unsupported', 'code rejected', 'code failed',
+])
+
 // SIP registration states reported by the JsSIP wrapper.
 const REG_LABEL = {
   idle: 'Idle', connecting: 'Connecting', registered: 'Registered',
@@ -106,7 +126,16 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const cellularReady = cellularAvailable && cellularDesired
     && ['on', 'connected', 'registered', 'active'].includes(cellularActual)
 
-  const loadCalls = useCallback(() => { if (id) api.calls(id).then((r) => setCalls(r.calls || [])).catch(() => {}) }, [id])
+  // Several websocket events land in the same instant when a service code ends (the reply
+  // and the outcome arrive separately), and each asks for a refresh. Those responses can
+  // return out of order: an older one landing last would put a stale list back on screen and
+  // the verdict would flip back to "waiting". Only the newest request may write.
+  const loadSeq = useRef(0)
+  const loadCalls = useCallback(() => {
+    if (!id) return
+    const seq = ++loadSeq.current
+    api.calls(id).then((r) => { if (seq === loadSeq.current) setCalls(r.calls || []) }).catch(() => {})
+  }, [id])
   useEffect(() => { loadCalls() }, [loadCalls])
   useEffect(() => { setCallSelMode(false); setCallSel(new Set()); setCallTransport('vowifi') }, [id])
   useEffect(() => {
@@ -120,11 +149,35 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   // Graft it onto the call still on screen so the user sees the reply where they asked.
   useEffect(() => subscribe && subscribe((m) => {
     if (m.type !== 'call' || m.instance !== id) return
-    if (m.call?.ussd_text) {
-      setCall((c) => (c && c.number === m.call.peer ? { ...c, ussdText: m.call.ussd_text } : c))
+    // The manager decides an outcome from the Q.850 cause, which is strictly better evidence
+    // than the SIP cause JsSIP hands us — and the history list already shows ITS verdict.
+    // Carry it onto the live call so the ended screen cannot contradict the row behind it.
+    if (m.call && (m.call.ussd_text || m.call.status)) {
+      setCall((c) => (c && c.number === m.call.peer
+        ? { ...c, ussdText: m.call.ussd_text || c.ussdText, backendStatus: m.call.status }
+        : c))
     }
     loadCalls()
   }), [subscribe, id, loadCalls])
+
+  // The manager's verdict for the call on screen. Prefer what the websocket pushed, but fall
+  // back to the history list — it is the same data fetched over the API, so this no longer
+  // depends on one message arriving at the right moment. The list is newest-first, so a code
+  // dialled repeatedly resolves to the current attempt.
+  const rawVerdict = call?.backendStatus
+    || (call?.number ? calls.find((c) => c.peer === call.number && c.direction === 'out')?.status : null)
+  const seenVerdict = SETTLED_CODE_STATUS.has(rawVerdict) ? rawVerdict : null
+  // A verdict is the carrier's final word. Once it has been shown, no later refresh may take
+  // it away again — otherwise the screen alternates between an answer and "waiting for one".
+  const [stickyVerdict, setStickyVerdict] = useState(null)
+  // Clear only when a NEW call starts. Clearing on every state change discarded a verdict
+  // that had already arrived while the call was still up: the active -> ended transition wiped
+  // it, so the screen fell back to "waiting" for an instant and then jumped forward again.
+  useEffect(() => {
+    if (call?.state === 'calling' || call?.state === 'incoming') setStickyVerdict(null)
+  }, [call?.state])
+  useEffect(() => { if (seenVerdict) setStickyVerdict(seenVerdict) }, [seenVerdict])
+  const backendVerdict = stickyVerdict || seenVerdict
 
   const toast = (m) => (showToast ? showToast(m) : null)
   const toggleCallSel = (cid) => setCallSel((s) => { const n = new Set(s); n.has(cid) ? n.delete(cid) : n.add(cid); return n })
@@ -165,9 +218,53 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const clearCallSoon = (endCause) => {
     setCall((c) => c ? { ...c, state: 'ended', endCause } : null)
     setKeypad(false); setMuted(false); setRecording(false)
-    setTimeout(() => setCall(null), 2500)
     loadCalls()
   }
+  // How long the 'ended' screen stays up. A service code's answer is NOT carried by the call:
+  // it rides an in-dialog request, is parsed by the manager and arrives over the websocket
+  // after the call is already torn down. Clearing on the ordinary 2.5s would hide the very
+  // thing the user dialled for, so wait for the reply, then leave it up long enough to read.
+  const [ussdTimedOut, setUssdTimedOut] = useState(false)
+  const [dismissIn, setDismissIn] = useState(null)   // seconds left on the Back button
+  // A service code's answer arrives after the call is over, so the 'ended' screen has to
+  // outlive the call. Two questions decide what it does, and they are computed here as plain
+  // booleans on purpose: the timers below depend on THESE, not on the reply itself, so a
+  // verdict or a text landing a second later cannot restart a countdown already running.
+  // 'accepted' means the carrier took the request, so a reply may still be on its way — the
+  // verdict and the text arrive separately and the verdict usually wins. Any other verdict
+  // (refused, unsupported, could-not-handle) is the end of it; nothing more is coming.
+  const mayStillReply = !backendVerdict || backendVerdict === 'code accepted'
+  const awaitingReply = call?.state === 'ended' && Boolean(call.serviceCode)
+    && !call.ussdText && mayStillReply && !ussdTimedOut
+  const codeSettled = call?.state === 'ended' && Boolean(call.serviceCode) && !awaitingReply
+
+  useEffect(() => { setUssdTimedOut(false); setDismissIn(null) }, [call?.number, call?.state])
+  // Hold the screen while the carrier is still expected to speak, but stop short of claiming
+  // nothing is coming until the window has actually elapsed.
+  useEffect(() => {
+    if (!awaitingReply) return
+    // A verdict already in hand proves the path works, so a reply — if there is one — follows
+    // within about a second. With no verdict yet the manager itself may be slow, so allow far
+    // longer before concluding anything.
+    const t = setTimeout(() => setUssdTimedOut(true), backendVerdict ? 3000 : 10000)
+    return () => clearTimeout(t)
+  }, [awaitingReply, backendVerdict])
+  // An ordinary call has nothing to read, so it clears itself as before.
+  useEffect(() => {
+    if (call?.state !== 'ended' || call.serviceCode) return
+    const t = setTimeout(() => setCall(null), 2500)
+    return () => clearTimeout(t)
+  }, [call?.state, call?.serviceCode])
+  // A settled service code carries text the user has to READ. Vanishing on a timer can take
+  // the answer away mid-sentence, so count down visibly on a Back button they can also just
+  // press — the wait becomes theirs to end, not the UI's to impose.
+  useEffect(() => {
+    if (!codeSettled) return
+    setDismissIn(30)
+    const iv = setInterval(() => setDismissIn((n) => (n === null ? null : n - 1)), 1000)
+    return () => clearInterval(iv)
+  }, [codeSettled])
+  useEffect(() => { if (dismissIn === 0) setCall(null) }, [dismissIn])
 
   const connect = useCallback(() => {
     if (!prov || !prov.enabled || phone.current) return
@@ -368,17 +465,6 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
 
   const regColor = reg === 'registered' ? GREEN : reg === 'failed' || reg === 'disconnected' ? RED : '#eab308'
   const inCall = call && (call.state === 'active' || call.state === 'calling' || call.state === 'ringing' || call.state === 'incoming' || call.state === 'ended')
-  // A service code is answered and torn down immediately, so every call-shaped ending would
-  // misdescribe it. JsSIP's cause carries the SIP response that decided the outcome, which is
-  // the only place the carrier says whether it serves the code at all.
-  const SERVICE_CODE_END_LABEL = {
-    'Not Found': 'The carrier does not recognise this code.',
-    'Address Incomplete': 'The carrier rejected this code as malformed.',
-    'Incompatible SDP': 'The carrier will not serve this code on this line.',
-    Rejected: 'The carrier refused this code.',
-    Unavailable: 'The carrier could not serve this code right now.',
-    Canceled: 'Cancelled before the carrier answered.',
-  }
   const endLabel = (c, isCode) => (isCode
     ? t(SERVICE_CODE_END_LABEL[c] || 'The carrier gave no usable answer to this code.')
     : t(c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended'))
@@ -484,7 +570,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
               {call.transport === 'cellular' && <div style={{ fontSize: 12, color: '#f59e0b', marginTop: 5 }}>{t('Cellular call connected · browser audio unavailable')}</div>}
               {recording && <div style={{ fontSize: 12, color: RED, marginTop: 2 }}>● Recording</div>}
             </div>
-            {call.transport !== 'cellular' && keypad && (
+            {call.transport !== 'cellular' && !call.serviceCode && keypad && (
               <div style={{ maxWidth: 220, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {/* Echo strip: shows every digit/symbol entered via click or physical keyboard */}
                 <div className="mono" style={{ minHeight: 40, padding: '8px 12px', borderRadius: 8,
@@ -501,7 +587,10 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                 </div>
               </div>
             )}
-            {call.transport !== 'cellular' && <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 8 }}>
+            {/* Mute, keypad and record all act on audio, and a service code has none: it is
+                signalling that the carrier answers and tears down in about a second. Offering
+                them implies an audio call that is not happening — only Hang up is real here. */}
+            {call.transport !== 'cellular' && !call.serviceCode && <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 8 }}>
               <RoundBtn icon={muted ? '🔇' : '🎙'} label={t(muted ? 'Unmute' : 'Mute')} color="#60a5fa" onClick={toggleMute} active={muted} />
               <RoundBtn icon="⌨" label={t('Keypad')} color="#a78bfa" onClick={() => setKeypad((v) => !v)} active={keypad} />
               <RoundBtn icon="⏺" label={t(recording ? 'Stop' : 'Record')} color={RED} onClick={toggleRecord} active={recording} />
@@ -523,7 +612,47 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                 fontSize: 14, lineHeight: 1.5, textAlign: 'left', whiteSpace: 'pre-wrap',
                 wordBreak: 'break-word', color: 'var(--text)' }}>{call.ussdText}</div>
             )}
-            <div style={{ fontSize: 14, color: call.endCause === 'Rejected' ? RED : 'var(--text-mute)' }}>{endLabel(call.endCause, call.serviceCode)}</div>
+            {(() => {
+              if (!call.serviceCode) {
+                return <div style={{ fontSize: 14, color: call.endCause === 'Rejected' ? RED : 'var(--text-mute)' }}>{endLabel(call.endCause, false)}</div>
+              }
+              // A service code's verdict comes from the manager, which reads the Q.850 cause.
+              // JsSIP's SIP cause is coarser — it reports a network failure (cause 38) as
+              // "Rejected" — so showing it while the real verdict is still in flight means
+              // announcing one outcome and then correcting it in front of the user. Wait
+              // instead: the answer is a second away, and a brief "waiting" beats a wrong
+              // answer that changes. The SIP cause is only consulted if nothing ever arrives.
+              if (call.ussdText) {
+                return <div style={{ fontSize: 14, color: GREEN }}>{t('Carrier replied')}</div>
+              }
+              if (CALL_STATUS_LABEL[backendVerdict]) {
+                const bad = backendVerdict !== 'code accepted'
+                // Accepted with nothing to show is the normal outcome for an ACTION code
+                // (#21# cancels call forwarding; *#21# would query it). Saying only
+                // "accepted" next to an empty screen reads as "nothing happened", which
+                // invites dialling again to check — say that silence is expected instead.
+                if (!bad) {
+                  // Only say a code returns nothing once the wait has actually elapsed;
+                  // saying it while the text is still in flight is the same mistake as
+                  // reporting "no reply" a second before one arrives.
+                  return <div style={{ fontSize: 14, color: GREEN }}>{t(ussdTimedOut
+                    ? 'Carrier accepted the code. This kind of code returns no text.'
+                    : 'Carrier accepted the code. Waiting for its reply…')}</div>
+                }
+                return <div style={{ fontSize: 14, color: RED }}>{t(CALL_STATUS_LABEL[backendVerdict])}</div>
+              }
+              if (!ussdTimedOut) {
+                return <div style={{ fontSize: 14, color: 'var(--text-mute)' }}>{t('Waiting for the carrier\u2019s reply\u2026')}</div>
+              }
+              return <div style={{ fontSize: 14, color: 'var(--text-mute)' }}>{endLabel(call.endCause, true)}</div>
+            })()}
+            {dismissIn !== null && (
+              <button onClick={() => setCall(null)} style={{ margin: '4px auto 0', padding: '9px 22px',
+                borderRadius: 10, cursor: 'pointer', background: 'var(--hover)', color: 'var(--text-soft)',
+                border: '1px solid var(--border-strong)', fontSize: 13.5, fontVariantNumeric: 'tabular-nums' }}>
+                {t('Back')} ({dismissIn}s)
+              </button>
+            )}
           </div>
         )}
 

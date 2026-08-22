@@ -5247,25 +5247,30 @@ async def api_engine_event(payload: dict):
         disp = _call_disposition(dialstatus, cause, direction, to)
         rec = store.update_last_call(iid, direction, to, disp)
         if not rec and to:
-            # exact peer didn't match an open record (e.g. 'h' lost the number to a
-            # masquerade and call_out stored a different form) — finalize the latest open
-            # call of this direction instead so it never stays stuck on dialing/ringing.
-            rec = store.update_last_call(iid, direction, None, disp)
-        if not rec:
             # The dialplan fires call_out and call_result from separate backgrounded
             # notify.py processes ('&'), so nothing orders them. On a call that lasts under a
             # second — a dialled service code answered on the BYE does exactly that — the
             # result can land BEFORE the record it is meant to close, and used to be dropped
             # silently, stranding the call on 'dialing' forever. call_out is already on its
-            # way, so wait briefly for it rather than discarding the outcome.
+            # way, so wait for it.
+            #
+            # Match the EXACT peer while waiting. Falling back to "the latest open call" in
+            # here would attach this verdict to a DIFFERENT call that merely happens to be
+            # open — dialling two codes in quick succession made a #225# record carry a
+            # *#21# outcome, because #225# was the only open record when *#21#'s result
+            # overtook its own call_out.
             for _ in range(15):
                 await asyncio.sleep(0.2)
-                rec = (store.update_last_call(iid, direction, to, disp)
-                       or (store.update_last_call(iid, direction, None, disp) if to else None))
+                rec = store.update_last_call(iid, direction, to, disp)
                 if rec:
                     log.info("call_result for %s arrived before its record; applied on retry",
-                             to or direction)
+                             to)
                     break
+        if not rec and to:
+            # Only now, with the ordering window spent: 'h' can lose the number to a
+            # masquerade, so finalize the latest open call of this direction rather than
+            # leaving it stuck on dialing forever.
+            rec = store.update_last_call(iid, direction, None, disp)
         if rec:
             await hub.broadcast({"type": "call", "instance": iid, "call": rec})
     elif event == "ussd" and args:

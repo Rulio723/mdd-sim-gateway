@@ -168,6 +168,11 @@ const zh = {
   'Service codes can only be dialled over VoWiFi, not the cellular modem.': '服务代码只能通过 VoWiFi 拨打，蜂窝模块不支持。',
   'Sending the code to the carrier…': '正在向运营商发送代码…',
   'Carrier accepted the code. Waiting for its reply…': '运营商已接受该代码，正在等待回复…',
+  'Waiting for the carrier’s reply…': '正在等待运营商回复…',
+  'Carrier replied': '运营商已回复',
+  'Carrier accepted the code. This kind of code returns no text.':
+    '运营商已接受该代码。此类代码不返回文本内容。',
+  Back: '返回',
   'The carrier does not recognise this code.': '运营商不识别此代码。',
   'The carrier rejected this code as malformed.': '运营商认为此代码格式无效。',
   'The carrier will not serve this code on this line.': '运营商不为此线路提供该代码的服务。',
