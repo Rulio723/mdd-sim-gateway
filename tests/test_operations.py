@@ -80,6 +80,23 @@ class OperationsTests(unittest.TestCase):
             self.assertNotIn("path", result)
             self.assertTrue(Path(temp, "backups", result["name"]).is_file())
 
+    def test_local_backup_can_be_deleted_by_its_listed_name(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
+            Path(temp, "config.yaml").write_text("settings: {}\ninstances: {}\n")
+            created = operations.create_local_backup("Test Gateway")
+            result = operations.delete_local_backup(created["name"])
+            self.assertTrue(result["ok"])
+            self.assertFalse(Path(temp, "backups", created["name"]).exists())
+
+    def test_local_backup_delete_rejects_paths_and_non_backups(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
+            outside = Path(temp, "keep.txt")
+            outside.write_text("keep")
+            for name in ("../keep.txt", "/tmp/keep.txt", "not-a-backup.txt"):
+                with self.assertRaises(ValueError):
+                    operations.delete_local_backup(name)
+            self.assertEqual(outside.read_text(), "keep")
+
     def test_support_bundle_contains_only_redacted_documents(self):
         settings_value = {
             "telegram": {"bot_token": "secret"},
@@ -101,6 +118,56 @@ class OperationsTests(unittest.TestCase):
             self.assertNotIn("secret", settings)
             self.assertNotIn("001122", log)
             self.assertEqual(status["imei"], "<redacted>")
+
+    def test_support_bundle_can_settle_a_service_code_verdict(self):
+        """A user reporting "the carrier does not support this code" must be checkable.
+
+        The verdict comes from the Q.850 cause on call_result, which lived only in
+        events.jsonl and was not collected at all — the bundle showed the conclusion and
+        never the evidence behind it.
+        """
+        events = "\n".join(json.dumps(r) for r in [
+            {"instance": "sim1", "event": "call_out", "args": ["*#21#"]},
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "*#21#", "CHANUNAVAIL", "79"]},
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(events + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                captured = archive.read("logs/sim1-call-events.jsonl").decode()
+
+        self.assertIn("*#21#", captured)     # which code was dialled
+        self.assertIn("79", captured)        # and what the carrier answered
+
+    def test_support_bundle_keeps_dialled_numbers_and_replies_out(self):
+        """The evidence must not smuggle in what redaction elsewhere is careful to remove.
+
+        A subscriber's number and a reply's text sit inside an `args` array, where the
+        key-name redaction rules never reach them.
+        """
+        events = "\n".join(json.dumps(r) for r in [
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "+8615001007220", "CANCEL", "127"]},
+            {"instance": "sim1", "event": "ussd", "args": ["#225#", "WW91ciBiYWxhbmNl"]},
+            {"instance": "sim1", "event": "sms_in", "args": ["6700", "cHJpdmF0ZQ=="]},
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(events + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                captured = archive.read("logs/sim1-call-events.jsonl").decode()
+
+        self.assertNotIn("8615001007220", captured)   # a dialled number
+        self.assertNotIn("WW91ciBiYWxhbmNl", captured)  # the reply's own text
+        self.assertNotIn("cHJpdmF0ZQ==", captured)      # an SMS body
+        self.assertIn("<number>", captured)
+        self.assertIn("#225#", captured)              # the code itself still diagnosable
+        self.assertNotIn("sms_in", captured)          # message events are not call evidence
 
     def test_support_bundle_carries_the_host_view_the_control_plane_cannot_observe(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):

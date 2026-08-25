@@ -72,6 +72,29 @@ class BrowserDiallerServiceCodeTests(unittest.TestCase):
         # The cellular path dials a voice call; a service code needs AT+CUSD instead.
         self.assertIn("if (isServiceCode(target)) {", self.view)
 
+    def test_a_locally_rejected_code_is_not_blamed_on_the_carrier(self):
+        # The dialplan records a call the moment its pattern matches, so an absent record
+        # means the code never matched — our own Asterisk answered 404, the request never
+        # reached the network. An engine image predating service-code support does exactly
+        # that, and reporting it as "the carrier does not recognise this code" sends the user
+        # to their operator over a stale image on their own machine.
+        self.assertIn("if (!rawVerdict) {", self.view)
+        self.assertIn("The gateway did not send this code.", self.view)
+        # It must be checked before the SIP-cause fallback, which is what used to answer here.
+        self.assertLess(self.view.index("if (!rawVerdict) {"),
+                        self.view.index("return <div style={{ fontSize: 14, color: 'var(--text-mute)' }}>{endLabel(call.endCause, true)}"))
+
+    def test_blocked_webrtc_is_reported_instead_of_timing_out(self):
+        # A privacy extension replaces RTCPeerConnection with a non-constructor rather than
+        # removing it, so JsSIP stalls inside connect() with no error: no SDP, no INVITE, and
+        # the call screen runs its full course before blaming the carrier for a request that
+        # never left the browser. Detect it up front and say so.
+        self.assertIn("const WEBRTC_AVAILABLE = typeof RTCPeerConnection === 'function'", self.view)
+        self.assertIn("callTransport === 'vowifi' && !WEBRTC_AVAILABLE", self.view)
+        # Refused before dialling, not after: the check must precede the JsSIP call.
+        self.assertLess(self.view.index("!WEBRTC_AVAILABLE"),
+                        self.view.index("phone.current.call(target)"))
+
     def test_sip_uri_escapes_hash_because_jssip_rejects_it(self):
         self.assertIn(r"const user = String(number).replace(/#/g, '%23')", self.phone)
         self.assertIn("this.ua.call(`sip:${user}@${domain}`", self.phone)

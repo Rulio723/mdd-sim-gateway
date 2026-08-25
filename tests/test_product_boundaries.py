@@ -42,6 +42,19 @@ class ProductBoundaryTests(unittest.TestCase):
                 "external": [{"username": "remote", "password": "secret"}]}})
             self.assertEqual(saved["sip"]["external"], [])
 
+    def test_retired_activation_event_is_removed_from_every_notification_channel(self):
+        temp, paths = self.temp_config()
+        with temp, paths:
+            config.save({
+                "settings": {key: {"events": {"activation_reminder": True}}
+                             for key in ("webhook", "telegram", "pushplus")},
+                "instances": {},
+            })
+            settings = config.load()["settings"]
+            for key in ("webhook", "telegram", "pushplus"):
+                self.assertNotIn("activation_reminder", settings[key]["events"])
+                self.assertTrue(settings[key]["events"]["software_update"])
+
     def test_only_first_five_legacy_lines_are_startable(self):
         temp, paths = self.temp_config()
         with temp, paths:

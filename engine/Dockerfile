@@ -9,7 +9,7 @@
 # Reproducibility: source inputs and the multi-architecture base manifest are pinned. Fedora
 # packages still resolve from the supported Fedora 44 repositories at build time, so every
 # release workflow performs a clean image build instead of claiming byte-for-byte reproducibility.
-FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898 AS build
 
 # pcsc-lite is pinned to a fixed upstream version and built from source (see below), so the
 # engine's PC/SC client library matches the host pcscd EXACTLY across any distro — this is the
@@ -17,6 +17,8 @@ FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8e
 # client/server protocol mismatch that distro-default pcsc-lite packages cause.
 ARG PCSC_VERSION=2.3.3
 ARG PCSC_SHA256=00b667aa71504ed1d39a48ad377de048c70dbe47229e8c48a3239ab62979c70f
+ARG PJPROJECT_REPOSITORY=https://github.com/MddIdd/pjproject-sysmocom-mirror.git
+ARG ASTERISK_REPOSITORY=https://github.com/MddIdd/asterisk-sysmocom-mirror.git
 
 WORKDIR /home/asterisk-build
 
@@ -33,7 +35,7 @@ RUN dnf -y --refresh --setopt=fastestmirror=True --setopt=max_parallel_downloads
     uriparser-devel libxslt-devel mysql-devel bluez-libs-devel radcli-devel freetds-devel \
     jack-audio-connection-kit-devel libcap-devel net-snmp-devel corosynclib-devel newt-devel \
     popt-devel libical-devel spandsp-devel openldap-devel codec2-devel fftw-devel libsndfile-devel \
-    unbound-devel wget subversion libresample-devel binutils-devel libsrtp-devel gsm-devel iproute \
+    unbound-devel wget curl subversion libresample-devel binutils-devel libsrtp-devel gsm-devel iproute \
     procps-ng net-tools python3-pysocks python3-requests python3-pyscard python3-jinja2 \
     python3-devel python3-pip \
     meson ninja-build perl-podlators systemd-devel \
@@ -82,8 +84,8 @@ RUN set -eu; \
         done; \
         return 1; \
     }; \
-    checkout_with_retry https://gitea.sysmocom.de/sysmocom/pjproject.git pjproject 20537ab1e6beb2baf9ec15599e0217a601cf7ce5 && \
-    checkout_with_retry https://gitea.sysmocom.de/sysmocom/asterisk.git asterisk d231cb2c658545773fcd5eb9de787219b9ef6566 && \
+    checkout_with_retry "$PJPROJECT_REPOSITORY" pjproject 20537ab1e6beb2baf9ec15599e0217a601cf7ce5 && \
+    checkout_with_retry "$ASTERISK_REPOSITORY" asterisk d231cb2c658545773fcd5eb9de787219b9ef6566 && \
     cd asterisk && \
     git config user.email "build@vowifi" && git config user.name "vowifi build" && \
     fetch_with_retry . f1b60dcd9568c4045512fd0d8b619b9fb91a7f35 2 && \
@@ -95,7 +97,7 @@ RUN set -eu; \
     make menuselect/menuselect menuselect-tree menuselect.makeopts && \
     ./menuselect/menuselect --enable codec_opus --disable BUILD_NATIVE && \
     make -j$(nproc) && \
-    make install
+    make install DOWNLOAD='curl --http1.1 -fL -O -C - --retry 5 --retry-all-errors --connect-timeout 15 --max-time 900 --speed-time 30 --speed-limit 1024'
 
 RUN python3 -m pip install --no-cache-dir panoramisk==1.4
 
@@ -105,6 +107,69 @@ RUN python3 -m pip install --no-cache-dir panoramisk==1.4
 # include a software Milenage implementation or accept Ki/OP/OPc.
 RUN python3 -m pip install --no-cache-dir pyserial==3.5 pycryptodome==3.23.0 cryptography==50.0.0 \
     "git+https://github.com/mitshell/card.git@790a8fb0b8fbc0b06f568feba51aeef28352145e"
+
+# Derive the Fedora runtime package closure from the binary we just built and every Asterisk
+# module we ship. This keeps all codecs and optional modules loadable without carrying compilers,
+# headers or source trees into the final image. Packages needed by the Python tunnel and its shell
+# supervisor are explicit because they are not visible to ldd.
+RUN set -eu; \
+    { \
+      printf '%s\n' \
+        bash coreutils grep hostname iproute net-tools procps-ng \
+        tcpdump bind-utils iputils ca-certificates \
+        python3 python3-jinja2 python3-pyscard python3-pysocks python3-requests; \
+      { printf '%s\n' /usr/sbin/asterisk; find /usr/lib/asterisk/modules -type f -name '*.so'; } | \
+        while IFS= read -r binary; do \
+          ldd "$binary" 2>/dev/null || true; \
+        done | \
+        sed -n \
+          -e 's/^[[:space:]]*[^[:space:]]* => \([^[:space:]]*\).*/\1/p' \
+          -e 's/^[[:space:]]*\(\/[^[:space:]]*\) (.*/\1/p' | \
+        sort -u | \
+        while IFS= read -r library; do \
+          if package=$(rpm -qf --qf '%{NAME}' "$library" 2>/dev/null); then \
+            printf '%s\n' "$package"; \
+          fi; \
+        done; \
+    } | sort -u > /runtime-packages.txt
+
+FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898 AS runtime
+
+COPY --from=build /runtime-packages.txt /tmp/runtime-packages.txt
+RUN dnf -y --refresh --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
+    --setopt=timeout=30 --setopt=minrate=50k --setopt=retries=3 upgrade && \
+    dnf -y --setopt=fastestmirror=True --setopt=max_parallel_downloads=20 \
+    --setopt=timeout=30 --setopt=minrate=50k --setopt=retries=3 \
+    --setopt=install_weak_deps=False install $(cat /tmp/runtime-packages.txt) && \
+    dnf clean all && rm -rf /var/cache/dnf /tmp/runtime-packages.txt
+
+# Asterisk and its bundled pjproject are built outside Fedora's RPM database. Copy only their
+# installed runtime trees. The pinned pcsc-lite client overwrites Fedora's client library so it
+# continues to match the host pcscd protocol exactly.
+COPY --from=build /usr/sbin/asterisk /usr/sbin/asterisk
+COPY --from=build /usr/lib/asterisk/ /usr/lib/asterisk/
+COPY --from=build /usr/lib/libasteriskpj.so /usr/lib/libasteriskpj.so
+COPY --from=build /usr/lib/libasteriskpj.so.2 /usr/lib/libasteriskpj.so.2
+COPY --from=build /usr/lib/libasteriskssl.so /usr/lib/libasteriskssl.so
+COPY --from=build /usr/lib/libasteriskssl.so.1 /usr/lib/libasteriskssl.so.1
+COPY --from=build /var/lib/asterisk/ /var/lib/asterisk/
+COPY --from=build /usr/lib64/libpcsclite.so /usr/lib64/libpcsclite.so
+COPY --from=build /usr/lib64/libpcsclite.so.1 /usr/lib64/libpcsclite.so.1
+COPY --from=build /usr/lib64/libpcsclite_real.so /usr/lib64/libpcsclite_real.so
+COPY --from=build /usr/lib64/libpcsclite_real.so.1 /usr/lib64/libpcsclite_real.so.1
+COPY --from=build /usr/local/ /usr/local/
+RUN mkdir -p /var/cache/asterisk /var/log/asterisk /var/spool/asterisk && ldconfig && \
+    missing=0; \
+    for binary in /usr/sbin/asterisk /usr/lib/asterisk/modules/*.so; do \
+      if ldd "$binary" 2>/dev/null | grep -q 'not found'; then \
+        echo "missing runtime dependency: $binary" >&2; \
+        ldd "$binary" >&2; \
+        missing=1; \
+      fi; \
+    done; \
+    [ "$missing" = 0 ] && \
+    python3 -c 'import Crypto, cryptography, jinja2, panoramisk, requests, serial, smartcard, socks, card' && \
+    asterisk -V
 
 # our scripts + templates
 COPY pin_keeper.py   /usr/local/bin/pin_keeper.py
@@ -122,8 +187,11 @@ RUN chmod +x /usr/local/bin/*.py /entrypoint.sh
 # rebuilding from source (see ensure_engine_image in install.sh).
 ARG RUNTIME_FP=""
 ARG BASE_FP=""
+ARG MDD_VERSION=""
 LABEL io.mdd-sim-gateway.managed="true" \
       io.mdd-sim-gateway.runtime-fp="${RUNTIME_FP}" \
       io.mdd-sim-gateway.base-fp="${BASE_FP}" \
+      org.opencontainers.image.version="${MDD_VERSION}" \
+      org.opencontainers.image.source="https://github.com/MddIdd/mdd-sim-gateway" \
       org.opencontainers.image.title="MDD Sim Gateway VoWiFi engine"
 ENTRYPOINT ["/entrypoint.sh"]

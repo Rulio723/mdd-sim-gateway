@@ -57,8 +57,8 @@ function readerBody(readerOrIndex, extra = {}) {
 
 export const api = {
   authStatus: () => j('GET', '/api/auth/status'),
-  authSetup: (username, password) => j('POST', '/api/auth/setup', { username, password }),
-  authLogin: (username, password) => j('POST', '/api/auth/login', { username, password }),
+  authSetup: (username, password, remember) => j('POST', '/api/auth/setup', { username, password, remember }),
+  authLogin: (username, password, remember) => j('POST', '/api/auth/login', { username, password, remember }),
   authLogout: () => j('POST', '/api/auth/logout', {}),
   authPassword: (current_password, new_password) => j('POST', '/api/auth/password', { current_password, new_password }),
   // Unified physical-device control plane. Older deployments may return 404;
@@ -97,6 +97,7 @@ export const api = {
   updateProgress: () => j('GET', '/api/system/update/progress'),
   cancelUpdate: () => j('POST', '/api/system/update/cancel', {}),
   createBackup: () => j('POST', '/api/system/backups', {}),
+  deleteBackup: (name) => j('DELETE', `/api/system/backups/${encodeURIComponent(name)}`),
   maintenance: (action) => j('POST', '/api/system/maintenance', { action }),
   restartProgress: () => j('GET', '/api/system/maintenance/restart-progress'),
   supportBundleUrl: '/api/diagnostics/support-bundle',
@@ -135,9 +136,21 @@ export const api = {
   resetAllowanceQueryRule: (id) => j('DELETE', `/api/instances/${id}/allowance/query-rule`),
   queryAllowance: (id, transport = 'auto') => j(
     'POST', `/api/instances/${id}/allowance/query`, { transport }),
+  // Number keeping. Config is stored server-side rather than in the line config, so saving it
+  // never restarts a running engine.
+  keepalive: (id) => j('GET', `/api/instances/${id}/keepalive`),
+  saveKeepalive: (id, body) => j('PUT', `/api/instances/${id}/keepalive`, body),
+  keepaliveSummary: () => j('GET', '/api/keepalive/summary'),
+  runKeepalive: (id) => j('POST', `/api/instances/${id}/keepalive/run`),
   // delete messages: { ids:[...] } | { peer } (whole conversation) | { all:true }
   deleteMessages: (id, sel) => j('POST', `/api/instances/${id}/messages/delete`, sel),
 
+  voicemails: (id) => j('GET', `/api/instances/${id}/voicemails`),
+  // Served as audio/wav by the control plane; the <audio> element fetches it directly
+  // and the session cookie rides along same-origin, so it never goes through j().
+  voicemailAudioUrl: (id, vid) => `/api/instances/${id}/voicemails/${vid}/audio`,
+  markVoicemailListened: (id, vid) => j('POST', `/api/instances/${id}/voicemails/${vid}/listened`),
+  deleteVoicemails: (id, sel) => j('POST', `/api/instances/${id}/voicemails/delete`, sel),
   calls: (id) => j('GET', `/api/instances/${id}/calls`),
   // delete call-log entries: { ids:[...] } | { all:true }
   deleteCalls: (id, sel) => j('POST', `/api/instances/${id}/calls/delete`, sel),

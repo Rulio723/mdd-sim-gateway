@@ -12,7 +12,8 @@ const STATE_LABEL = {
 // Short labels for the status machine's reason codes — the cause a down segment began with.
 // An unmapped code falls back to itself rather than hiding information.
 const REASON_LABEL = {
-  no_card: 'SIM status unavailable', pin_wrong: 'PIN incorrect', pin_blocked: 'PIN blocked (PUK required)',
+  no_card: 'SIM status unavailable', wrong_card: "Reader holds another line's SIM",
+  pin_wrong: 'PIN incorrect', pin_blocked: 'PIN blocked (PUK required)',
   pin_required: 'PIN required', epdg_unresolved: 'ePDG address unresolved',
   tunnel_network: 'Server ePDG did not answer IKE',
   tunnel_child_rekey_timeout: 'Server ePDG did not answer CHILD_SA rekey',

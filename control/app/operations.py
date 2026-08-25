@@ -126,6 +126,46 @@ def redact_jsonl(text: str) -> str:
     return "\n".join(lines)
 
 
+CALL_EVENTS = ("call_out", "call_result", "ussd")
+
+
+def call_event_evidence(text: str) -> str:
+    """Extract just enough of the engine's call events to check a service-code verdict.
+
+    The UI's verdict for a dialled service code ("the carrier does not support this code",
+    "the carrier refused it") is derived from the Q.850 cause on call_result, and that cause
+    is recorded ONLY here. Without it a user's report cannot be checked against what the
+    carrier actually said — the bundle showed the conclusion but never the evidence.
+
+    The whole file cannot be shipped: it also carries dialled subscriber numbers and message
+    bodies, and the key-name redaction rules do not reach them because they sit inside an
+    `args` array. So keep the diagnosis and drop the identity — a service code is a carrier's
+    own public number and is precisely what has to be diagnosable, whereas a number a user
+    dialled is not, and neither is the text of a reply.
+    """
+    out = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        event = str(record.get("event") or "")
+        if event not in CALL_EVENTS:
+            continue
+        args = [str(a) for a in (record.get("args") or [])]
+        # call_result is "<direction> <peer> <dialstatus> <cause>"; the others lead with peer.
+        peer_at = 1 if (event == "call_result" and args and args[0] in ("in", "out")) else 0
+        if peer_at < len(args) and not any(ch in args[peer_at] for ch in "*#"):
+            args[peer_at] = "<number>"
+        if event == "ussd" and len(args) > 1:
+            # That a reply arrived, and how big it was, answers the question. Its text can
+            # carry account details and answers nothing.
+            args[1] = f"<{len(args[1])} bytes>"
+        out.append(json.dumps({"instance": record.get("instance"), "event": event,
+                               "args": args}, ensure_ascii=False, sort_keys=True))
+    return "\n".join(out)
+
+
 def create_local_backup(system_name: str = "gateway") -> dict:
     """Create a root-local recovery archive. It is intentionally not returned over HTTP."""
     root = Path(cfg.DATA_DIR).resolve()
@@ -151,6 +191,19 @@ def list_local_backups() -> list[dict]:
         result.append({"name": path.name, "created_at": int(stat.st_mtime),
                        "size": stat.st_size, "location": "gateway-local"})
     return result[:50]
+
+
+def delete_local_backup(name: str) -> dict:
+    """Delete one named local backup without allowing paths outside the backup directory."""
+    name = str(name or "")
+    if (Path(name).name != name or not re.fullmatch(r"[A-Za-z0-9_.-]+\.tar\.gz", name)):
+        raise ValueError("invalid backup name")
+    root = (Path(cfg.DATA_DIR) / "backups").resolve()
+    target = root / name
+    if not target.is_file():
+        raise FileNotFoundError(name)
+    target.unlink()
+    return {"ok": True, "name": name}
 
 
 SERVICE_RESTART_SCOPES = ("control", "services", "host")
@@ -251,8 +304,22 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
         base = Path(cfg.DATA_DIR) / "instances"
         # Include the current logs, compact rebuild snapshots and retained IKE segments. Every
         # source goes through the same redaction and contributes only its configured tail.
+        # These globs are an allow-list on purpose. logs/voicemail/*.wav lives under the same
+        # directory and must NEVER be collected: a bundle is meant to be shareable, and a
+        # recording of a caller's voice cannot be redacted into something safe to share.
         paths = [*base.glob("*/run/*.log"), *base.glob("*/logs/diagnostics.jsonl"),
                  *base.glob("*/logs/ike/charon-*.log")]
+        # The engine's call events are the only record of the Q.850 cause behind a service
+        # code's verdict, so a bundle without them cannot answer "was it really unsupported?".
+        # They are filtered rather than redacted; see call_event_evidence.
+        for path in sorted(base.glob("*/logs/events.jsonl")):
+            try:
+                lines = path.read_text(errors="replace").splitlines()[-(log_lines * 4):]
+            except OSError:
+                continue
+            evidence = call_event_evidence("\n".join(lines))
+            if evidence:
+                archive.writestr(f"logs/{path.parent.parent.name}-call-events.jsonl", evidence)
         for path in sorted(paths):
             try:
                 lines = path.read_text(errors="replace").splitlines()[-log_lines:]

@@ -25,6 +25,18 @@ _AVAILABLE = {"ok": True, "update_available": True, "latest": "9.9.9",
               "release_url": "https://example.invalid/release"}
 
 
+class ReleaseWorkflowTests(unittest.TestCase):
+    def test_engine_archive_is_checksummed_and_published_with_the_release(self):
+        workflow = (Path(__file__).resolve().parent.parent /
+                    ".github/workflows/release.yml").read_text(encoding="utf-8")
+        asset = 'mdd-sim-gateway-engine-${GITHUB_REF_NAME}-arm64.tar.gz'
+        self.assertIn('docker save --output "$engine_archive"', workflow)
+        self.assertIn("name: engine-image", workflow)
+        # The asset feeds the handoff manifest and SHA256SUMS, then `gh release create`.
+        self.assertEqual(workflow.count(f'"{asset}"'), 3)
+        self.assertIn('> "$root/engine/release-image.SHA256SUMS"', workflow)
+
+
 class RequestApplyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -115,11 +127,25 @@ class RequestApplyTests(unittest.TestCase):
 
 
 class UpdaterTests(unittest.TestCase):
+    def test_docker_control_recreation_preserves_node_test_runtime(self):
+        installer = (Path(__file__).resolve().parent.parent / "install.sh").read_text(
+            encoding="utf-8")
+        start = installer.index("run_control() {")
+        end = installer.index("\n}\n", start)
+        run_control = installer[start:end]
+
+        self.assertIn(
+            "-v /usr/local/bin/sing-box:/usr/local/bin/sing-box:ro", run_control)
+        self.assertIn("-v /usr/local/bin/xray:/usr/local/bin/xray:ro", run_control)
+        self.assertIn('-v "${REPO_DIR}/host:/app/host:ro"', run_control)
+        self.assertIn("-e MDD_SINGBOX_BIN=/usr/local/bin/sing-box", run_control)
+        self.assertIn("-e MDD_XRAY_BIN=/usr/local/bin/xray", run_control)
+
     def test_reload_reuses_satisfied_python_requirements_offline(self):
         installer = (Path(__file__).resolve().parent.parent / "install.sh").read_text(
             encoding="utf-8")
-        offline = 'pip" install --quiet --no-index'
-        online = 'pip" install --quiet wheel -r'
+        offline = 'python" -m pip install --quiet --no-index'
+        online = 'python" -m pip install --quiet wheel'
         self.assertIn(offline, installer)
         self.assertIn(online, installer)
         self.assertLess(installer.index(offline), installer.index(online))
@@ -160,6 +186,17 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(published["artifact"], "release.tar.gz")
         self.assertEqual(published["total_bytes"], 1234)
         self.assertEqual(published["route_name"], "Primary")
+
+    def test_engine_asset_gets_a_bounded_large_file_timeout(self):
+        process = SimpleNamespace(returncode=0, poll=Mock(return_value=0),
+                                  communicate=Mock(return_value=("", "")))
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(mdd_update.subprocess, "Popen", return_value=process) as popen:
+            mdd_update.download(
+                "https://example.invalid/engine.tar.gz", Path(tmp, "engine.tar.gz"), {},
+                artifact="engine.tar.gz", phase="engine_image")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--max-time") + 1], "1800")
 
     def test_transfer_rate_follows_the_recent_window_not_the_whole_download(self):
         """A minute lost to curl's connect retries must not depress the speed, and with it the
@@ -204,6 +241,82 @@ class UpdaterTests(unittest.TestCase):
             artifact.write_bytes(b"image")
             mdd_update.load_control_image(artifact, "9.9.9")
         self.assertEqual(run.call_args_list[2].args[0][:3], ["docker", "load", "--input"])
+
+    def test_release_engine_archive_is_loaded_and_identity_checked_before_install(self):
+        runtime_fp, base_fp = "a" * 64, "b" * 64
+        process = SimpleNamespace(returncode=0)
+        process.poll = Mock(side_effect=[None, 0])
+        inspected = SimpleNamespace(
+            returncode=0,
+            stdout=f"arm64|9.9.9|{runtime_fp}|{base_fp}\n",
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(mdd_update.subprocess, "Popen", return_value=process) as popen, \
+                patch.object(mdd_update.subprocess, "run", return_value=inspected), \
+                patch.object(mdd_update.time, "sleep"):
+            status = mdd_update.Status(Path(tmp, "status.json"), "9.9.9")
+            archive = Path(tmp, "mdd-sim-gateway-engine-v9.9.9-arm64.tar.gz")
+            image = mdd_update.load_release_engine(
+                archive, "9.9.9", runtime_fp, base_fp, status, Path(tmp, "engine.log"))
+        self.assertEqual(image, "ghcr.io/mddidd/mdd-sim-gateway-engine:v9.9.9")
+        self.assertEqual(popen.call_args.args[0],
+                         ["docker", "load", "--input", str(archive)])
+
+    def test_release_engine_identity_mismatch_is_rejected(self):
+        process = SimpleNamespace(returncode=0, poll=Mock(return_value=0))
+        inspected = SimpleNamespace(returncode=0, stdout="amd64|9.9.9|bad|bad\n", stderr="")
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(mdd_update.subprocess, "Popen", return_value=process), \
+                patch.object(mdd_update.subprocess, "run", return_value=inspected):
+            status = mdd_update.Status(Path(tmp, "status.json"), "9.9.9")
+            with self.assertRaises(mdd_update.UpdateError):
+                mdd_update.load_release_engine(
+                    Path(tmp, "engine.tar.gz"), "9.9.9", "a" * 64, "b" * 64,
+                    status, Path(tmp, "engine.log"))
+
+    def test_old_updater_handoff_uses_the_release_routes_and_checksum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, data = base / "repo", base / "data"
+            manifest = repo / mdd_update.ENGINE_HANDOFF_MANIFEST
+            manifest.parent.mkdir(parents=True)
+            data.mkdir()
+            engine_name = "mdd-sim-gateway-engine-v9.9.9-arm64.tar.gz"
+            payload = b"verified engine archive"
+            manifest.write_text(
+                f"{hashlib.sha256(payload).hexdigest()}  {engine_name}\n",
+                encoding="utf-8")
+            proxy = "socks5h://127.0.0.1:1080"
+            network = data / "update/network.json"
+            network.parent.mkdir()
+            network.write_text(json.dumps({"routes": [
+                {"proxy_url": "", "route": "direct", "route_name": ""},
+                {"proxy_url": proxy, "route": "library", "route_name": "Primary"},
+            ], "asset_sizes": {engine_name: len(payload)}}), encoding="utf-8")
+            attempts = []
+
+            def fake_download(_url, destination, _env, proxy_url="", **_kwargs):
+                attempts.append(proxy_url)
+                if not proxy_url:
+                    raise mdd_update.UpdateError("direct route stalled")
+                destination.write_bytes(payload)
+
+            distributed = "ghcr.io/mddidd/mdd-sim-gateway-engine:v9.9.9"
+            with patch.object(mdd_update, "download", side_effect=fake_download), \
+                    patch.object(mdd_update.shutil, "disk_usage",
+                                 return_value=SimpleNamespace(free=3 * 1024 ** 3)), \
+                    patch.object(mdd_update, "release_engine_fingerprints",
+                                 return_value=("a" * 64, "b" * 64)), \
+                    patch.object(mdd_update, "load_release_engine",
+                                 return_value=distributed) as load_engine:
+                actual = mdd_update.perform_engine_handoff(
+                    repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", network)
+
+            self.assertEqual(actual, distributed)
+            self.assertEqual(attempts, ["", proxy])
+            self.assertEqual(load_engine.call_args.args[0].name, engine_name)
+            self.assertTrue(network.exists())  # the still-running old updater owns this file
 
     def test_control_image_mismatch_restores_previous_tag(self):
         completed = lambda code=0, out="", err="": type(
@@ -293,6 +406,95 @@ class UpdaterTests(unittest.TestCase):
 
             self.assertEqual((repo / "VERSION").read_text().strip(), "9.9.9")
             self.assertFalse((repo / "EDITION").exists())
+
+    def test_changed_engine_is_fetched_loaded_and_activated_by_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, data, source = base / "repo", base / "data", base / "source"
+            repo.mkdir(); data.mkdir()
+            (repo / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+            (source / "webui/dist").mkdir(parents=True)
+            (source / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+            (source / "webui/dist/index.html").write_text("ok", encoding="utf-8")
+            (source / "webui/dist/.mdd-release-version").write_text(
+                "9.9.9\n", encoding="utf-8")
+            status = mdd_update.Status(data / "orchestrator/status.json", "9.9.9")
+            runtime_fp, base_fp = "a" * 64, "b" * 64
+            distributed = "ghcr.io/mddidd/mdd-sim-gateway-engine:v9.9.9"
+            downloads = []
+
+            def fake_download(url, destination, _env, _proxy="", **_kwargs):
+                downloads.append((url, destination.name, _kwargs.get("phase")))
+                destination.write_bytes(b"ok")
+
+            with patch.object(mdd_update, "download", side_effect=fake_download), \
+                    patch.object(mdd_update.platform, "machine", return_value="aarch64"), \
+                    patch.object(mdd_update, "verify_release_archive"), \
+                    patch.object(mdd_update, "extract", return_value=source), \
+                    patch.object(mdd_update, "release_engine_fingerprints",
+                                 return_value=(runtime_fp, base_fp)), \
+                    patch.object(mdd_update, "engine_image_matches_inputs", return_value=False), \
+                    patch.object(mdd_update.shutil, "disk_usage",
+                                 return_value=SimpleNamespace(free=3 * 1024 ** 3)), \
+                    patch.object(mdd_update, "verify_release_file") as verify_file, \
+                    patch.object(mdd_update, "load_release_engine",
+                                 return_value=distributed) as load_engine, \
+                    patch.object(mdd_update, "backup", return_value=base / "backup.tar.gz"), \
+                    patch.object(mdd_update, "apply_tree"), \
+                    patch.object(mdd_update, "reload_services", return_value=0) as reload:
+                mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status)
+
+            command, _, env = reload.call_args.args[:3]
+            self.assertEqual(command, ["sh", str(repo / "install.sh"), "reload"])
+            self.assertEqual(env["MDD_ENGINE_DISTRIBUTION_IMAGE"], distributed)
+            engine_name = "mdd-sim-gateway-engine-v9.9.9-arm64.tar.gz"
+            self.assertIn((f"https://github.com/MddIdd/mdd-sim-gateway/releases/download/"
+                           f"v9.9.9/{engine_name}", engine_name, "engine_image"), downloads)
+            self.assertEqual(load_engine.call_args.args[0].name, engine_name)
+            self.assertTrue(any(call.args[0].name == engine_name
+                                and call.args[2] == "ARM64 Engine image"
+                                for call in verify_file.call_args_list))
+
+    def test_amd64_refreshes_engine_and_docker_control_locally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, data, source = base / "repo", base / "data", base / "source"
+            repo.mkdir(); data.mkdir()
+            (data / "install-mode").write_text("docker\n", encoding="utf-8")
+            (repo / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+            (source / "webui/dist").mkdir(parents=True)
+            (source / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+            (source / "webui/dist/index.html").write_text("ok", encoding="utf-8")
+            (source / "webui/dist/.mdd-release-version").write_text(
+                "9.9.9\n", encoding="utf-8")
+            downloads = []
+
+            def fake_download(url, destination, _env, _proxy="", **_kwargs):
+                downloads.append(destination.name)
+                destination.write_bytes(b"ok")
+
+            status = mdd_update.Status(data / "orchestrator/status.json", "9.9.9")
+            with patch.object(mdd_update.platform, "machine", return_value="x86_64"), \
+                    patch.object(mdd_update, "download", side_effect=fake_download), \
+                    patch.object(mdd_update, "verify_release_archive"), \
+                    patch.object(mdd_update, "extract", return_value=source), \
+                    patch.object(mdd_update, "release_engine_fingerprints",
+                                 return_value=("a" * 64, "b" * 64)), \
+                    patch.object(mdd_update, "engine_image_matches_inputs", return_value=False), \
+                    patch.object(mdd_update, "backup", return_value=base / "backup.tar.gz"), \
+                    patch.object(mdd_update, "apply_tree"), \
+                    patch.object(mdd_update, "load_release_engine") as load_engine, \
+                    patch.object(mdd_update, "load_control_image") as load_control, \
+                    patch.object(mdd_update, "reload_services", return_value=0) as reload:
+                mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status)
+
+            command, _, env = reload.call_args.args[:3]
+            self.assertEqual(command, ["sh", str(repo / "install.sh"), "reload"])
+            self.assertNotIn("MDD_ENGINE_DISTRIBUTION_IMAGE", env)
+            self.assertNotIn("MDD_REUSE_CONTROL_IMAGE", env)
+            self.assertEqual(downloads, ["mdd-sim-gateway-v9.9.9.tar.gz", "SHA256SUMS"])
+            load_engine.assert_not_called()
+            load_control.assert_not_called()
 
     def test_perform_rejects_malformed_version_and_repository(self):
         with tempfile.TemporaryDirectory() as tmp:

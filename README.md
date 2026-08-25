@@ -61,7 +61,7 @@ sudo ./install.sh install
 
 - 自动识别蜂窝模块与普通 PC/SC 读卡器；模块可同时管理 4G 和 VoWiFi，读卡器仅显示其支持的 VoWiFi 能力。
 - 每个物理模块独立保存 4G、飞行模式和 VoWiFi 期望状态：4G 开关只控制移动数据承载，飞行模式单独控制射频，VoWiFi 独立启停；状态按各自 ModemManager 对象读取。
-- 登录后自动检查新版本并每 6 小时刷新一次；发现新版本时左下角版本号显示红点，可直达 Release 页面。
+- 后台每 6 小时检查新版本；发现新版本时左下角版本号显示红点，并可通过已启用的通知通道推送。可选择通知所有版本，或忽略最后一位版本号变化、仅通知功能更新。
 - 使用物理 SIM/eSIM 完成 EAP-AKA 与 IMS-AKA；不读取、不保存 Ki/OP/OPc，也不使用演示鉴权向量。
 - 自动读取 IMSI、ICCID、MCC/MNC、SIM SPN/GID 和模块 IMEI；使用内置 AOSP Carrier ID 数据离线识别宿主网络与部分 MVNO，PIN 开启时仅在本机加密边界内使用。
 - 每张模块 SIM 显式展示三条逻辑通道的容量、实际分配、用途和错误；部分分配失败会主动释放已打开通道。
@@ -69,6 +69,7 @@ sudo ./install.sh install
 - 可建立包含多个订阅、具体节点和 SOCKS5 的代理库，再为国家出口复用其中一项；Reality/XHTTP 节点由 Xray-core 兼容层承载，其余节点与国家 TUN 由 sing-box 管理。候选节点必须通过 UDP 健康检查，失败时按 SIM 故障关闭，不泄漏到错误国家。
 - 标准 GET/POST Webhook、Telegram（直连/手动代理/国家出口）和 PushPlus。
 - Telegram 仅用于单向推送来电、短信和设备状态通知，不接受远程控制指令。
+- 自动更新默认关闭；即使开启，发布 Release 也不会直接安装，只有另行加入更新许可并到达计划时间的版本才会自动更新。
 - 使用 lpac 管理 eUICC 配置文件；支持需要显式选择安全元件的双 SE 卡。
 - 中英文界面、HTTPS、首次管理员设置、支持按钮或 Enter 提交的会话登录、CSRF、防暴力登录、审计记录、脱敏支持包、备份与版本检查。
 
@@ -107,7 +108,7 @@ sudo ./install.sh build-lpac
 sudo ./install.sh uninstall
 ```
 
-完整说明见 [安装与升级](docs/INSTALL.md)，系统边界见 [架构说明](docs/ARCHITECTURE.md)，问题排查见 [故障排查](docs/TROUBLESHOOTING.md)。
+完整说明见 [安装与升级](docs/INSTALL.md)，系统边界见 [架构说明](docs/ARCHITECTURE.md)，问题排查见 [故障排查](docs/TROUBLESHOOTING.md)。参与开发前请先读 [开发与协作规范](docs/DEVELOPMENT.md)。
 
 ## 使用边界
 

@@ -92,17 +92,6 @@ def parse_expiry_date(value: object) -> date | None:
     return None
 
 
-def reminder_days(snapshot: dict, today: date) -> int | None:
-    """Return 3, 2 or 1 only when activation tracking is explicitly configured."""
-    if not str(snapshot.get("activated_at") or "").strip():
-        return None
-    expiry = parse_expiry_date(snapshot.get("valid_until"))
-    if not expiry:
-        return None
-    remaining = (expiry - today).days
-    return remaining if remaining in {3, 2, 1} else None
-
-
 def parse_reply(key: str, messages: list[dict]) -> dict:
     text = "\n".join(str(item.get("body") or "") for item in messages)
     if not text:

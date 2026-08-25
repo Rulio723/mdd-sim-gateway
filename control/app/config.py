@@ -67,6 +67,11 @@ DEFAULTS = {
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
         "ring_timeout": 35,
+        # Voicemail defaults. Off unless asked for: recording a caller is the operator's
+        # decision. Per-line overrides live in the line's sip.* block, like ring_timeout.
+        "vm_enabled": False,
+        "vm_ring_seconds": 25,
+        "vm_max_seconds": 120,
         # Country-aware outer ePDG routing. Disabled preserves the legacy host routing until the
         # host-side orchestrator is installed/configured. When enabled, a line fails closed if
         # its SIM country has no healthy exit (unless that country explicitly selects direct).
@@ -107,7 +112,9 @@ DEFAULTS = {
             "payload_template": "",
             "verify_tls": True,
             "events": {"incoming_sms": True, "incoming_call": True,
-                       "activation_reminder": True},
+                       "missed_call": True, "voicemail_received": True,
+                       "keepalive_result": True, "balance_low": True,
+                       "software_update": True},
         },
         "telegram": {
             "enabled": False,
@@ -117,7 +124,9 @@ DEFAULTS = {
             "proxy_url": "",
             "proxy_country": "",
             "events": {"incoming_sms": True, "incoming_call": True,
-                       "activation_reminder": True},
+                       "missed_call": True, "voicemail_received": True,
+                       "keepalive_result": True, "balance_low": True,
+                       "software_update": True},
         },
         "pushplus": {
             "enabled": False,
@@ -126,7 +135,9 @@ DEFAULTS = {
             "template": "html",
             "channel": "wechat",
             "events": {"incoming_sms": True, "incoming_call": True,
-                       "activation_reminder": True},
+                       "missed_call": True, "voicemail_received": True,
+                       "keepalive_result": True, "balance_low": True,
+                       "software_update": True},
         },
         "security": {
             "https_only": True,
@@ -142,6 +153,12 @@ DEFAULTS = {
         "updates": {
             "proxy_mode": "auto",
             "proxy_profile_id": "",
+            # Automatic and notify-only are mutually exclusive. New installations track stable
+            # releases explicitly classified as main automatically; every automatic install
+            # still requires an exact
+            # promotion in update-policy.json.
+            "update_mode": "automatic",
+            "version_scope": "main",
         },
         # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
         # $MDD_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
@@ -268,6 +285,9 @@ def load() -> dict:
             merged = {**DEFAULTS["settings"][key], **saved}
             merged["events"] = {**DEFAULTS["settings"][key]["events"],
                                 **(saved.get("events", {}) or {})}
+            # Number keeping superseded the old manually-entered activation countdown. Do not
+            # preserve its hidden checkbox forever when loading a pre-keepalive config.
+            merged["events"].pop("activation_reminder", None)
             out["settings"][key] = merged
         # Telegram is notification-only. Drop command settings left by an older configuration
         # so an upgrade cannot preserve a remote call/SMS control channel.
@@ -370,9 +390,28 @@ def load() -> dict:
             update_profile_id = str(updates["proxy_profile_id"])
         normalized_update_mode = "library" if update_mode == "library" and update_profile_id \
             else (update_mode if update_mode in {"auto", "direct"} else "auto")
+        raw_updates = data.get("settings", {}).get("updates", {}) or {}
+        update_mode = str(raw_updates.get("update_mode") or "").lower()
+        version_scope = str(raw_updates.get("version_scope") or "").lower()
+        if version_scope == "feature":
+            version_scope = "main"
+        if update_mode not in {"automatic", "notify"}:
+            legacy_auto_update = raw_updates.get("auto_update")
+            update_mode = "automatic" if legacy_auto_update is True else \
+                "notify" if legacy_auto_update is False else "automatic"
+            if not version_scope:
+                version_scope = str(raw_updates.get("notification_mode") or "all") \
+                    if update_mode == "notify" else "all" if legacy_auto_update is True \
+                    else "main"
+            if version_scope == "feature":
+                version_scope = "main"
+        if version_scope not in {"all", "main"}:
+            version_scope = "main" if update_mode == "automatic" else "all"
         out["settings"]["updates"] = {
             "proxy_mode": normalized_update_mode,
             "proxy_profile_id": update_profile_id if normalized_update_mode == "library" else "",
+            "update_mode": update_mode,
+            "version_scope": version_scope,
         }
         # Asterisk debug includes complete SIP messages and IMS identities.  Older manual
         # provisioning forms accidentally enabled it by default, so normalize every loaded
@@ -980,6 +1019,13 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
             # settings default, else 35s. Clamped to a sane 5..180 range.
             "ring_timeout": max(5, min(180, int(
                 sip.get("ring_timeout") or settings.get("ring_timeout", 35)))),
+            # Voicemail: per-line override wins, else the global default. The ring bound stops
+            # short of the inbound INVITE timeout so the carrier does not give up first.
+            "vm_enabled": bool(sip.get("vm_enabled", settings.get("vm_enabled", False))),
+            "vm_ring_seconds": max(5, min(55, int(
+                sip.get("vm_ring_seconds") or settings.get("vm_ring_seconds", 25)))),
+            "vm_max_seconds": max(30, min(300, int(
+                sip.get("vm_max_seconds") or settings.get("vm_max_seconds", 120)))),
             # Public builds identify themselves honestly; stale/manual settings cannot make
             # the gateway impersonate a handset model.
             "user_agent": "MDD-Sim-Gateway",

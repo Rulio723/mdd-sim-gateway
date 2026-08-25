@@ -17,8 +17,11 @@ RUN chmod +x /usr/local/bin/*.py /entrypoint.sh
 # is carrying needs a full rebuild (Asterisk-level inputs) or only this overlay (scripts).
 ARG RUNTIME_FP=""
 ARG BASE_FP=""
+ARG MDD_VERSION=""
 LABEL io.mdd-sim-gateway.managed="true" \
       io.mdd-sim-gateway.runtime-fp="${RUNTIME_FP}" \
       io.mdd-sim-gateway.base-fp="${BASE_FP}" \
+      org.opencontainers.image.version="${MDD_VERSION}" \
+      org.opencontainers.image.source="https://github.com/MddIdd/mdd-sim-gateway" \
       org.opencontainers.image.title="MDD Sim Gateway VoWiFi engine"
 ENTRYPOINT ["/entrypoint.sh"]

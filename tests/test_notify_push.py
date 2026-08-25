@@ -128,6 +128,46 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class BrandPrefixTests(unittest.TestCase):
+    """A push arrives out of context — a lock screen, a Telegram list beside other bots — and
+    the event alone does not say which machine is talking."""
+
+    EVENTS = ("incoming_sms", "incoming_call", "missed_call", "voicemail_received",
+              "host_alert", "number_changed", "line_unrecoverable", "keepalive_result",
+              "balance_low", "software_update")
+
+    def _payload(self, event):
+        return notify_push.build_payload(
+            event, {"id": "1", "name": "UK SIM", "msisdn": "+447700900123"},
+            "+447700900321", "detail")
+
+    def test_every_title_leads_with_the_brand(self):
+        for event in self.EVENTS:
+            title = notify_push.build_notification_message(self._payload(event))["title"]
+            self.assertTrue(title.startswith(notify_push.BRAND), f"{event}: {title}")
+
+    def test_every_telegram_message_leads_with_the_brand(self):
+        for event in self.EVENTS:
+            first = notify_push._telegram_text(self._payload(event)).splitlines()[0]
+            self.assertIn(notify_push.BRAND, first, f"{event}: {first}")
+
+    def test_the_brand_is_not_repeated_when_the_text_already_carries_it(self):
+        # The software-update wording names the product, so a blind prefix would read
+        # "MDD · MDD Sim Gateway 新版本".
+        title = notify_push.build_notification_message(
+            self._payload("software_update"))["title"]
+        self.assertEqual(title.count(notify_push.BRAND), 1, title)
+        first = notify_push._telegram_text(
+            self._payload("software_update")).splitlines()[0]
+        self.assertEqual(first.count(notify_push.BRAND), 1, first)
+
+    def test_the_icon_stays_leftmost_in_telegram(self):
+        # It is what makes the event type scannable in a chat list.
+        first = notify_push._telegram_text(self._payload("missed_call")).splitlines()[0]
+        self.assertFalse(first.startswith(notify_push.BRAND), first)
+        self.assertLess(first.index("📵"), first.index(notify_push.BRAND))
+
+
 class HostAlertNotificationTests(unittest.TestCase):
     """The host alert is not a SIM event. Rendering it through the call/SMS path produced
     "📞 Incoming call — SIM: Raspberry Pi 3 Model B, From: Raspberry Pi 3 Model B"."""
@@ -163,35 +203,43 @@ class HostAlertNotificationTests(unittest.TestCase):
         self.assertTrue(notify_push._events_enabled({})[notify_push.EV_HOST_ALERT])
 
 
-class ActivationReminderNotificationTests(unittest.TestCase):
-    def test_it_is_enabled_by_default_and_can_be_disabled_per_channel(self):
-        self.assertTrue(notify_push._events_enabled({})[
-            notify_push.EV_ACTIVATION_REMINDER])
-        self.assertFalse(notify_push._events_enabled({"events": {
-            notify_push.EV_ACTIVATION_REMINDER: False,
-        }})[notify_push.EV_ACTIVATION_REMINDER])
+class MissedCallNotificationTests(unittest.TestCase):
+    """A missed call is the outcome of a call nobody answered — a different event from the
+    ringing announcement, and the one that matters when no browser was open."""
 
-    def test_it_has_expiry_wording_not_call_or_sms_wording(self):
+    def test_it_is_enabled_by_default_and_can_be_disabled_per_channel(self):
+        self.assertTrue(notify_push._events_enabled({})[notify_push.EV_MISSED_CALL])
+        self.assertFalse(notify_push._events_enabled({"events": {
+            notify_push.EV_MISSED_CALL: False,
+        }})[notify_push.EV_MISSED_CALL])
+
+    def test_it_is_worded_as_a_missed_call_not_a_ringing_one(self):
         payload = notify_push.build_payload(
-            notify_push.EV_ACTIVATION_REMINDER,
-            {"id": "1", "name": "US SIM"}, "2026-08-28",
-            "线路 US SIM 将于 2026-08-28 到期，还剩 3 天。")
+            notify_push.EV_MISSED_CALL,
+            {"id": "1", "name": "UK SIM", "msisdn": "+447700900123"},
+            "+447700900321", None)
         built = notify_push.build_notification_message(payload)
         telegram = notify_push._telegram_text(payload)
-        self.assertIn("即将到期", built["title"])
-        self.assertIn("还剩 3 天", built["content"])
-        self.assertIn("即将到期", telegram)
+        self.assertIn("未接来电", built["title"])
+        self.assertIn("+447700900321", built["content"])
+        self.assertIn("Missed call", telegram)
         self.assertNotIn("Incoming call", telegram)
         self.assertNotIn("Incoming SMS", telegram)
 
-    def test_enabled_channel_detection_honours_category_toggle(self):
+    def test_it_carries_no_message_body(self):
+        # Nothing was said into a call that was never answered; a body here could only be a
+        # leak from an adjacent SMS event.
+        payload = notify_push.build_payload(
+            notify_push.EV_MISSED_CALL, {"id": "1"}, "+15550000", "secret sms body")
+        self.assertIsNone(payload["text"])
+
+    def test_it_is_toggleable_independently_of_incoming_calls(self):
         settings = {"telegram": {"enabled": True, "events": {
-            notify_push.EV_ACTIVATION_REMINDER: False}}}
-        self.assertFalse(notify_push.has_enabled_channel(
-            settings, notify_push.EV_ACTIVATION_REMINDER))
-        settings["telegram"]["events"][notify_push.EV_ACTIVATION_REMINDER] = True
+            notify_push.EV_INCOMING_CALL: False, notify_push.EV_MISSED_CALL: True}}}
         self.assertTrue(notify_push.has_enabled_channel(
-            settings, notify_push.EV_ACTIVATION_REMINDER))
+            settings, notify_push.EV_MISSED_CALL))
+        self.assertFalse(notify_push.has_enabled_channel(
+            settings, notify_push.EV_INCOMING_CALL))
 
 
 class NumberChangeNotificationTests(unittest.TestCase):

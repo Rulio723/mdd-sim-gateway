@@ -1,10 +1,11 @@
 import tempfile
 import unittest
-from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 from control.app import allowance, store
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 class AllowanceTests(unittest.TestCase):
@@ -93,24 +94,19 @@ class AllowanceTests(unittest.TestCase):
         self.assertIsNone(store.latest_allowance_query("4"))
         self.assertEqual(store.get_allowance("4")["balance"], "")
 
-    def test_activation_date_enables_only_three_two_one_day_reminders(self):
-        snapshot = {"activated_at": "2026-08-01", "valid_until": "08/28/2026"}
-        self.assertEqual(allowance.reminder_days(snapshot, date(2026, 8, 25)), 3)
-        self.assertEqual(allowance.reminder_days(snapshot, date(2026, 8, 26)), 2)
-        self.assertEqual(allowance.reminder_days(snapshot, date(2026, 8, 27)), 1)
-        self.assertIsNone(allowance.reminder_days(snapshot, date(2026, 8, 24)))
-        self.assertIsNone(allowance.reminder_days(
-            {"activated_at": "", "valid_until": "08/28/2026"}, date(2026, 8, 25)))
-
     def test_activation_date_requires_iso_format(self):
         with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
             allowance.clean_allowance({"activated_at": "08/01/2026"})
 
-    def test_reminder_claim_is_persistent_and_deduplicated(self):
-        self.assertTrue(store.claim_allowance_reminder("1", "2026-08-28", 3, 100))
-        self.assertFalse(store.claim_allowance_reminder("1", "2026-08-28", 3, 101))
-        self.assertTrue(store.claim_allowance_reminder("1", "2026-08-28", 2, 102))
-        self.assertTrue(store.claim_allowance_reminder("1", "2026-09-28", 3, 103))
+
+class AllowancePanelTests(unittest.TestCase):
+    def test_query_rule_editor_is_reachable_from_the_allowance_page(self):
+        source = (ROOT / "webui" / "src" / "views" /
+                  "AllowancePanel.jsx").read_text(encoding="utf-8")
+        self.assertIn("setEditingRule(true)", source)
+        self.assertIn("{editingRule && <div", source)
+        self.assertIn(">{t('Query settings')}</button>", source)
+        self.assertNotIn("Configure it in Messages", source)
 
 
 if __name__ == "__main__":

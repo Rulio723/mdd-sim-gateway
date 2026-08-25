@@ -392,6 +392,63 @@ class ExistingModemCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.hub.cards["VoWiFi Modem new 00 01"]["matched"], "2")
 
 
+class IdenticalNativeReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_swapped_reader_names_are_attributed_by_live_card_identity(self):
+        """A reboot may swap pcscd names while the physical USB ports stay fixed.
+
+        A running engine's pin_status still naming the newly enumerated reader must not lend
+        that line's saved ICCID to the other physical card. Both cards are probed and matched
+        to their own lines before the live reader indices are refreshed.
+        """
+        cards = {
+            0: main.sim.CardInfo(
+                reader="AK9563 00 00", reader_index=0, present=True,
+                iccid="iccid-b", imsi="imsi-b", mcc="002", mnc="02",
+                pin_enabled=False, pin_tries=3, smsc="+200"),
+            1: main.sim.CardInfo(
+                reader="AK9563 01 00", reader_index=1, present=True,
+                iccid="iccid-a", imsi="imsi-a", mcc="001", mnc="01",
+                pin_enabled=False, pin_tries=3, smsc="+100"),
+        }
+        instances = {
+            "1": {"id": "1", "iccid": "iccid-a", "imsi": "imsi-a",
+                  "reader_index": 0, "reader_port": "2-1"},
+            "2": {"id": "2", "iccid": "iccid-b", "imsi": "imsi-b",
+                  "reader_index": 1, "reader_port": "2-3"},
+        }
+        pin_readers = {"1": "AK9563 00 00", "2": "AK9563 01 00"}
+
+        def upsert(update):
+            iid = str(update["id"])
+            instances[iid].update(update)
+            return dict(instances[iid])
+
+        main.hub.cards.clear()
+        self.addCleanup(main.hub.cards.clear)
+        with patch.object(main.usbreader, "port_for_index",
+                          side_effect=lambda idx: {0: "2-3", 1: "2-1"}[idx]), \
+                patch.object(main, "_modem_identity_for_reader", return_value=None), \
+                patch.object(main.cfg, "list_instances",
+                             side_effect=lambda: [dict(value) for value in instances.values()]), \
+                patch.object(main.engine, "is_running", return_value=True), \
+                patch.object(main.engine, "read_run_json",
+                             side_effect=lambda iid, _name: {"reader": pin_readers[str(iid)]}), \
+                patch.object(main.sim, "read_card", side_effect=lambda idx: cards[idx]) as read, \
+                patch.object(main.cfg, "upsert_instance", side_effect=upsert), \
+                patch.object(main, "_auto_start_hotplugged_line", new=AsyncMock()):
+            await main._on_card_insert("AK9563 00 00", 0)
+            await main._on_card_insert("AK9563 01 00", 1)
+            await asyncio.sleep(0)
+
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(main.hub.cards["AK9563 00 00"]["matched"], "2")
+        self.assertEqual(main.hub.cards["AK9563 01 00"]["matched"], "1")
+        self.assertEqual(instances["1"]["reader_port"], "2-1")
+        self.assertEqual(instances["1"]["reader_index"], 1)
+        self.assertEqual(instances["2"]["reader_port"], "2-3")
+        self.assertEqual(instances["2"]["reader_index"], 0)
+
+
 class EsimProfileRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_active_profile_creates_line_and_schedules_auto_start(self):
         card = SimpleNamespace(

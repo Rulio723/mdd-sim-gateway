@@ -3,12 +3,14 @@ import { api, connectWs, setCsrf } from './api.js'
 import Softphone from './views/Softphone.jsx'
 import Messages from './views/Messages.jsx'
 import Esim from './views/Esim.jsx'
+import Keepalive from './views/Keepalive.jsx'
 import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
 import { useI18n } from './i18n.jsx'
 
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
-  ['messages', 'Messages', '✉'], ['esim', 'eSIM', '◎'], ['egress', 'Network exits', '⇄'],
+  ['messages', 'Messages', '✉'], ['esim', 'eSIM', '◎'], ['keepalive', 'Balance & keeping', '◷'],
+  ['egress', 'Network exits', '⇄'],
   ['notifications', 'Notifications', '◉'], ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
 ]
 
@@ -213,14 +215,15 @@ export default function App() {
   const common={devices,discovering,refreshDevices:refresh,instances,cards,selected:sel,setSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,openUpdateDialog,setSystemMeta}
   const content={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
-    messages:<Messages {...common}/>, esim:<Esim {...common}/>, egress:<EgressPage {...common}/>,
+    messages:<Messages {...common}/>, esim:<Esim {...common}/>, keepalive:<Keepalive {...common}/>,
+    egress:<EgressPage {...common}/>,
     notifications:<NotificationsPage {...common}/>, settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
   }[view]
   const issueUrl = `${(systemMeta.repository_url || 'https://github.com/MddIdd/mdd-sim-gateway').replace(/\/$/, '')}/issues/new/choose`
   return <div className="u-shell">
     <aside className={`u-sidebar ${menuOpen?'open':''}`}>
       <div className="u-brand"><img src="/logo.svg" alt="" /><div>MDD Sim Gateway<small>{t('4G + VoWiFi unified')}</small></div></div>
-      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}</button>)}</nav>
+      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}{key==='calls'&&!!systemMeta.unheard_voicemails&&<i className="u-nav-dot critical" title={t('There are voicemails you have not played')}/>}</button>)}</nav>
       <div className="u-sidebar-foot"><div className="u-theme">{[['auto','◐'],['light','☀'],['dark','☾']].map(([k,x])=><button key={k} className={theme===k?'active':''} onClick={()=>setTheme(k)} title={t(k)}>{x}</button>)}</div><small>{discovering&&!devices.length?t('Detecting devices…'):`${devices.length} ${t(devices.length === 1 ? 'device' : 'devices')}`}</small><a className="u-feedback-link" href={issueUrl} target="_blank" rel="noreferrer"><span>◉</span>{t('Issues and suggestions')}<b>↗</b></a><div className="u-project-meta">{systemMeta.update?.update_available&&systemMeta.update?.release_url?<a className="u-version has-update" href={systemMeta.update.release_url} onClick={e=>{e.preventDefault();setUpdateOpen(true)}} title={t('New version available: v{version}',{version:systemMeta.update.latest})}><i />v{systemMeta.version}</a>:<span className="u-version">{systemMeta.version ? `v${systemMeta.version}` : '—'}</span>}<span className="u-repo-actions">{systemMeta.repository_url&&<><a href={systemMeta.repository_url} target="_blank" rel="noreferrer" aria-label="GitHub" title="GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.52-1.34-1.29-1.69-1.29-1.69-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.78 2.72 1.27 3.38.97.1-.75.4-1.27.74-1.56-2.57-.29-5.27-1.29-5.27-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.16 1.18a10.9 10.9 0 0 1 5.75 0c2.19-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.71 5.39-5.29 5.68.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg></a><a className="u-star-link" href={systemMeta.repository_url} target="_blank" rel="noreferrer" aria-label={t('Star on GitHub')} title={t('Star on GitHub')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2.7 2.75 5.58 6.16.9-4.46 4.34 1.05 6.13L12 16.76l-5.5 2.89 1.05-6.13-4.46-4.34 6.16-.9L12 2.7Z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/></svg><b>{starCount(systemMeta.update?.stars) || '—'}</b></a></>}</span></div><button className="btn btn-ghost" onClick={async()=>{try{await api.authLogout()}finally{setCsrf('');setAuthState(s=>({...s,configured:true,authenticated:false,csrf:''}))}}}>{t('Sign out')}</button></div>
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>
@@ -234,11 +237,12 @@ export default function App() {
 const UPDATE_PHASES = {
   requested: 'Contacting the host…', launching: 'Contacting the host…',
   downloading: 'Downloading the new release…', verifying: 'Verifying the package…',
+  engine_image: 'Importing the verified Engine image…',
   backup: 'Backing up the current version…', applying: 'Applying files…',
   control_image: 'Importing the verified control image…',
   reloading: 'Rebuilding and restarting services…',
 }
-const UPDATE_PHASE_ORDER = ['requested', 'downloading', 'verifying', 'control_image', 'backup', 'applying', 'reloading', 'done']
+const UPDATE_PHASE_ORDER = ['requested', 'downloading', 'verifying', 'engine_image', 'control_image', 'backup', 'applying', 'reloading', 'done']
 const normalizedUpdatePhase = phase => phase === 'launching' ? 'requested' : (phase || 'requested')
 const formatUpdateBytes = value => {
   const bytes = Math.max(0, Number(value) || 0)
@@ -332,13 +336,15 @@ function UpdateModal({ update, current, t, onClose }) {
     } catch (err) { setError(err.message); setMode('failed') } finally { setCancelling(false) }
   }
   const mute = { fontSize: 12, color: 'var(--text-mute)' }
-  const visiblePhases = UPDATE_PHASE_ORDER.filter(key => key !== 'control_image' || progress?.install_mode === 'docker')
+  const visiblePhases = UPDATE_PHASE_ORDER.filter(key =>
+    (key !== 'control_image' || progress?.install_mode === 'docker') &&
+    (key !== 'engine_image' || progress?.engine_image_required))
   const activePhase = normalizedUpdatePhase(phase)
   const activeIndex = Math.max(0, visiblePhases.indexOf(activePhase))
   const downloaded = Number(progress?.downloaded_bytes) || 0
   const total = Number(progress?.total_bytes) || 0
   const percent = total > 0 ? Math.min(100, Math.round(downloaded * 100 / total)) : 0
-  const transferring = activePhase === 'downloading' || activePhase === 'control_image'
+  const transferring = ['downloading', 'engine_image', 'control_image'].includes(activePhase)
   const speed = Number(progress?.bytes_per_second) || 0
   // Only an estimate the host can actually support: a Release whose size the check never
   // returned, or a transfer that has not moved yet, gets no countdown rather than a wrong one.
@@ -415,8 +421,8 @@ function UpdateModal({ update, current, t, onClose }) {
 }
 
 function AuthScreen({ configured, accountUsername, t, onDone }) {
-  const [username,setUsername]=useState(configured ? (accountUsername || 'admin') : 'admin'); const [password,setPassword]=useState(''); const [confirm,setConfirm]=useState(''); const [error,setError]=useState(''); const [busy,setBusy]=useState(false); const [retry,setRetry]=useState(0)
+  const [username,setUsername]=useState(configured ? (accountUsername || 'admin') : 'admin'); const [password,setPassword]=useState(''); const [confirm,setConfirm]=useState(''); const [error,setError]=useState(''); const [busy,setBusy]=useState(false); const [retry,setRetry]=useState(0); const [remember,setRemember]=useState(true)
   useEffect(()=>{if(!retry)return;const timer=setInterval(()=>setRetry(v=>Math.max(0,v-1)),1000);return()=>clearInterval(timer)},[retry])
-  const submit=async()=>{if(busy||retry||!password)return;setError('');if(!configured&&password!==confirm){setError(t('Passwords do not match'));return}setBusy(true);try{onDone(await (configured?api.authLogin(username,password):api.authSetup(username,password)))}catch(err){if(err.status===429){const seconds=Math.max(1,Number(err.data?.retry_after)||60);setRetry(seconds);setError(t('Too many attempts. Try again in {seconds} seconds.',{seconds}))}else setError(err.message)}finally{setBusy(false)}}
-  return <div className="auth-shell"><form className="auth-card" onSubmit={e=>{e.preventDefault();submit()}}><div className="auth-brand"><div className="auth-mark">M</div><h1>MDD Sim Gateway</h1></div><p>{t(configured?'Sign in to manage the gateway':'Create the administrator account')}</p><label>{t('Username')}<input value={username} onChange={e=>setUsername(e.target.value)} readOnly={configured} autoComplete="off" data-1p-ignore="true" data-lpignore="true" required /></label><label>{t('Password')}<input type="password" value={password} onChange={e=>setPassword(e.target.value)} autoComplete="off" data-1p-ignore="true" data-lpignore="true" minLength="10" required /></label>{!configured&&<label>{t('Confirm password')}<input type="password" value={confirm} onChange={e=>setConfirm(e.target.value)} autoComplete="new-password" minLength="10" required /></label>}{error&&<p className="auth-error">{retry?t('Too many attempts. Try again in {seconds} seconds.',{seconds:retry}):error}</p>}<button type="submit" className="primary" disabled={busy||retry>0||!password}>{retry?t('Try again in {seconds}s',{seconds:retry}):t(busy?'Please wait…':configured?'Sign in':'Create account')}</button>{!configured&&<small>{t('Use at least 10 characters. Reset it from the host if it is lost.')}</small>}</form></div>
+  const submit=async()=>{if(busy||retry||!password)return;setError('');if(!configured&&password!==confirm){setError(t('Passwords do not match'));return}setBusy(true);try{onDone(await (configured?api.authLogin(username,password,remember):api.authSetup(username,password,remember)))}catch(err){if(err.status===429){const seconds=Math.max(1,Number(err.data?.retry_after)||60);setRetry(seconds);setError(t('Too many attempts. Try again in {seconds} seconds.',{seconds}))}else setError(err.message)}finally{setBusy(false)}}
+  return <div className="auth-shell"><form className="auth-card" onSubmit={e=>{e.preventDefault();submit()}}><div className="auth-brand"><div className="auth-mark">M</div><h1>MDD Sim Gateway</h1></div><p>{t(configured?'Sign in to manage the gateway':'Create the administrator account')}</p><label>{t('Username')}<input value={username} onChange={e=>setUsername(e.target.value)} readOnly={configured} autoComplete="off" data-1p-ignore="true" data-lpignore="true" required /></label><label>{t('Password')}<input type="password" value={password} onChange={e=>setPassword(e.target.value)} autoComplete="off" data-1p-ignore="true" data-lpignore="true" minLength="10" required /></label>{!configured&&<label>{t('Confirm password')}<input type="password" value={confirm} onChange={e=>setConfirm(e.target.value)} autoComplete="new-password" minLength="10" required /></label>}<label className="auth-remember"><input type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)} />{t('Keep me signed in for 30 days')}</label>{error&&<p className="auth-error">{retry?t('Too many attempts. Try again in {seconds} seconds.',{seconds:retry}):error}</p>}<button type="submit" className="primary" disabled={busy||retry>0||!password}>{retry?t('Try again in {seconds}s',{seconds:retry}):t(busy?'Please wait…':configured?'Sign in':'Create account')}</button>{!configured&&<small>{t('Use at least 10 characters. Reset it from the host if it is lost.')}</small>}</form></div>
 }

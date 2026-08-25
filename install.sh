@@ -36,6 +36,9 @@
 #   MDD_ADVERTISE_ADDR  host LAN IP for SIP/WebRTC media           (default: auto-detect)
 #   MDD_BIND            control bind addr                          (default 0.0.0.0)
 #   MDD_ENGINE_BASE_IMAGE optional trusted local engine image for an offline overlay migration
+#   MDD_ENGINE_DISTRIBUTION_IMAGE optional already-pulled, release-matched Engine image
+#   PJPROJECT_REPOSITORY optional reviewed pjproject Git repository override for a full build
+#   ASTERISK_REPOSITORY optional reviewed Asterisk Git repository override for a full build
 #   MDD_REUSE_WEBUI     set to 1 to reuse a prebuilt, reviewed webui/dist in an offline install
 #   MDD_REUSE_CONTROL_IMAGE set to 1 to reuse a checksummed Release control image (docker mode)
 #   PCSC_VERSION           pinned pcsc-lite version                   (default 2.3.3)
@@ -63,6 +66,7 @@ MDD_ADVERTISE_ADDR="${MDD_ADVERTISE_ADDR:-}"
 
 CONTROL_IMAGE="mdd-sim-gateway/control"
 ENGINE_IMAGE="mdd-sim-gateway/engine"
+ENGINE_HANDOFF_MANIFEST="$REPO_DIR/engine/release-image.SHA256SUMS"
 CONTROL_NAME="mdd-sim-gateway-control"
 ENGINE_PREFIX="mdd-sim-gateway-engine-"
 MDD_DOCKER_LABEL="io.mdd-sim-gateway.managed"
@@ -555,23 +559,10 @@ _build_pcsclite_host() {
 # Dockerfile — so an unforced reinstall reuses the existing patched image instead of rebuilding it.
 # Files the overlay can refresh on its own, versus the ones that decide what the base contains.
 # Splitting them is what lets an update ship an engine fix without a 15-minute Asterisk rebuild.
-ENGINE_RUNTIME_FILES="pin_keeper.py ami_usim.py swu_ike.py log_capture.py render.py notify.py entrypoint.sh"
 ENGINE_BASE_TAG="mdd-sim-gateway/engine-base:trusted"
 
 engine_fingerprint() {
-  # $1: runtime|base. Hash of the inputs that class owns; order is fixed so it is reproducible.
-  eng="$REPO_DIR/engine"
-  if [ "$1" = runtime ]; then
-    # shellcheck disable=SC2086
-    { for f in $ENGINE_RUNTIME_FILES; do [ -f "$eng/$f" ] && cat "$eng/$f"; done
-      find "$eng/templates" -type f 2>/dev/null | LC_ALL=C sort | while read -r t; do cat "$t"; done
-    } | sha256sum | cut -d' ' -f1
-  else
-    { cat "$eng/Dockerfile" 2>/dev/null
-      echo "pcsc=$PCSC_VERSION"
-      find "$eng/patches" -type f 2>/dev/null | LC_ALL=C sort | while read -r p; do cat "$p"; done
-    } | sha256sum | cut -d' ' -f1
-  fi
+  PCSC_VERSION="$PCSC_VERSION" sh "$REPO_DIR/tools/engine-fingerprint.sh" "$1"
 }
 
 engine_image_label() {
@@ -586,10 +577,39 @@ engine_image_label() {
 # registry at all. Forcing still overrides everything.
 ensure_engine_image() {
   force="${1:-}"
+  # Whether this call replaced the image. A running container keeps the image it started
+  # from, so an upgrade that rebuilds the image but leaves the containers alone silently
+  # ships nothing: the lines go on serving the old dialplan. The caller uses this to decide
+  # whether the containers have to be re-created, instead of asking the operator to know.
+  ENGINE_IMAGE_CHANGED=0
   runtime_fp=$(engine_fingerprint runtime)
   base_fp=$(engine_fingerprint base)
   have_image=0
   docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 && have_image=1
+
+  if [ -n "${MDD_ENGINE_DISTRIBUTION_IMAGE:-}" ]; then
+    distributed="$MDD_ENGINE_DISTRIBUTION_IMAGE"
+    docker image inspect "$distributed" >/dev/null 2>&1 || \
+      die "distributed engine image not found: $distributed"
+    expected_version=$(tr -d '\n' < "$REPO_DIR/VERSION")
+    expected_arch=$(uname -m)
+    [ "$expected_arch" = aarch64 ] && expected_arch=arm64
+    [ "$expected_arch" = x86_64 ] && expected_arch=amd64
+    identity=$(docker image inspect "$distributed" --format \
+      '{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}|{{index .Config.Labels "io.mdd-sim-gateway.base-fp"}}' 2>/dev/null || true)
+    expected="$expected_arch|$expected_version|$runtime_fp|$base_fp"
+    [ "$identity" = "$expected" ] || \
+      die "distributed engine image identity mismatch: ${identity:-unreadable}"
+    if [ "$have_image" = 1 ]; then
+      docker tag "$ENGINE_IMAGE" "$ENGINE_IMAGE:previous" || \
+        die "could not preserve the current engine image"
+    fi
+    docker tag "$distributed" "$ENGINE_IMAGE" || die "could not activate distributed engine image"
+    docker tag "$distributed" "$ENGINE_BASE_TAG" >/dev/null 2>&1 || true
+    ENGINE_IMAGE_CHANGED=1
+    info "using verified distributed engine image $distributed"
+    return
+  fi
 
   if [ "$have_image" = 1 ] && [ -z "$force" ] && [ -z "$NOCACHE_FLAG" ]; then
     image_runtime=$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.runtime-fp)
@@ -601,13 +621,17 @@ ensure_engine_image() {
     if [ -n "$image_base" ] && [ "$image_base" = "$base_fp" ]; then
       # Only runtime-owned files moved: refresh them onto the image already installed.
       info "engine scripts changed — refreshing them onto the existing image (no rebuild)"
-      engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp" && return
+      if engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp"; then
+        ENGINE_IMAGE_CHANGED=1; return
+      fi
       warn "overlay refresh failed; falling back to a full engine rebuild"
     elif [ -z "$image_base" ]; then
       # Built before fingerprints existed: adopt it as the base and stamp it, rather than
       # forcing every existing install through a rebuild it may not be able to complete.
       info "engine image predates fingerprinting — refreshing scripts onto it and stamping it"
-      engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp" && return
+      if engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp"; then
+        ENGINE_IMAGE_CHANGED=1; return
+      fi
       warn "overlay refresh failed; falling back to a full engine rebuild"
     else
       info "engine base inputs changed (Dockerfile/patches/pcsc) — full rebuild required"
@@ -620,17 +644,63 @@ ensure_engine_image() {
     info "building offline engine overlay from trusted local image $MDD_ENGINE_BASE_IMAGE"
     engine_overlay_build "$MDD_ENGINE_BASE_IMAGE" "$runtime_fp" "$base_fp" || \
       die "offline engine overlay build failed"
+    ENGINE_IMAGE_CHANGED=1
   else
     info "building engine image ($ENGINE_IMAGE) from source — long; compiles Asterisk+pcsc-lite+Python SWu tunnel deps and bakes engine/patches/*…"
-    # shellcheck disable=SC2086
-    docker build $NOCACHE_FLAG --build-arg "PCSC_VERSION=$PCSC_VERSION" \
+    # The reviewed GitHub mirrors remain the Dockerfile defaults. Some installation networks can
+    # reach the reviewed upstream sysmocom repositories but not GitHub, so preserve an explicit
+    # override instead of trapping a forced full build behind one hard-coded route. Build the
+    # argument vector incrementally so repository URLs remain one quoted argument.
+    set -- docker build
+    [ -n "$NOCACHE_FLAG" ] && set -- "$@" "$NOCACHE_FLAG"
+    set -- "$@" --build-arg "PCSC_VERSION=$PCSC_VERSION" \
       --build-arg "RUNTIME_FP=$runtime_fp" --build-arg "BASE_FP=$base_fp" \
-      -t "$ENGINE_IMAGE" "$REPO_DIR/engine"
+      --build-arg "MDD_VERSION=$(tr -d '\n' < "$REPO_DIR/VERSION")"
+    [ -n "${PJPROJECT_REPOSITORY:-}" ] && \
+      set -- "$@" --build-arg "PJPROJECT_REPOSITORY=$PJPROJECT_REPOSITORY"
+    [ -n "${ASTERISK_REPOSITORY:-}" ] && \
+      set -- "$@" --build-arg "ASTERISK_REPOSITORY=$ASTERISK_REPOSITORY"
+    "$@" -t "$ENGINE_IMAGE" "$REPO_DIR/engine"
     # Keep the full build as the base every future overlay starts from, so repeated updates
     # stack one layer on a known-good image instead of a layer per update.
     docker tag "$ENGINE_IMAGE" "$ENGINE_BASE_TAG" >/dev/null 2>&1 || true
+    ENGINE_IMAGE_CHANGED=1
   fi
   info "engine image built"
+}
+
+# v1.4.1's updater deliberately invokes the newly applied installer with --no-engines because
+# distributed Engine images did not exist yet. A release-only checksum manifest lets the new
+# installer recognise that one transition, reuse the old updater's still-live route list, and
+# import the matching Release asset instead of silently leaving the old Engine behind.
+engine_matches_checkout() {
+  docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || return 1
+  runtime_fp=$(engine_fingerprint runtime)
+  base_fp=$(engine_fingerprint base)
+  [ "$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.runtime-fp)" = "$runtime_fp" ] && \
+    [ "$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.base-fp)" = "$base_fp" ]
+}
+
+handoff_release_engine() {
+  have python3 || die "python3 is required to import the Release Engine asset"
+  version=$(tr -d '\n' < "$REPO_DIR/VERSION")
+  repository=${MDD_UPDATE_REPOSITORY:-MddIdd/mdd-sim-gateway}
+  network_file="$MDD_DATA_DIR/update/network.json"
+  if [ -f "$network_file" ]; then
+    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
+      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
+      --repository "$repository" --network-config "$network_file" --engine-handoff) || \
+      die "could not import the Engine Release asset"
+  else
+    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
+      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
+      --repository "$repository" --engine-handoff) || \
+      die "could not import the Engine Release asset"
+  fi
+  [ -n "$distributed" ] || die "Engine Release handoff returned no image"
+  MDD_ENGINE_DISTRIBUTION_IMAGE=$distributed
+  export MDD_ENGINE_DISTRIBUTION_IMAGE
+  info "old updater handed off to verified Release Engine asset $distributed"
 }
 
 # Overlay the runtime-owned files onto $1 and retag the result as the engine image. Needs no
@@ -648,6 +718,7 @@ engine_overlay_build() {
     docker tag "$ENGINE_IMAGE" "$ENGINE_IMAGE:previous" >/dev/null 2>&1
   docker build --build-arg "BASE_IMAGE=$overlay_base" \
     --build-arg "RUNTIME_FP=$overlay_runtime_fp" --build-arg "BASE_FP=$overlay_base_fp" \
+    --build-arg "MDD_VERSION=$(tr -d '\n' < "$REPO_DIR/VERSION")" \
     -t "$ENGINE_IMAGE" -f "$REPO_DIR/engine/Dockerfile.overlay" "$REPO_DIR/engine"
 }
 
@@ -740,11 +811,12 @@ setup_venv() {
   # vendored networking stack and lets a fully provisioned host reload offline. Only a genuinely
   # missing or changed dependency needs the package index. Do not upgrade pip on every reload;
   # replacing the installer itself creates needless network and compatibility risk.
-  if "$VENV_DIR/bin/pip" install --quiet --no-index \
+  if "$VENV_DIR/bin/python" -m pip install --quiet --no-index \
       -r "$REPO_DIR/control/requirements.txt" >/dev/null 2>&1; then
     info "control requirements already satisfied — reusing the installed packages"
   else
-    "$VENV_DIR/bin/pip" install --quiet wheel -r "$REPO_DIR/control/requirements.txt"
+    "$VENV_DIR/bin/python" -m pip install --quiet wheel \
+      -r "$REPO_DIR/control/requirements.txt"
   fi
   info "venv ready"
 }
@@ -983,6 +1055,9 @@ run_control() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /run/pcscd:/run/pcscd \
     -v /run/dbus:/run/dbus:ro \
+    -v /usr/local/bin/sing-box:/usr/local/bin/sing-box:ro \
+    -v /usr/local/bin/xray:/usr/local/bin/xray:ro \
+    -v "${REPO_DIR}/host:/app/host:ro" \
     -v "${DATA_ABS}:/data" \
     -e MDD_DATA=/data \
     -e MDD_HOST_DATA="${DATA_ABS}" \
@@ -992,7 +1067,21 @@ run_control() {
     -e MDD_MANAGER_URL="https://host.docker.internal:${MDD_PORT}" \
     -e MDD_ENGINE_IMAGE="${ENGINE_IMAGE}" \
     -e MDD_PCSCD_DIR=/run/pcscd \
+    -e MDD_SINGBOX_BIN=/usr/local/bin/sing-box \
+    -e MDD_XRAY_BIN=/usr/local/bin/xray \
     "$CONTROL_IMAGE"
+}
+
+# Re-scan present cards after old engine containers have been removed. Restart only the control
+# plane: restarting the orchestrator here would also rebuild pcscd while new engines start.
+restart_control_plane() {
+  if [ "$MODE" = local ]; then
+    have systemctl || return 1
+    systemctl restart mdd-sim-gateway-control || return 1
+  else
+    managed_control_exists || return 1
+    docker restart "$CONTROL_NAME" >/dev/null || return 1
+  fi
 }
 
 # ------------------------------------------------------------------ subcommands
@@ -1036,6 +1125,7 @@ cmd_install() {
     run_control_local
   fi
   run_orchestrator
+  rm -f "$ENGINE_HANDOFF_MANIFEST"
   DATA_ABS=$(data_dir_abs)
   LAN_IP="${MDD_ADVERTISE_ADDR:-$(detect_lan_ip)}"
   printf '\n'
@@ -1075,6 +1165,21 @@ cmd_reload() {
   ensure_singbox
   ensure_xray
   ensure_cellular_tools
+  ENGINE_IMAGE_CHANGED=0
+  if [ "$PRESERVE_ENGINES" = 1 ] && [ -f "$ENGINE_HANDOFF_MANIFEST" ]; then
+    if engine_matches_checkout; then
+      info "installed engine already matches the release handoff — preserving it"
+    elif [ "$(host_arch)" != arm64 ]; then
+      # Release image assets are ARM64-only. The old updater still passes --no-engines on
+      # amd64, so explicitly release that preservation request and let the normal native
+      # overlay/build path refresh the Engine instead of importing an incompatible archive.
+      info "no distributed Engine asset for $(host_arch) — refreshing the native image locally"
+      PRESERVE_ENGINES=0
+    else
+      handoff_release_engine
+      PRESERVE_ENGINES=0
+    fi
+  fi
   if [ "$PRESERVE_ENGINES" = 1 ]; then
     docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || \
       die "--no-engines requires the existing engine image $ENGINE_IMAGE"
@@ -1095,10 +1200,31 @@ cmd_reload() {
     run_control_local
   fi
   run_orchestrator
-  if [ "$RECREATE_ENGINES" = 1 ]; then
-    warn "engines will be re-created by the control plane on next start/provision (image updated)"
-    for n in $(engine_names); do docker rm -f "$n" >/dev/null 2>&1 || true; done
+  # A container keeps the image it was started from, so re-creating them is not optional once
+  # the image has changed — skipping it leaves every line running the previous engine while
+  # the control plane reports the new version. That mismatch is invisible from the UI and was
+  # reported as a broken feature rather than a stale image, so decide it from what actually
+  # happened instead of from a flag the operator has to know to pass. --no-engines still wins
+  # for an operator; only the release-only v1.4.1 handoff marker overrides it above.
+  if [ "$RECREATE_ENGINES" = 1 ] || [ "$ENGINE_IMAGE_CHANGED" = 1 ]; then
+    removed=0
+    for n in $(engine_names); do
+      docker rm -f "$n" >/dev/null 2>&1 && removed=$((removed + 1)) || true
+    done
+    # A disappearing container is reported as STOPPED and does not enter health recovery. A
+    # control-plane restart starts with an empty card table, so its first reader scan treats each
+    # present SIM as an insertion and starts the missing engine. Engines not removed remain alone.
+    if [ "$removed" -gt 0 ]; then
+      info "removed $removed engine container(s) built on the previous image"
+      if restart_control_plane; then
+        info "control plane restarted — present SIM lines are starting their new engines"
+      else
+        warn "could not restart the control plane; removed engines remain down until it restarts"
+        warn "run: $0 restart"
+      fi
+    fi
   fi
+  rm -f "$ENGINE_HANDOFF_MANIFEST"
   info "reload complete (data preserved)"
 }
 

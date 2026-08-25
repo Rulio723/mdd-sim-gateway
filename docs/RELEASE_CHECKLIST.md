@@ -5,14 +5,23 @@
 - `VERSION`、WebUI `package.json` 与标签保持一致（例如 `1.0.0` / `v1.0.0`）。
 - `CHANGELOG.md` 将目标版本从 `Unreleased` 改为发布日期。
 - CI 的 Python 测试、WebUI 构建、生产依赖审计和脚本语法检查全部通过。
-- Release 必须包含 `mdd-sim-gateway-control-vX.Y.Z-arm64.tar.gz`，且
-  `SHA256SUMS` 同时覆盖源码包和控制镜像。发布前用 `docker load` 验证资产为
-  `linux/arm64`、版本 label 与 `VERSION` 一致；不得只发源码包。
+- Release 必须包含 `mdd-sim-gateway-control-vX.Y.Z-arm64.tar.gz` 和
+  `mdd-sim-gateway-engine-vX.Y.Z-arm64.tar.gz`，且 `SHA256SUMS` 同时覆盖源码包和两个
+  镜像。发布前用 `docker load` 验证资产为 `linux/arm64`、版本 label 与 `VERSION`
+  一致；不得只发源码包。
+- Release 工作流必须在原生 `ubuntu-24.04-arm` runner 无缓存构建 Engine，通过模块数、
+  Python 依赖和 Asterisk 版本检查，并推送
+  `ghcr.io/mddidd/mdd-sim-gateway-engine:vX.Y.Z`；package job 必须等待该 job 成功。
 - 依赖版本、源码提交与二进制 SHA-256 已复核；不得临时改成浮动分支或 `latest`。
 
 ## ARM64 实机验收
 
-- 在目标 ARM64 主机执行一次无缓存 Engine 镜像完整构建，并在镜像内运行 `pip check` 与关键模块导入检查；这是发标签前的硬性门槛，不能用 GitHub x86 runner 的 Dockerfile 静态检查替代。
+- 在目标 ARM64 设备通过一键更新下载本次 Engine Release 资产，确认直连失败或过慢时能
+  切换到代理，核对架构、版本和源码指纹，并完成一次真实 SIM 线路重建与注册；编译由原生
+  ARM64 CI 完成，设备本身不得重新编译镜像。另行抽查同版本 GHCR 镜像身份一致。
+- 必须另从仍运行 `v1.4.1` 旧升级器的设备直接升级到本版本，确认源码包内的一次性 Engine
+  接力清单生效：不要求先安装桥接版本，不直连 GHCR，也不能因旧升级器的 `--no-engines`
+  参数留下旧镜像。
 - 全新安装与重复安装均成功，断电重启后管理面自动启动。
 - ModemManager/NetworkManager、pcscd、sing-box、lpac 状态符合预期。
 - 已有 Docker 与外部容器保持不变；MDD 容器均带归属标签，端口冲突会安全中止。
@@ -28,18 +37,18 @@
 ## 隐私与发布
 
 - 订阅者标识符（IMSI、ICCID、IMEI、号码）由 `tools/check-subscriber-identifiers.sh` 自动扫描，
-  CI 与发布流程均已强制执行，无需手工核对。**本条曾作为纯手工步骤连续十五个版本未被执行**
-  （v1.3.1–v1.3.15 均含参考网关的真实号码、ICCID 与 IMEI），因此改为自动化。
+  CI 与发布流程均已强制执行，无需手工核对。
 - 仍需人工检查脚本覆盖不到的部分：EID、PIN、Token、订阅地址、私钥，以及截图内容。
 - `data/`、`.env`、证书、pcap、数据库、构建目录和本机日志未被 Git 跟踪。
 - 截图仅使用空状态、虚构数据，或已经逐项遮挡设备、线路、运营商、国家出口、号码与消息内容并经人工复核的真实页面。
 - 先创建私有仓库完成内部验收；最终确认后再决定是否公开。
-- 推送已签名的 `vX.Y.Z` 标签；Release 工作流会生成源码包、ARM64 控制镜像与
-  同时覆盖两者的 `SHA256SUMS`。
+- 推送已签名的 `vX.Y.Z` 标签；Release 工作流会生成源码包、ARM64 控制镜像、ARM64 Engine
+  镜像及同时覆盖三者的 `SHA256SUMS`，并把同一 Engine 发布到 GHCR 和 Release 资产。
 - **Release 说明改写为简短的中英双语，中文在前、英文在后，两者内容一致。**
   工作流用 `--generate-notes` 只生成提交列表，那是给写代码的人看的，不是给升级的人看的；
   发布后必须用 `gh release edit vX.Y.Z --notes-file <文件>` 替换。每条按
-  「症状 → 原因 → 现在的行为」写一到三句：使用者据此判断该不该升级，而提交标题做不到这件事。
+  「症状 → 原因 → 现在的行为」写一到两句：使用者据此判断该不该升级，而提交标题做不到这件事。
   若本版未重建引擎镜像，在结尾注明，免得对方做多余的构建。
+- 发布 Release 后，在 `update-policy.json` 的 `release` 中填写该版本，并按发布内容明确标记为 `main`（包含功能变化）或 `patch`（仅修复）；这个分类只控制“仅主版本”的筛选，不代表允许自动安装。先完成观察和实机验证，只有决定向已主动开启自动更新的设备推送时，才在 `auto_update` 中另行填写同一目标版本和 UTC `not_before`；二者必须与当前最新正式 Release 完全一致。发现回归时清空自动更新许可即可阻止尚未开始的设备安装。
 - ARM64 交叉构建时，WebUI 阶段必须保持在 Docker `BUILDPLATFORM` 原生架构；前端产物是
   与架构无关的静态文件，不得在 GitHub x86 Runner 的 ARM64 QEMU 中执行 `npm ci`。

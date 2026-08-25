@@ -68,6 +68,9 @@ When installation completes, open `https://<gateway-address>:8443` and create th
   country. sing-box owns the isolated TUNs; Xray-core carries Reality/XHTTP nodes. VoWiFi fails
   closed unless the selected exit passes a runtime UDP check.
 - Send standard/custom Webhooks, Telegram notifications and PushPlus messages.
+- Check releases every six hours in the background and notify on every release or only on
+  major/minor feature updates. Automatic installation is opt-in and requires a separate,
+  time-gated promotion after the GitHub Release is published.
 - Telegram is notification-only and does not accept remote control commands.
 - Manage eUICC profiles through a pinned local lpac build, including dual-SE readers.
 - Offer HTTPS, first-run administrator setup, CSRF protection, login throttling, local backups,
@@ -137,7 +140,7 @@ SOCKS5 details. A separate UDP probe is mandatory because IKEv2/ESP NAT traversa
   cryptographic material. Review every bundle before sharing it.
 - The product has no analytics or telemetry. Network requests occur only for configured
   carrier/IMS operation, subscriptions, notifications, eSIM provisioning, dependency installation
-  and explicit release checks.
+  and periodic release/promotion checks.
 - Do not expose Docker, ModemManager, pcscd, SIP, AMI or the management port directly to the
   public Internet. Prefer a trusted LAN or VPN and a trusted TLS certificate.
 

@@ -1,8 +1,13 @@
 """Local administrator authentication for the management UI.
 
 Credentials are stored outside the source tree in ``$MDD_DATA/auth.json``. Passwords use
-stdlib scrypt with a per-install salt. Sessions are memory-only, so a service restart logs all
-browsers out. This is intentional for an appliance control surface.
+stdlib scrypt with a per-install salt.
+
+Sessions survive a restart. They used to be memory-only, which reads as deliberate until you
+count the restarts: replacing an engine image, reloading and every self-update all restart the
+control plane, so an appliance that is otherwise untouched logs its administrator out several
+times a day. Only a hash of each token is written to ``$MDD_DATA/sessions.json``, so the file
+cannot be replayed as a cookie by anyone who reads it.
 """
 from __future__ import annotations
 
@@ -17,11 +22,72 @@ import time
 from . import config as cfg
 
 AUTH_PATH = os.path.join(cfg.DATA_DIR, "auth.json")
+SESSIONS_PATH = os.path.join(cfg.DATA_DIR, "sessions.json")
 SESSION_COOKIE = "mdd_session"
 SESSION_TTL = 12 * 60 * 60
+# "Remember me" is for the browser someone administers the gateway from; the short default
+# stays for everyone else.
+SESSION_TTL_REMEMBER = 30 * 24 * 60 * 60
+# Every request slides its session forward. Writing that to disk each time would rewrite the
+# file continuously on an SD card for no benefit, so persist only once the expiry has really
+# moved. A restart therefore costs at most this much of a session's remaining life.
+SESSION_PERSIST_SKEW = 10 * 60
+# Keyed by the token's hash, never the token itself.
 _sessions: dict[str, dict] = {}
 _failures: dict[str, list[float]] = {}
 _lock = threading.RLock()
+
+
+def _token_key(token: str) -> str:
+    """Look a session up by digest so the stored file is not a list of usable cookies."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _write_json(path: str, payload: dict) -> None:
+    os.makedirs(cfg.DATA_DIR, exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def _save_sessions() -> None:
+    """Persist the live sessions. Callers already hold the lock."""
+    try:
+        _write_json(SESSIONS_PATH, {"version": 1, "sessions": _sessions})
+    except OSError:
+        # A session that cannot be written is still valid in this process; losing it on the
+        # next restart is not a reason to refuse the login that is happening now.
+        pass
+
+
+def _load_sessions() -> None:
+    global _sessions
+    try:
+        with open(SESSIONS_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return
+    stored = data.get("sessions") if isinstance(data, dict) else None
+    if not isinstance(stored, dict):
+        return
+    now = time.time()
+    live = {}
+    for key, item in stored.items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            expires = float(item["expires"])
+            ttl = float(item.get("ttl") or SESSION_TTL)
+        except (KeyError, TypeError, ValueError):
+            continue
+        csrf = item.get("csrf")
+        if not isinstance(csrf, str) or not csrf or expires <= now:
+            continue
+        live[str(key)] = {"csrf": csrf, "expires": expires, "ttl": ttl}
+    with _lock:
+        _sessions = live
 
 
 def _read() -> dict:
@@ -80,7 +146,8 @@ def throttled(peer: str) -> int:
     return max(0, 60 - int(now - attempts[-1])) if len(attempts) >= 5 else 0
 
 
-def login(username: str, password: str, peer: str) -> tuple[str, str] | None:
+def login(username: str, password: str, peer: str,
+          remember: bool = False) -> tuple[str, str] | None:
     data = _read()
     try:
         expected = bytes.fromhex(data["password_hash"])
@@ -95,26 +162,39 @@ def login(username: str, password: str, peer: str) -> tuple[str, str] | None:
             return None
         _failures.pop(peer, None)
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
-        _sessions[token] = {"csrf": csrf, "expires": time.time() + SESSION_TTL}
+        ttl = float(SESSION_TTL_REMEMBER if remember else SESSION_TTL)
+        _sessions[_token_key(token)] = {"csrf": csrf, "expires": time.time() + ttl,
+                                        "ttl": ttl}
+        _save_sessions()
         return token, csrf
 
 
 def session(token: str | None) -> dict | None:
     if not token:
         return None
+    key = _token_key(token)
     with _lock:
-        item = _sessions.get(token)
-        if not item or item["expires"] < time.time():
-            _sessions.pop(token, None)
+        item = _sessions.get(key)
+        now = time.time()
+        if not item or item["expires"] < now:
+            if _sessions.pop(key, None) is not None:
+                _save_sessions()
             return None
-        item["expires"] = time.time() + SESSION_TTL
+        renewed = now + item.get("ttl", SESSION_TTL)
+        # Only touch the disk once the window has genuinely moved on; see SESSION_PERSIST_SKEW.
+        if renewed - item["expires"] >= SESSION_PERSIST_SKEW:
+            item["expires"] = renewed
+            _save_sessions()
+        else:
+            item["expires"] = renewed
         return dict(item)
 
 
 def logout(token: str | None) -> None:
     if token:
         with _lock:
-            _sessions.pop(token, None)
+            if _sessions.pop(_token_key(token), None) is not None:
+                _save_sessions()
 
 
 def change_password(current_password: str, new_password: str) -> None:
@@ -140,3 +220,8 @@ def change_password(current_password: str, new_password: str) -> None:
     os.replace(temporary, AUTH_PATH)
     with _lock:
         _sessions.clear()
+        _save_sessions()
+
+
+# A restart must not log the administrator out; see the module docstring.
+_load_sessions()

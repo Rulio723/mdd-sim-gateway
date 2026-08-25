@@ -2,7 +2,131 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
-## [Unreleased]
+## [1.5.1] - 2026-08-26
+
+### Fixed
+
+- The balance and allowance page told users with an unknown carrier query method to configure
+  it on the Messages page, even though that editor had moved away with the old Messages-page
+  integration. Query settings are now available directly on the balance and allowance card,
+  and attempting a query without a rule expands the editor in place.
+
+- [Issue #13](https://github.com/MddIdd/mdd-sim-gateway/issues/13): an amd64 host upgrading
+  from v1.4.1 downloaded the ARM64 Engine Release asset, then failed only after the source had
+  already been replaced because the imported image could not pass the host-architecture check.
+  Release image assets now remain ARM64-only by design, while amd64 upgrades skip them and refresh
+  or build native Engine and Docker-control images locally. The v1.4.1 handoff also overrides its
+  old `--no-engines` request on amd64 so the previous Engine cannot be left behind.
+
+- A locally preserved virtual environment whose `pip` launcher had lost its executable bit made
+  reload fail even though the Python interpreter and installed dependencies were healthy. Reload
+  now invokes pip through the virtual environment's interpreter, avoiding that unnecessary
+  dependency on the wrapper script's mode.
+
+## [1.5.0] - 2026-08-26
+
+### Added
+
+- Balance and number keeping, on one page. A carrier reclaims a number that never bills, and
+  nothing here tracked that: balance was buried on two other screens and activity was not
+  shown at all. The page answers whether each number is still on a network, still funded, and
+  whether anything is keeping it used — and can now keep it used, by producing one real
+  chargeable event on a schedule you set. A prepaid SIM sends a billed SMS; a plan SIM renews
+  itself and instead has its balance watched against the next cycle's fee. A free balance
+  lookup is not usage with most carriers and cannot stand in for either.
+
+  Lines whose SIM is not currently in the gateway are listed separately: they cannot be kept
+  alive, but they are the ones sitting unused, so their expiry is the most useful thing the
+  page can show. They can also be deleted there — ported-away numbers and old test entries
+  accumulate, and a line whose reader is absent could not be reached from the device page.
+
+- Voicemail. An incoming call nobody answers — which, for a SIM kept at home, usually means
+  no browser was open — now records the caller's message instead of ringing out into nothing.
+  Recordings play from the call log beside the call they belong to, and stay on the gateway:
+  they are never attached to a notification and never collected into a support bundle. Off by
+  default, with a per-line override, because recording a caller is the operator's decision
+  rather than something the product should assume. A call declined on the softphone is never
+  recorded.
+
+- Missed calls are announced. Until now the only call notification fired while the phone was
+  still ringing, which is the moment least useful to someone who is not at the browser. A
+  message left after the call replaces that notification rather than adding to it, so one
+  unanswered call cannot buzz a phone twice.
+
+- The control plane now checks releases in the background even when nobody is signed in and
+  can send a deduplicated new-version notice through the configured Webhook, Telegram and
+  PushPlus channels. Administrators can announce every release or only major/minor feature
+  updates, ignoring a patch-only change to the final version component.
+
+- Automatic updates are opt-in and use a separate promotion gate. Publishing a GitHub Release
+  does not authorize unattended installation: the exact latest version and its earliest rollout
+  time must also be approved in `update-policy.json`, allowing a release to soak before rollout.
+
+### Changed
+
+- Push notifications lead with the product name. A notification arrives out of context — on a
+  lock screen, or in a Telegram list beside a dozen other bots — where "未接来电" alone does
+  not say which machine is talking.
+
+- The Engine image now builds Asterisk, pjproject and pcsc-lite in a disposable build stage and
+  copies only their runtime closure into the image sent to the gateway. The ARM64 image is about
+  1.04 GB unpacked instead of 3.22 GB, while retaining the same 334 Asterisk module files; this
+  materially reduces release downloads and gateway system-disk use without narrowing the
+  supported codec or module surface.
+
+- Releases now build the Engine natively on an ARM64 GitHub runner from reviewed mirrors of the
+  pinned sysmocom commits and publish the same versioned image through GHCR and as a checksummed
+  Release asset. One-click update downloads that asset through the same direct-to-proxy fallback
+  as the rest of an update only when Engine inputs changed, verifies its architecture, version
+  and source fingerprints, preserves the previous image for rollback, then recreates only
+  affected lines.
+
+### Fixed
+
+- [Issue #10](https://github.com/MddIdd/mdd-sim-gateway/issues/10): two identical USB readers
+  without serial numbers could assign different live SIMs to the same Instance after reader names
+  changed across a reboot. Live card identity now decides attribution before the saved reader index
+  is refreshed, preserving the one-to-one mapping between SIMs and lines.
+
+- [Issue #12](https://github.com/MddIdd/mdd-sim-gateway/issues/12): recreating the Docker control
+  container during a self-update dropped the sing-box, xray and host-tool mounts used by network
+  exit tests. The installer now restores those mounts and their environment variables every time
+  it recreates the container.
+
+- Signing in again several times a day. Sessions were held in memory only, which reads as a
+  deliberate choice for an appliance until you count the restarts: replacing an Engine image,
+  reloading and every self-update restart the control plane, and each one logged every browser
+  out. Sessions now survive a restart, and the sign-in screen offers to keep the browser signed
+  in for 30 days instead of the 12-hour default. Only a hash of each token is stored, so the
+  file cannot be replayed as a cookie by anyone who can read it, and changing the password
+  still revokes every session everywhere.
+
+- Reloading an updated Engine image no longer leaves every replaced WiFi Calling line stopped.
+  After removing containers that still use the previous image, the installer now restarts only
+  the control plane so its initial reader scan brings each present SIM line back automatically;
+  Engine containers that were not replaced keep running.
+
+- Engine release builds no longer depend on `wget` completing Asterisk's sound downloads without
+  a deadline. Those small upstream assets now use bounded retries, low-speed detection and resume,
+  preventing a transient slow connection from leaving the ARM64 release job hung indefinitely.
+
+- A forced Engine source build had no way to override the reviewed GitHub source mirrors, so an
+  installation network that could reach the pinned upstream sysmocom repositories but not GitHub
+  failed before compilation began. The installer now passes explicitly configured pjproject and
+  Asterisk repository overrides into the Docker build while retaining the reviewed mirrors as the
+  safe default.
+
+- Four backend status messages appeared in English on a Chinese interface, including the one
+  shown when a reader holds another line's SIM — the sentence a user sees precisely when they
+  need to understand a binding mistake. The connectivity timeline could not label that state
+  at all and drew the raw code. Both tables are now checked against the backend by a test,
+  because a missing translation is invisible until someone reaches that exact state.
+
+### Removed
+
+- The 3/2/1-day activation reminder. Number keeping covers what it was for: a plan SIM now
+  reports a balance too low to renew, and every line's expiry is on the page with the same
+  countdown. It only ever fired for lines whose activation date had been filled in by hand.
 
 ## [1.4.1] - 2026-08-22
 

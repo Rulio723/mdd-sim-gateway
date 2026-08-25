@@ -81,7 +81,11 @@ LINE_HISTORY_PRUNE_INTERVAL_SECONDS = 3600
 # Comfortably below store.LINE_STATE_CONTINUITY_SECONDS, so throttled writes still read back
 # as one uninterrupted observation.
 LINE_STATE_WRITE_INTERVAL_SECONDS = 30
+UPDATE_CHECK_INTERVAL_SECONDS = float(os.environ.get("MDD_UPDATE_CHECK_INTERVAL", "21600"))
 _line_state_written: dict[str, tuple[str, float]] = {}
+_line_registered_written: dict[str, float] = {}   # per-line throttle for the durable
+                                                 # "last registered" stamp
+LINE_REGISTERED_WRITE_INTERVAL_SECONDS = 3600
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -449,6 +453,13 @@ class Hub:
         self.status_cache: dict[str, dict] = {}  # background sampled; HTTP never probes devices
         self.status_sampled_at: dict[str, float] = {}  # last authoritative status observation
         self._pushed_calls: set[int] = set() # call-record ids already push-notified (dedupe)
+        # Separate from _pushed_calls: one call legitimately raises BOTH an incoming_call (on
+        # the first INVITE) and a missed_call (when it ends unanswered), so they cannot share
+        # a dedupe set. Keyed by call-record id because call_result retries and can re-enter.
+        self._pushed_missed: set[int] = set()
+        # Lines with a number-keeping run in flight. The claim ledger stops a *restart* from
+        # repeating a run; this stops two pollers in one process from overlapping on one.
+        self._keepalive_running: set[str] = set()
         # Per-reader serialization for PC/SC APDU access (sim.read_card / PIN / lpac).
         # lpac opens SCARD_SHARE_EXCLUSIVE; concurrent connect/APDU on the same reader
         # fails with sharing violations or corrupts eUICC sessions.
@@ -620,9 +631,19 @@ def _random_svn() -> str:
     return f"{random.randint(0, 99):02d}"
 
 
-def _find_running_by_reader(name: str):
+def _find_running_by_reader(
+    name: str,
+    reader_port: str | None = None,
+    *,
+    require_port_match: bool = False,
+):
     """The running instance whose pin_keeper reports using this reader NAME
-    (pin_status.json "reader") — per-reader correct with multiple SIMs."""
+    (pin_status.json "reader") — per-reader correct with multiple SIMs.
+
+    A native reader name is only a transient pcscd enumeration identity. During insertion
+    attribution callers that know the live USB port must also verify it against the line's
+    saved port; otherwise two identical serial-less readers can exchange names after reboot
+    and make a running engine lend the wrong ICCID to the newly observed card."""
     if not name:
         return None
     for i in cfg.list_instances():
@@ -630,6 +651,14 @@ def _find_running_by_reader(name: str):
             continue
         ps = engine.read_run_json(str(i["id"]), "pin_status.json") or {}
         if ps.get("reader") == name:
+            saved_port = str(i.get("reader_port") or "")
+            live_port = str(reader_port or "")
+            if require_port_match and saved_port and saved_port != live_port:
+                log.warning(
+                    "ignoring stale running-reader claim for instance %s: "
+                    "reader=%s saved_port=%s live_port=%s",
+                    i.get("id"), name, saved_port, live_port or "unresolved")
+                continue
             return i
     return None
 
@@ -681,7 +710,8 @@ async def _on_card_insert(name, idx):
     # using THIS reader name first, and only probe when no running engine claims it.
     # Also skip probing while an LPA (lpac) operation holds the reader exclusively —
     # profile enable/disable triggers eUICC REFRESH that looks like remove+insert.
-    inst = await asyncio.to_thread(_find_running_by_reader, name)
+    inst = await asyncio.to_thread(
+        _find_running_by_reader, name, info.get("reader_port"), require_port_match=True)
     if inst is not None:
         info.update(iccid=inst.get("iccid"), imsi=inst.get("imsi"), matched=inst["id"],
                     smsc=inst.get("smsc"), mcc=inst.get("mcc"), mnc=inst.get("mnc"),
@@ -1374,6 +1404,19 @@ async def _record_line_state(iid: str, st: dict) -> None:
         # History is diagnostic only; never let it interrupt status sampling.
         _line_state_written.pop(iid, None)
         log.debug("line state record failed instance=%s: %r", iid, exc)
+    if kind == "up":
+        # The timeline is pruned after three days, so it cannot answer "when was this number
+        # last on a network" for a SIM kept for number-keeping. Keep one durable timestamp,
+        # refreshed at most hourly: this is a number-keeping fact, not a diagnostic sample,
+        # and the SD card should not pay per status poll for it.
+        last = _line_registered_written.get(iid, 0.0)
+        if time.monotonic() - last >= LINE_REGISTERED_WRITE_INTERVAL_SECONDS:
+            _line_registered_written[iid] = time.monotonic()
+            try:
+                await asyncio.to_thread(store.touch_line_registered, iid)
+            except Exception as exc:  # noqa
+                _line_registered_written.pop(iid, None)
+                log.debug("registered stamp failed instance=%s: %r", iid, exc)
 
 
 def _status_poll_delay(instances: list[dict]) -> float:
@@ -1424,8 +1467,6 @@ HOST_ALERT_REPEAT_SECONDS = float(os.environ.get("MDD_HOST_ALERT_REPEAT", "21600
 # measurement sitting near its threshold crosses back and forth all day and each re-entry
 # looks like a new problem worth notifying about.
 HOST_ALERT_CLEAR_SECONDS = float(os.environ.get("MDD_HOST_ALERT_CLEAR", "1800"))
-ALLOWANCE_REMINDER_POLL_SECONDS = float(
-    os.environ.get("MDD_ALLOWANCE_REMINDER_POLL", "3600"))
 
 HOST_ALERT_TEXT = {
     "undervoltage_now": "供电电压不足（正在发生）。网口、蜂窝模块和读卡器共用同一路供电，"
@@ -1506,41 +1547,8 @@ async def sms_segment_reaper():
             rec = await asyncio.to_thread(store.add_message, iid, "in", group["peer"], body,
                                           ts=group["first_ts"])
             await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+            await asyncio.to_thread(_harvest_allowance_reply, iid, group["peer"])
             _dispatch_push(notify_push.EV_INCOMING_SMS, iid, group["peer"], body)
-
-
-async def allowance_reminder_poller():
-    """Send one reminder per line/expiry/day at 3, 2 and 1 days before expiry."""
-    while True:
-        try:
-            settings = cfg.get_settings()
-            if notify_push.has_enabled_channel(settings, notify_push.EV_ACTIVATION_REMINDER):
-                try:
-                    local_zone = ZoneInfo(str(settings.get("timezone") or "Asia/Shanghai"))
-                except ZoneInfoNotFoundError:
-                    local_zone = ZoneInfo("UTC")
-                now = datetime.now(local_zone)
-                for inst in cfg.list_instances():
-                    iid = str(inst.get("id") or "")
-                    snapshot = await asyncio.to_thread(store.get_allowance, iid)
-                    days = allowance.reminder_days(snapshot, now.date())
-                    expiry = allowance.parse_expiry_date(snapshot.get("valid_until"))
-                    if days is None or expiry is None:
-                        continue
-                    claimed = await asyncio.to_thread(
-                        store.claim_allowance_reminder, iid, expiry.isoformat(), days,
-                        int(now.timestamp()))
-                    if not claimed:
-                        continue
-                    text = (f"线路 {inst.get('name') or iid} 将于 {expiry.isoformat()} 到期，"
-                            f"还剩 {days} 天。激活时间：{snapshot.get('activated_at')}。"
-                            "请及时续期或重新激活。")
-                    await asyncio.to_thread(
-                        notify_push.dispatch, settings, notify_push.EV_ACTIVATION_REMINDER,
-                        inst, expiry.isoformat(), text)
-        except Exception as exc:  # noqa
-            log.debug("allowance reminder poll failed: %r", exc)
-        await asyncio.sleep(max(60.0, ALLOWANCE_REMINDER_POLL_SECONDS))
 
 
 def _host_alert_summary(alerts: list[dict]) -> str:
@@ -1845,6 +1853,8 @@ async def cellular_sms_poller():
                 await hub.broadcast({"type": "sms", "instance": rec["instance"],
                                      "message": rec})
                 if rec["direction"] == "in":
+                    await asyncio.to_thread(_harvest_allowance_reply, rec["instance"],
+                                            rec["peer"])
                     _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
                                    rec["peer"], rec["body"])
         except Exception as exc:  # noqa
@@ -1906,6 +1916,8 @@ async def _poll_instance_status(inst: dict) -> None:
             asyncio.create_task(learn_msisdn(iid))
         elif st["state"] == "OK":
             asyncio.create_task(_verify_ims_msisdn(iid, inst))
+        if st["state"] == "OK":
+            asyncio.create_task(_maybe_run_keepalive(iid, inst))
         st = _with_status_activity(
             iid, apply_health(iid, inst, st, runtime.get("container_id")))
         hub.status_cache[iid] = st
@@ -2183,6 +2195,22 @@ def apply_health(iid, inst, st, container_id: str | None = None):
     return st
 
 
+async def update_automation_poller():
+    """Check releases without requiring a browser login.
+
+    Notification delivery and the promotion-gated auto-update decision are blocking network/
+    filesystem work, so keep them off the API event loop. A short startup delay lets the host
+    finish restoring routes after boot; later checks use the same six-hour cadence as the UI.
+    """
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await asyncio.to_thread(update_check.automation_cycle)
+        except Exception as exc:  # noqa: a failed poll must never take the control plane down
+            log.warning("background update check failed: %s", type(exc).__name__)
+        await asyncio.sleep(max(300, UPDATE_CHECK_INTERVAL_SECONDS))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.init()
@@ -2220,8 +2248,8 @@ async def lifespan(app: FastAPI):
     monitor = asyncio.create_task(card_monitor())
     sms_poller = asyncio.create_task(cellular_sms_poller())
     host_poller = asyncio.create_task(host_health_poller())
-    allowance_poller = asyncio.create_task(allowance_reminder_poller())
     segment_reaper = asyncio.create_task(sms_segment_reaper())
+    update_poller = asyncio.create_task(update_automation_poller())
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
@@ -2229,12 +2257,12 @@ async def lifespan(app: FastAPI):
     monitor.cancel()
     sms_poller.cancel()
     host_poller.cancel()
-    allowance_poller.cancel()
     segment_reaper.cancel()
+    update_poller.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
-    await asyncio.gather(poller, monitor, sms_poller, host_poller, allowance_poller,
-                         segment_reaper, return_exceptions=True)
+    await asyncio.gather(poller, monitor, sms_poller, host_poller,
+                         segment_reaper, update_poller, return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
         await c.close()
@@ -2289,12 +2317,14 @@ def api_auth_setup(body: dict, request: Request):
         auth.setup(str(body.get("password") or ""), str(body.get("username") or "admin"))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    remember = bool(body.get("remember"))
     result = auth.login(str(body.get("username") or "admin"), str(body.get("password") or ""),
-                        request.client.host if request.client else "")
+                        request.client.host if request.client else "", remember=remember)
     token, csrf = result
     response = JSONResponse({"ok": True, "authenticated": True, "csrf": csrf})
-    response.set_cookie(auth.SESSION_COOKIE, token, max_age=auth.SESSION_TTL, httponly=True,
-                        secure=True, samesite="strict", path="/")
+    response.set_cookie(auth.SESSION_COOKIE, token,
+                        max_age=auth.SESSION_TTL_REMEMBER if remember else auth.SESSION_TTL,
+                        httponly=True, secure=True, samesite="strict", path="/")
     return response
 
 
@@ -2307,13 +2337,18 @@ def api_auth_login(body: dict, request: Request):
     if retry:
         return JSONResponse({"detail": "too many attempts", "retry_after": retry},
                             status_code=429, headers={"Retry-After": str(retry)})
-    result = auth.login(str(body.get("username") or "admin"), str(body.get("password") or ""), peer)
+    remember = bool(body.get("remember"))
+    result = auth.login(str(body.get("username") or "admin"), str(body.get("password") or ""),
+                        peer, remember=remember)
     if not result:
         raise HTTPException(401, "invalid username or password")
     token, csrf = result
     response = JSONResponse({"ok": True, "authenticated": True, "csrf": csrf})
-    response.set_cookie(auth.SESSION_COOKIE, token, max_age=auth.SESSION_TTL, httponly=True,
-                        secure=True, samesite="strict", path="/")
+    # The cookie has to outlive the session it names, or the browser discards a credential the
+    # gateway would still have honoured.
+    response.set_cookie(auth.SESSION_COOKIE, token,
+                        max_age=auth.SESSION_TTL_REMEMBER if remember else auth.SESSION_TTL,
+                        httponly=True, secure=True, samesite="strict", path="/")
     return response
 
 
@@ -3915,7 +3950,7 @@ def api_put_settings(body: dict):
             raise HTTPException(400, "unsupported PushPlus template")
     if "updates" in body:
         try:
-            body["updates"] = update_check.validate_network_settings(body.get("updates"))
+            body["updates"] = update_check.validate_update_settings(body.get("updates"))
         except update_check.UpdateNetworkError as exc:
             raise HTTPException(400, str(exc)) from exc
         if body["updates"]["proxy_mode"] == "library":
@@ -4067,6 +4102,9 @@ def api_system_status():
         "system_name": "MDD Sim Gateway",
         "host": host,
         "host_alerts": hub.host_alerts if hub.host_snapshot else sysinfo.alerts(host),
+        # Drives the unread dot on the Calls entry: a message nobody has played is the one
+        # thing on this page the user has to act on rather than merely read.
+        "unheard_voicemails": sum(store.unheard_voicemail_counts().values()),
         "timezone": settings.get("timezone") or "UTC",
         "version": VERSION,
         "repository_url": f"https://github.com/{update_check.repository()}",
@@ -4141,6 +4179,16 @@ async def api_system_backup():
     settings = cfg.get_settings()
     return await asyncio.to_thread(
         operations.create_local_backup, "mdd-sim-gateway")
+
+
+@app.delete("/api/system/backups/{name}")
+async def api_system_backup_delete(name: str):
+    try:
+        return await asyncio.to_thread(operations.delete_local_backup, name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="backup not found") from exc
 
 
 @app.post("/api/system/maintenance")
@@ -4362,6 +4410,7 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
     # Line ids are reused by the next created line, so its connectivity timeline always goes
     # with the line it describes — a new SIM must never inherit another SIM's outages.
     _line_state_written.pop(str(iid), None)
+    _line_registered_written.pop(str(iid), None)
     await asyncio.to_thread(store.clear_line_states, iid)
     await asyncio.to_thread(store.clear_allowance_data, iid)
     _refresh_card_matches()
@@ -4892,7 +4941,7 @@ async def api_allowance_query(iid: str, body: dict):
     rule = _allowance_rule(inst)
     effective = rule.get("effective")
     if not effective:
-        raise HTTPException(409, "allowance query method is unknown; configure it in Messages")
+        raise HTTPException(409, "allowance query method is unknown; configure it in the allowance panel")
     transport = str((body or {}).get("transport") or "auto").lower()
     if transport not in {"auto", "vowifi", "cellular"}:
         raise HTTPException(422, "transport must be auto, vowifi, or cellular")
@@ -4909,6 +4958,483 @@ async def api_allowance_query(iid: str, body: dict):
         "unknown" if result.get("uncertain") else "failed")
     return {"ok": bool(result.get("ok")), "query": query, "rule": rule,
             "send": result}
+
+
+# ----------------------------- Number keeping -----------------------------
+KEEPALIVE_ACTIONS = {"sms", "balance_watch"}
+
+
+def _local_tz() -> ZoneInfo:
+    """The user's configured zone, because "days remaining" is a calendar question."""
+    try:
+        return ZoneInfo(str(cfg.get_settings().get("timezone") or "Asia/Shanghai"))
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def _keepalive_next_due(record: dict, now: int) -> int:
+    """When the next run is owed. Anchored on the last SUCCESSFUL run, not on the last
+    attempt: a line that was offline (or whose send failed) must not have its schedule
+    silently pushed a whole interval into the future."""
+    if not record.get("enabled"):
+        return 0
+    interval = max(1, int(record.get("interval_days") or 30)) * 86400
+    anchor = int(record.get("next_due_ts") or 0)
+    if anchor:
+        return anchor
+    # Never run: first one is owed from the moment it was switched on, which the config save
+    # records by seeding next_due_ts. Fall back to "now" for a record predating that.
+    return now
+
+
+def _keepalive_view(iid: str, record: dict, now: int) -> dict:
+    out = {k: v for k, v in record.items() if k != "instance"}
+    out["enabled"] = bool(record.get("enabled"))
+    out["verify_charge"] = bool(record.get("verify_charge"))
+    due = _keepalive_next_due(record, now)
+    out["next_due_ts"] = due
+    # The same instant as a local calendar date, so the date field round-trips exactly instead
+    # of shifting a day whenever the browser's zone differs from the gateway's.
+    out["next_run_date"] = (datetime.fromtimestamp(due, _local_tz()).date().isoformat()
+                            if due else "")
+    return out
+
+
+def _clean_keepalive(body: dict) -> dict:
+    """Validate a keepalive config. The action costs the user real money on a real SIM, so
+    every field is checked here rather than trusted from the browser."""
+    body = body or {}
+    action = str(body.get("action") or "sms").lower()
+    if action not in KEEPALIVE_ACTIONS:
+        raise HTTPException(422, "action must be sms or balance_watch")
+    raw_interval = body.get("interval_days")
+    try:
+        # `or 30` would turn an explicit 0 into the default and silently schedule a run the
+        # user never asked for. Absent means default; present means it has to be valid.
+        interval = 30 if raw_interval in (None, "") else int(raw_interval)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "interval_days must be a number") from None
+    if not 1 <= interval <= 90:
+        raise HTTPException(422, "interval_days must be between 1 and 90")
+    enabled = 1 if body.get("enabled") else 0
+    sms_to = str(body.get("sms_to") or "").strip()
+    sms_body = str(body.get("sms_body") or "").strip()
+    threshold = str(body.get("threshold") or "").strip()
+    if enabled and action == "sms":
+        if not re.fullmatch(r"\+?[0-9 ()-]{3,32}", sms_to or ""):
+            raise HTTPException(422, "a chargeable SMS needs a valid recipient number")
+        if not sms_body:
+            raise HTTPException(422, "a chargeable SMS needs a body")
+    if len(sms_body) > 160:
+        raise HTTPException(422, "keepalive SMS body must be 160 characters or fewer")
+    clean = {"enabled": enabled, "action": action, "sms_to": sms_to, "sms_body": sms_body,
+             "verify_charge": 1 if body.get("verify_charge", True) else 0,
+             "threshold": threshold, "interval_days": interval}
+    # "When does it first run" and "how often after that" are two different questions, so the
+    # first run is a date the user picks rather than something inferred from the interval.
+    raw_date = str(body.get("next_run_date") or "").strip()
+    if raw_date:
+        try:
+            day = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(422, "next_run_date must be YYYY-MM-DD") from None
+        # Anchor at the start of the execution window on that local date: the run still waits
+        # for the window, and this way the stored time is the one the user will see back.
+        clean["next_due_ts"] = int(datetime(
+            day.year, day.month, day.day, KEEPALIVE_WINDOW[0], 0,
+            tzinfo=_local_tz()).timestamp())
+    return clean
+
+
+KEEPALIVE_WINDOW = (10, 22)          # local hours; never message a carrier at 3am
+KEEPALIVE_BALANCE_REPEAT_SECONDS = 3 * 86400
+KEEPALIVE_FAILURE_RETRY_SECONDS = 3600
+KEEPALIVE_RECONCILE_ATTEMPTS = 6     # ~2 minutes, matching allowance.QUERY_WINDOW_SECONDS
+KEEPALIVE_RECONCILE_INTERVAL = 20
+
+
+def _parse_money(value: object) -> float | None:
+    """Pull a comparable number out of a carrier's own wording ("£4.20", "4.20 GBP", "$12").
+
+    Balances are stored as display strings on purpose, so this is best-effort: when it cannot
+    be read the balance is shown and never judged, rather than guessed at.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"-?\d+(?:[.,]\d+)?", text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _keepalive_in_window(now_local: datetime) -> bool:
+    return KEEPALIVE_WINDOW[0] <= now_local.hour < KEEPALIVE_WINDOW[1]
+
+
+def _keepalive_slot(due_ts: int) -> str:
+    """Identity of one scheduled run: its due timestamp.
+
+    Not the due DATE. The claim has to survive a restart mid-run — that is the double-charge
+    it exists to prevent — while still letting a failed run be retried by the backoff, which
+    lands on the same day. Keying on the timestamp gives both: a retry has a new due time and
+    therefore a new slot, whereas a restart re-reads the same one and is refused.
+    """
+    return str(int(due_ts))
+
+
+async def _keepalive_reconcile_reply(iid: str) -> dict:
+    """Harvest the carrier's reply to a query WE started.
+
+    allowance.reconcile() is pull-only — the browser polling GET /allowance is what normally
+    drives it. A scheduled run has no browser, so without this the reply would sit in the
+    message log until it fell outside the two-minute window and the query expired unread.
+    """
+    snapshot = await asyncio.to_thread(allowance.reconcile, iid)
+    for _ in range(KEEPALIVE_RECONCILE_ATTEMPTS):
+        query = await asyncio.to_thread(store.latest_allowance_query, iid)
+        if (query or {}).get("status") == "parsed":
+            break
+        await asyncio.sleep(KEEPALIVE_RECONCILE_INTERVAL)
+        snapshot = await asyncio.to_thread(allowance.reconcile, iid)
+    return snapshot
+
+
+async def _keepalive_send_sms(iid: str, inst: dict, record: dict) -> tuple[str, str]:
+    """Produce one chargeable event on the SIM. Returns (status, detail)."""
+    to, text = record.get("sms_to") or "", record.get("sms_body") or ""
+    if not to or not text:
+        return "failed", "保号短信未配置收件号码或内容"
+    result = await send_sms_on_line(iid, to, text, "auto")
+    if result.get("unavailable") or not result.get("ok"):
+        error = result.get("error") or "发送失败"
+        if result.get("uncertain"):
+            # Submitted but unacknowledged: the charge may well have happened, so this is not
+            # reported as a failure the user should act on.
+            return "sent_unconfirmed", f"已提交但未收到确认：{error}"
+        return "failed", str(error)
+    detail = f"计费短信已发往 {to}"
+    if record.get("verify_charge"):
+        before = _parse_money((await asyncio.to_thread(store.get_allowance, iid)).get("balance"))
+        rule = allowance.query_rule(inst, carrier_id.lookup(inst))
+        effective = (rule or {}).get("effective")
+        if effective:
+            try:
+                query = await asyncio.to_thread(
+                    store.start_allowance_query, iid, effective["recipient"],
+                    effective["body"], rule.get("carrier_key") or "", "auto")
+                probe = await send_sms_on_line(iid, effective["recipient"],
+                                               effective["body"], "auto")
+                await asyncio.to_thread(
+                    store.set_allowance_query_status, query["id"],
+                    "sent" if probe.get("ok") else "failed")
+                if probe.get("ok"):
+                    after = _parse_money((await _keepalive_reconcile_reply(iid)).get("balance"))
+                    if before is not None and after is not None and after < before:
+                        detail += f"，余额 {before:g}→{after:g}"
+                    elif after is not None:
+                        # An unchanged balance is NOT a failure: a plan with bundled texts
+                        # bills the usage without moving the wallet.
+                        detail += "，余额未变（套餐内短信）"
+            except Exception as exc:  # noqa
+                log.debug("keepalive charge verification failed instance=%s: %r", iid, exc)
+    return "ok", detail
+
+
+async def _keepalive_watch_balance(iid: str, inst: dict, record: dict) -> tuple[str, str]:
+    """A plan SIM renews itself; what needs watching is whether it can pay the next cycle."""
+    rule = allowance.query_rule(inst, carrier_id.lookup(inst))
+    effective = (rule or {}).get("effective")
+    if not effective:
+        return "failed", "该线路没有余额查询规则"
+    query = await asyncio.to_thread(
+        store.start_allowance_query, iid, effective["recipient"], effective["body"],
+        rule.get("carrier_key") or "", "auto")
+    result = await send_sms_on_line(iid, effective["recipient"], effective["body"], "auto")
+    await asyncio.to_thread(store.set_allowance_query_status, query["id"],
+                            "sent" if result.get("ok") else "failed")
+    if not result.get("ok"):
+        return "failed", str(result.get("error") or "余额查询发送失败")
+    snapshot = await _keepalive_reconcile_reply(iid)
+    balance_text = snapshot.get("balance") or ""
+    balance = _parse_money(balance_text)
+    threshold = _parse_money(record.get("threshold"))
+    if balance is None or threshold is None:
+        # Shown, never judged: guessing at an unparseable balance would raise false alarms.
+        return "ok", (f"余额 {balance_text}（未设阈值或无法解析，仅展示）" if balance_text
+                      else "已查询，但未能解析余额")
+    if balance < threshold:
+        return "balance_low", f"余额 {balance_text} 低于阈值 {record.get('threshold')}"
+    return "ok", f"余额 {balance_text} 高于阈值 {record.get('threshold')}"
+
+
+async def _run_keepalive(iid: str, inst: dict, record: dict, *, manual: bool = False) -> dict:
+    """Execute one scheduled action. Never raises: this runs from the status poller."""
+    now = int(time.time())
+    action = str(record.get("action") or "sms")
+    try:
+        if action == "balance_watch":
+            status, detail = await _keepalive_watch_balance(iid, inst, record)
+        else:
+            status, detail = await _keepalive_send_sms(iid, inst, record)
+    except Exception as exc:  # noqa
+        log.warning("keepalive run failed instance=%s: %r", iid, exc)
+        status, detail = "failed", f"执行异常：{exc}"
+
+    state = {"last_run_ts": now, "last_status": status, "last_detail": detail}
+    interval = max(1, int(record.get("interval_days") or 30)) * 86400
+    if status in {"ok", "sent_unconfirmed", "balance_low"}:
+        state["next_due_ts"] = now + interval
+    else:
+        # A failure did not produce the chargeable event the number needs, so it is retried
+        # rather than left for another full interval. Backed off an hour: the poller runs
+        # every few seconds and the failure is usually something slow to fix (no registration,
+        # no route), not something the next poll will resolve.
+        state["next_due_ts"] = now + KEEPALIVE_FAILURE_RETRY_SECONDS
+    settings = cfg.get_settings()
+    if status == "balance_low":
+        low_since = int(record.get("balance_low_since") or 0) or now
+        last_notified = int(record.get("balance_low_last_notified") or 0)
+        state["balance_low_since"] = low_since
+        if now - last_notified >= KEEPALIVE_BALANCE_REPEAT_SECONDS:
+            state["balance_low_last_notified"] = now
+            await asyncio.to_thread(
+                notify_push.dispatch, settings, notify_push.EV_BALANCE_LOW, inst,
+                inst.get("msisdn") or "", f"{detail}。请及时充值，否则套餐可能无法续费。")
+    else:
+        # Recovered: forget the episode so the next dip notifies immediately.
+        state["balance_low_since"] = 0
+        state["balance_low_last_notified"] = 0
+    # A successful chargeable run is announced because it spent the user's money on their SIM.
+    # A failure is announced when it STARTS failing: it now retries hourly, and repeating the
+    # same bad news every hour is how a notification channel gets muted.
+    announce = (status != "failed" and action == "sms") or (
+        status == "failed" and str(record.get("last_status") or "") != "failed")
+    if announce:
+        verb = {"ok": "成功", "sent_unconfirmed": "已提交未确认"}.get(status, "失败")
+        text = f"保号{verb}：{detail}"
+        if state.get("next_due_ts"):
+            text += f"。下次执行 {datetime.fromtimestamp(state['next_due_ts'], _local_tz()):%Y-%m-%d %H:%M}"
+        await asyncio.to_thread(
+            notify_push.dispatch, settings, notify_push.EV_KEEPALIVE_RESULT, inst,
+            inst.get("msisdn") or "", text)
+    updated = await asyncio.to_thread(store.save_keepalive_state, iid, state)
+    log.info("keepalive %s instance=%s status=%s: %s",
+             "manual run" if manual else "run", iid, status, detail)
+    return updated
+
+
+async def _maybe_run_keepalive(iid: str, inst: dict) -> None:
+    """Called from the status poller when the line is registered.
+
+    Parasitic on the poller rather than a task of its own, exactly like _verify_ims_msisdn:
+    it inherits "only ever act on a line that is actually up" for free, and an offline line
+    simply never reaches this point.
+    """
+    try:
+        record = await asyncio.to_thread(store.get_keepalive, iid)
+        if not record.get("enabled"):
+            return
+        now = int(time.time())
+        due = int(record.get("next_due_ts") or 0)
+        if not due or now < due:
+            return
+        if not _keepalive_in_window(datetime.now(_local_tz())):
+            return
+        if iid in hub._keepalive_running:
+            return
+        claimed = await asyncio.to_thread(store.claim_keepalive_run, iid,
+                                          _keepalive_slot(due), now)
+        if not claimed:
+            return
+        hub._keepalive_running.add(iid)
+        try:
+            await _run_keepalive(iid, inst, record)
+        finally:
+            hub._keepalive_running.discard(iid)
+    except Exception as exc:  # noqa
+        log.debug("keepalive scheduling failed instance=%s: %r", iid, exc)
+
+
+@app.post("/api/instances/{iid}/keepalive/run")
+async def api_keepalive_run(iid: str):
+    """Run it now, ignoring the schedule but not the safety rules."""
+    inst = _allowance_instance(iid)
+    record = await asyncio.to_thread(store.get_keepalive, str(iid))
+    if str(iid) in hub._keepalive_running:
+        raise HTTPException(409, "a number-keeping run is already in progress")
+    hub._keepalive_running.add(str(iid))
+    try:
+        updated = await _run_keepalive(str(iid), inst, record, manual=True)
+    finally:
+        hub._keepalive_running.discard(str(iid))
+    return {"keepalive": _keepalive_view(str(iid), updated, int(time.time()))}
+
+
+@app.get("/api/instances/{iid}/keepalive")
+def api_keepalive(iid: str):
+    _allowance_instance(iid)
+    return {"keepalive": _keepalive_view(str(iid), store.get_keepalive(str(iid)),
+                                         int(time.time()))}
+
+
+@app.put("/api/instances/{iid}/keepalive")
+def api_keepalive_save(iid: str, body: dict):
+    """Deliberately NOT routed through POST /api/instances: that restarts a running engine on
+    any save, and the engine has no use for this setting."""
+    _allowance_instance(iid)
+    values = _clean_keepalive(body)
+    now = int(time.time())
+    previous = store.get_keepalive(str(iid))
+    chosen_due = values.pop("next_due_ts", None)
+    if not values["enabled"]:
+        store.save_keepalive_state(str(iid), {"next_due_ts": 0})
+    elif chosen_due is not None:
+        store.save_keepalive_state(str(iid), {"next_due_ts": chosen_due})
+    elif not previous.get("enabled"):
+        # Switched on without naming a date: run at the next opportunity rather than making
+        # the user wait a whole interval to find out whether it works.
+        store.save_keepalive_state(str(iid), {"next_due_ts": now})
+    record = store.save_keepalive_config(str(iid), values)
+    return {"keepalive": _keepalive_view(str(iid), record, now)}
+
+
+@app.get("/api/keepalive/summary")
+async def api_keepalive_summary():
+    """One aggregate for the whole page: at most five lines, so a per-line fan-out of four
+    requests each would be pure overhead."""
+    now = int(time.time())
+    rows = []
+    for inst in cfg.list_instances():
+        iid = str(inst["id"])
+        status = _cached_line_status(inst)
+        record = await asyncio.to_thread(store.get_keepalive, iid)
+        snapshot = await asyncio.to_thread(store.get_allowance, iid)
+        recorded_since = await asyncio.to_thread(store.line_state_recorded_since, iid)
+        span = _availability_window(now, recorded_since)
+        segments = await asyncio.to_thread(store.line_state_timeline, iid, now - span, now)
+        summary = store.line_state_summary(segments)
+        rule = allowance.query_rule(inst, carrier_id.lookup(inst))
+        expiry = allowance.parse_expiry_date(snapshot.get("valid_until"))
+        carrier = carrier_id.lookup(inst) or {}
+        # Whether this SIM is physically in the gateway right now. There are always more
+        # configured lines than card slots, and a SIM that is out of the box cannot be sent
+        # anything — offering it a keepalive switch would promise something undeliverable.
+        # Its expiry still matters, though: an unused SIM is the one a carrier reclaims.
+        # A running engine is holding the SIM by definition, and unlike the card table it
+        # survives a control-plane restart: hub.cards is rebuilt by the PC/SC monitor, so for
+        # the first seconds after a restart it is empty and every line would otherwise report
+        # itself as out of the gateway.
+        in_gateway = bool(await asyncio.to_thread(engine.is_running, iid)) or any(
+            card.get("present") and (
+                str(card.get("matched") or "") == iid
+                or (inst.get("iccid") and str(card.get("iccid") or "") == str(inst["iccid"])))
+            for card in hub.cards_list())
+        rows.append({
+            "instance": iid,
+            "name": inst.get("name") or iid,
+            "msisdn": inst.get("msisdn") or "",
+            "country": inst.get("country") or "",
+            "carrier": carrier.get("carrier_label") or carrier.get("name") or "",
+            "enabled": bool(inst.get("enabled", True)),
+            "in_gateway": in_gateway,
+            "state": status.get("state"),
+            "label": status.get("label"),
+            "reason_code": status.get("reason_code"),
+            "last_registered_ts": int(record.get("last_registered_ts") or 0),
+            "uptime_ratio": summary.get("uptime_ratio"),
+            "uptime_span_seconds": span,
+            "allowance": snapshot,
+            "days_to_expiry": ((expiry - datetime.now(_local_tz()).date()).days
+                               if expiry else None),
+            "has_query_rule": bool((rule or {}).get("effective")),
+            "keepalive": _keepalive_view(iid, record, now),
+        })
+    return {"lines": rows, "now": now}
+
+
+# ----------------------------- Voicemail -----------------------------
+def _voicemail_dir(iid: str) -> str:
+    return os.path.join(cfg.DATA_DIR, "instances", str(iid), "logs", "voicemail")
+
+
+def _voicemail_file(iid: str, relative: str) -> str | None:
+    """Resolve a stored path, refusing anything that escapes this line's own directory.
+
+    The engine token proves an event came from *an* engine container, not that its arguments
+    are sane. A recording path is a filename this process will later open and serve, so it is
+    confined here rather than trusted.
+    """
+    root = os.path.realpath(os.path.join(cfg.DATA_DIR, "instances", str(iid), "logs"))
+    full = os.path.realpath(os.path.join(root, str(relative or "")))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+def _voicemail_view(row: dict) -> dict:
+    return {"id": row["id"], "instance": row["instance"], "peer": row["peer"],
+            "ts": row["ts"], "duration_seconds": row["duration_seconds"],
+            "size_bytes": row["size_bytes"], "listened": bool(row["listened"])}
+
+
+def _remove_voicemail_files(iid: str, paths: list[str]) -> None:
+    for relative in paths:
+        full = _voicemail_file(iid, relative)
+        if not full:
+            continue
+        try:
+            os.remove(full)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.debug("could not remove voicemail %s: %r", relative, exc)
+
+
+@app.get("/api/instances/{iid}/voicemails")
+def api_voicemails(iid: str):
+    _allowance_instance(iid)
+    return {"voicemails": [_voicemail_view(r) for r in store.list_voicemails(str(iid))]}
+
+
+@app.get("/api/instances/{iid}/voicemails/{vid}/audio")
+def api_voicemail_audio(iid: str, vid: int):
+    _allowance_instance(iid)
+    row = store.get_voicemail(str(iid), int(vid))
+    if not row:
+        raise HTTPException(404, "no such voicemail")
+    full = _voicemail_file(str(iid), row["path"])
+    if not full or not os.path.isfile(full):
+        raise HTTPException(404, "the recording is no longer on disk")
+    # Inline, not an attachment: the point is to play it in the call log.
+    return FileResponse(full, media_type="audio/wav",
+                        headers={"Content-Disposition": "inline"})
+
+
+@app.post("/api/instances/{iid}/voicemails/{vid}/listened")
+async def api_voicemail_listened(iid: str, vid: int):
+    _allowance_instance(iid)
+    if not store.get_voicemail(str(iid), int(vid)):
+        raise HTTPException(404, "no such voicemail")
+    await asyncio.to_thread(store.set_voicemail_listened, str(iid), int(vid), True)
+    await hub.broadcast({"type": "voicemail", "instance": str(iid), "listened": int(vid)})
+    return {"ok": True}
+
+
+@app.post("/api/instances/{iid}/voicemails/delete")
+async def api_voicemails_delete(iid: str, body: dict):
+    """Delete recordings: {ids:[...]} or {all:true}. The audio goes with the record."""
+    _allowance_instance(iid)
+    ids = None if (body or {}).get("all") else [int(i) for i in (body or {}).get("ids") or []]
+    if ids is not None and not ids:
+        raise HTTPException(422, "provide ids or all:true")
+    paths = await asyncio.to_thread(store.delete_voicemails, str(iid), ids)
+    await asyncio.to_thread(_remove_voicemail_files, str(iid), paths)
+    await hub.broadcast({"type": "voicemail", "instance": str(iid), "deleted": len(paths)})
+    return {"deleted": len(paths)}
 
 
 # ----------------------------- Calls -----------------------------
@@ -5201,6 +5727,7 @@ async def api_engine_event(payload: dict):
             return {"ok": True, "dropped": "empty_body"}
         rec = store.add_message(iid, "in", sender, text)
         await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+        await asyncio.to_thread(_harvest_allowance_reply, iid, sender)
         _dispatch_push(notify_push.EV_INCOMING_SMS, iid, sender, text)
     elif event == "sms_out" and len(args) >= 2:
         pass  # already stored by the send path
@@ -5273,6 +5800,55 @@ async def api_engine_event(payload: dict):
             rec = store.update_last_call(iid, direction, None, disp)
         if rec:
             await hub.broadcast({"type": "call", "instance": iid, "call": rec})
+            # A call nobody answered is worth a notification; one the user actively declined
+            # is not — they were there and said no. Dedupe on the record id, not on the
+            # event: the retry loop above and the peerless fallback can both re-enter with
+            # the same verdict for one call.
+            if direction == "in" and disp == "missed":
+                cid = rec.get("id")
+                if cid is not None and cid not in hub._pushed_missed:
+                    hub._pushed_missed.add(cid)
+                    if len(hub._pushed_missed) > 512:      # bound the dedupe set
+                        hub._pushed_missed = set(list(hub._pushed_missed)[-256:])
+                    asyncio.create_task(_push_missed_call(
+                        iid, cid, rec.get("peer") or to))
+    elif event == "voicemail_new" and args:
+        # args: <peer> <absolute path inside the container> [seconds]
+        peer = args[0] if args else ""
+        raw = args[1] if len(args) > 1 else ""
+        seconds = int(args[2]) if len(args) > 2 and str(args[2]).lstrip("-").isdigit() else 0
+        # The container writes to /logs/voicemail/…; the manager sees the same bytes under
+        # the instance's own logs directory. Keep only the part below /logs so the stored
+        # path stays valid across container rebuilds and host data moves.
+        relative = str(raw).split("/logs/", 1)[-1].lstrip("/")
+        if not relative.startswith("voicemail/"):
+            relative = os.path.join("voicemail", os.path.basename(relative))
+        full = _voicemail_file(iid, relative)
+        if not full or not os.path.isfile(full):
+            log.warning("voicemail event for %s references an unusable path %r", iid, raw)
+            return {"ok": False, "error": "recording not found"}
+        size = os.path.getsize(full)
+        if size <= 0:
+            # Record() with the k option writes a header even when the caller hung up before
+            # speaking; an empty file is not a message and should not raise a notification.
+            os.remove(full)
+            return {"ok": True, "dropped": "empty_recording"}
+        rec, evicted = await asyncio.to_thread(
+            store.add_voicemail, iid, peer, relative, max(0, seconds), size)
+        if evicted:
+            await asyncio.to_thread(_remove_voicemail_files, iid, evicted)
+        call = await asyncio.to_thread(store.link_voicemail_to_call, iid, peer, rec["id"])
+        await hub.broadcast({"type": "voicemail", "instance": iid,
+                             "voicemail": _voicemail_view(rec)})
+        if call:
+            await hub.broadcast({"type": "call", "instance": iid, "call": call})
+        minutes, secs = divmod(max(0, seconds), 60)
+        # The number and the length, never the audio: a push channel is not a place to put a
+        # recording of somebody's voice.
+        _dispatch_push(notify_push.EV_VOICEMAIL, iid, peer,
+                       f"来自 {peer or '未知号码'} 的语音留言，时长 {minutes}:{secs:02d}。"
+                       "请在控制台收听。")
+        return {"ok": True, "voicemail": rec["id"]}
     elif event == "ussd" and args:
         # A carrier answers a service code in signalling rather than audio (T-Mobile puts it
         # on the BYE), so this is reported by a hangup handler on the carrier's own leg —
@@ -5330,6 +5906,61 @@ async def push_status(iid: str):
         await hub.broadcast({"type": "status", "instance": str(iid), **st})
     except Exception as e:  # noqa
         log.debug("push_status error: %r", e)
+
+
+MISSED_CALL_VOICEMAIL_GRACE_SECONDS = 4.0
+
+
+def _voicemail_enabled(inst: dict) -> bool:
+    """Resolve the same per-line-over-global order config.render_instance_json uses."""
+    sip = (inst or {}).get("sip") or {}
+    if "vm_enabled" in sip:
+        return bool(sip["vm_enabled"])
+    return bool(cfg.get_settings().get("vm_enabled", False))
+
+
+async def _push_missed_call(iid: str, call_id: int, peer: str) -> None:
+    """Announce a missed call — unless the caller left a message.
+
+    "You have a 0:42 message from X" already says everything "you missed a call from X" says,
+    so sending both makes one event buzz the user's phone twice. The dialplan starts
+    voicemail_new before the 'h' handler starts call_result, but both are backgrounded
+    processes and neither orders the other, so this waits briefly for the recording to be
+    filed rather than assuming it already has been.
+    """
+    try:
+        if _voicemail_enabled(cfg.get_instance(iid) or {}):
+            deadline = time.monotonic() + MISSED_CALL_VOICEMAIL_GRACE_SECONDS
+            while True:
+                if await asyncio.to_thread(store.call_has_voicemail, iid, call_id):
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.3)
+        _dispatch_push(notify_push.EV_MISSED_CALL, iid, peer)
+    except Exception as exc:  # noqa
+        log.debug("missed-call push failed instance=%s: %r", iid, exc)
+
+
+def _harvest_allowance_reply(iid: str, sender: str) -> None:
+    """Let an inbound SMS settle an allowance query that is still waiting for its answer.
+
+    allowance.reconcile() is otherwise only reached from GET /allowance, i.e. it needs a
+    browser polling the page. A query started with no page open — by the scheduler, or by a
+    user who navigated away — would never be read, and would expire two minutes later as if
+    the carrier had never replied.
+    """
+    try:
+        query = store.latest_allowance_query(str(iid))
+        if not query or query.get("status") not in {"pending", "sent", "unknown"}:
+            return
+        if str(query.get("recipient") or "") != str(sender or ""):
+            return
+        if int(time.time()) - int(query["started_ts"]) > allowance.QUERY_WINDOW_SECONDS:
+            return
+        allowance.reconcile(str(iid))
+    except Exception as exc:  # noqa
+        log.debug("allowance harvest failed instance=%s: %r", iid, exc)
 
 
 def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):

@@ -2,7 +2,6 @@ import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
-import AllowancePanel from './AllowancePanel.jsx'
 
 export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected }) {
   const { t: tr } = useI18n()
@@ -196,7 +195,6 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       </div>
-      <AllowancePanel instanceId={String(id)} mode="messages" transport={transport} showToast={showToast} />
       <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
       <div className="card" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
         <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]); setMessagesLoading(false) }}>+ {tr('New message')}</button>

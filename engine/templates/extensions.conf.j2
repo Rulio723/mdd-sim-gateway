@@ -24,12 +24,25 @@ same => n,TrySystem(/usr/local/bin/notify.py call_in "${CALLERID(num)}" &)
 same => n,WaitForPrecondition(10,2000)
 same => n,Ringing()
 {% if dialstr %}
-same => n,Dial({{ dialstr }},60)
+same => n,Dial({{ dialstr }},{{ vm_ring_seconds if vm_enabled else 60 }})
+{% if vm_enabled %}
+; BUSY here means the softphone DECLINED: the user was present and said no, so recording a
+; message would be the opposite of what they asked for. Everything else reaching this point
+; (NOANSWER, CHANUNAVAIL — no browser open, no registered contact) is an unattended call,
+; which is exactly the case voicemail exists for.
+same => n,GotoIf($["${DIALSTATUS}"="BUSY"]?bye)
+same => n,Goto(mdd_voicemail,vm,1)
+{% endif %}
+{% else %}
+{% if vm_enabled %}
+; No local endpoint at all: nobody can ever answer, so go straight to the recording.
+same => n,Goto(mdd_voicemail,vm,1)
 {% else %}
 same => n,Answer()
 same => n,Wait(30)
 {% endif %}
-same => n,Hangup()
+{% endif %}
+same => n(bye),Hangup()
 ; i (invalid) / t (response timeout) are explicit no-ops so the catch-all never mislogs them.
 exten => i,1,Hangup()
 exten => t,1,Hangup()
@@ -42,6 +55,33 @@ exten => t,1,Hangup()
 ; the call log. Return() ends the 'h' routine cleanly so no fall-through happens.
 exten => h,1,TrySystem(/usr/local/bin/notify.py call_result in "${CALLPEER}" "${DIALSTATUS}" "${HANGUPCAUSE}" &)
 same => n,Return()
+
+{% if vm_enabled %}
+; ===== Voicemail =====
+; Its own context, and no endpoint points at it: [volte_ims] matches every printable
+; extension, so a recording target sharing that context could be reached by an INVITE whose
+; user part happened to be "vm". Only the dialplan can Goto in here.
+;
+; Record() rather than app_voicemail: that module's spool lives inside the container at
+; /var/spool/asterisk/voicemail, which is NOT bind-mounted, so every engine rebuild would
+; destroy the recordings. /logs IS bind-mounted and survives, and the manager reads it there.
+[mdd_voicemail]
+exten => vm,1,NoOp(Voicemail from ${CALLPEER})
+same => n,Answer()
+same => n,Wait(0.5)
+; The prompt ships with this repository (templates/sounds); the base image's own sound
+; packages are a side effect of its build and are deliberately not relied on. A missing file
+; must not abort the recording, so the playback is tolerated rather than checked.
+same => n,TryExec(Playback(/var/lib/asterisk/mdd-sounds/vm-beep))
+same => n,Set(VMSTART=${EPOCH})
+; 5s of silence ends it, {{ vm_max_seconds }}s caps it. k keeps what was recorded when the
+; caller hangs up mid-message (the common case); q suppresses Asterisk's own beep, which the
+; prompt above already provided.
+same => n,Record(/logs/voicemail/vm-${EPOCH}-${FILTER(0-9+,${CALLPEER})}.wav,5,{{ vm_max_seconds }},kq)
+same => n,Set(VMSECS=$[${EPOCH} - ${VMSTART}])
+same => n,TrySystem(/usr/local/bin/notify.py voicemail_new "${CALLPEER}" "${RECORDED_FILE}" "${VMSECS}" &)
+same => n,Hangup()
+{% endif %}
 
 ; ===== Incoming SMS from the IMS/VoWiFi side =====
 [volte_ims_msg]

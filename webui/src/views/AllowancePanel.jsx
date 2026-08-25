@@ -77,8 +77,8 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
 
   const query = async () => {
     if (!rule?.effective) {
-      if (mode === 'messages') setEditingRule(true)
-      else toast(t('The query method for this carrier is unknown. Configure it in Messages.'))
+      setEditingRule(true)
+      toast(t('The query method for this carrier is unknown. Configure it below.'))
       return
     }
     const { recipient, body } = rule.effective
@@ -129,7 +129,7 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
         <div style={{ color: 'var(--text-mute)', fontSize: 11 }}>{t('Updated')}: {updated}{value.source === 'sms' ? ` · ${t('Carrier SMS')}` : ''}</div></div>
       {mode === 'overview' && <button className="btn btn-ghost" disabled={busy} onClick={() => { setDraft({ ...EMPTY, ...value }); setEditing(!editing) }}>{editing ? t('Cancel') : t('Edit')}</button>}
       <button className="btn btn-primary" disabled={busy} onClick={query}>{busy ? t('Working…') : t('Query allowance')}</button>
-      {mode === 'messages' && <button className="btn btn-ghost" disabled={busy} onClick={() => setEditingRule(!editingRule)}>{t('Query settings')}</button>}
+      <button className="btn btn-ghost" disabled={busy} onClick={() => setEditingRule(!editingRule)}>{t('Query settings')}</button>
     </div>
     {!editing && <div className="u-details cols" style={compact ? {
       marginTop: 10, gridTemplateColumns: 'repeat(6, minmax(110px, 1fr))',
@@ -143,7 +143,7 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
       <div className="u-details cols">{FIELDS.map(([key, label]) => <label className="u-detail" key={key}><span>{t(label)}</span><input type={key === 'activated_at' ? 'date' : 'text'} value={draft[key] || ''} maxLength={160} onChange={event => setDraft(current => ({ ...current, [key]: event.target.value }))} /></label>)}</div>
       <div style={{ marginTop: 10, textAlign: 'right' }}><button className="btn btn-primary" disabled={busy} onClick={saveManual}>{t('Save')}</button></div>
     </div>}
-    {mode === 'messages' && editingRule && <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+    {editingRule && <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
       <p className="u-note" style={{ marginTop: 0 }}>{rule?.known
         ? t('This carrier has a built-in method. Saving below creates an override; you can restore the default later.')
         : t('The carrier is unknown. Enter the service number and exact SMS query text supplied by the carrier.')}</p>

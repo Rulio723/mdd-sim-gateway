@@ -178,6 +178,54 @@ def init():
                     sent_ts INTEGER NOT NULL,
                     PRIMARY KEY(instance, expiry_date, days_before)
                 );
+                -- Number keeping. Carriers judge a number active by CHARGEABLE events, so
+                -- what is scheduled here is a real (paid) action, never a free balance
+                -- lookup. Config lives here rather than in the line config because the
+                -- engine has no use for it, and saving a line config restarts its container.
+                CREATE TABLE IF NOT EXISTS line_keepalive (
+                    instance TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    action TEXT NOT NULL DEFAULT 'sms',   -- 'sms' | 'balance_watch'
+                    sms_to TEXT NOT NULL DEFAULT '',
+                    sms_body TEXT NOT NULL DEFAULT '',
+                    verify_charge INTEGER NOT NULL DEFAULT 1,
+                    threshold TEXT NOT NULL DEFAULT '',
+                    interval_days INTEGER NOT NULL DEFAULT 30,
+                    -- The only persistent record of when a line last held a registration:
+                    -- line_states is pruned after 3 days and hub.ok_since dies with the
+                    -- process, so neither can answer "is this number still being used".
+                    last_registered_ts INTEGER NOT NULL DEFAULT 0,
+                    last_run_ts INTEGER NOT NULL DEFAULT 0,
+                    last_status TEXT NOT NULL DEFAULT '',
+                    last_detail TEXT NOT NULL DEFAULT '',
+                    next_due_ts INTEGER NOT NULL DEFAULT 0,
+                    balance_low_since INTEGER NOT NULL DEFAULT 0,
+                    balance_low_last_notified INTEGER NOT NULL DEFAULT 0
+                );
+                -- Claim ledger: an INSERT OR IGNORE here is what stops a restart mid-sweep
+                -- from charging the SIM twice for one due date.
+                CREATE TABLE IF NOT EXISTS keepalive_runs_claim (
+                    instance TEXT NOT NULL,
+                    slot TEXT NOT NULL,
+                    claimed_ts INTEGER NOT NULL,
+                    PRIMARY KEY(instance, slot)
+                );
+                -- calls had no index at all: every per-line lookup was a full scan + sort.
+                CREATE INDEX IF NOT EXISTS idx_calls_inst ON calls(instance, start_ts);
+                -- Voicemail. The audio itself stays on the shared /logs volume: binary_sms
+                -- stores payloads as hex in a column, which suits a 140-byte SMS and would be
+                -- absurd for a two-minute recording. Only the path and metadata live here.
+                CREATE TABLE IF NOT EXISTS voicemails (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance TEXT NOT NULL,
+                    peer TEXT NOT NULL DEFAULT '',
+                    ts INTEGER NOT NULL,
+                    duration_seconds INTEGER NOT NULL DEFAULT 0,
+                    path TEXT NOT NULL,          -- relative to instances/<id>/logs/
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    listened INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_voicemails_inst ON voicemails(instance, ts);
                 """
             )
             # migration: per-message failure detail (added later)
@@ -202,6 +250,12 @@ def init():
             try:
                 c.execute("ALTER TABLE line_allowances "
                           "ADD COLUMN activated_at TEXT NOT NULL DEFAULT ''")
+            except Exception:
+                pass
+            try:
+                # A message left after an unanswered call belongs to that call, so the log can
+                # show them together instead of as two unrelated events.
+                c.execute("ALTER TABLE calls ADD COLUMN voicemail_id INTEGER")
             except Exception:
                 pass
             try:
@@ -542,7 +596,8 @@ def clear_allowance_data(instance: str) -> None:
     """Remove SIM-specific cached usage and query settings before a reusable line id is freed."""
     with _lock, _conn() as c:
         for table in ("line_allowances", "allowance_query_rules", "allowance_queries",
-                      "allowance_reminders"):
+                      "allowance_reminders", "line_keepalive", "keepalive_runs_claim",
+                      "voicemails"):
             # Some recovery/tests open a minimal legacy DB before init() has created these
             # optional tables. Line deletion must still succeed in that degraded state.
             try:
@@ -562,6 +617,192 @@ def claim_allowance_reminder(instance: str, expiry_date: str, days_before: int,
              int(sent_ts or time.time())),
         )
         return cur.rowcount == 1
+
+
+KEEPALIVE_DEFAULTS = {
+    "enabled": 0, "action": "sms", "sms_to": "", "sms_body": "", "verify_charge": 1,
+    "threshold": "", "interval_days": 30, "last_registered_ts": 0, "last_run_ts": 0,
+    "last_status": "", "last_detail": "", "next_due_ts": 0,
+    "balance_low_since": 0, "balance_low_last_notified": 0,
+}
+_KEEPALIVE_CONFIG_KEYS = ("enabled", "action", "sms_to", "sms_body", "verify_charge",
+                          "threshold", "interval_days")
+_KEEPALIVE_STATE_KEYS = ("last_registered_ts", "last_run_ts", "last_status", "last_detail",
+                         "next_due_ts", "balance_low_since", "balance_low_last_notified")
+
+
+def get_keepalive(instance: str) -> dict:
+    """Always returns a full record: a line that was never configured reads as the defaults
+    rather than as an absence every caller would have to handle."""
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM line_keepalive WHERE instance=?",
+                        (str(instance),)).fetchone()
+    out = {**KEEPALIVE_DEFAULTS, "instance": str(instance)}
+    if row:
+        out.update({k: v for k, v in dict(row).items() if k in out or k == "instance"})
+    return out
+
+
+def _save_keepalive_fields(instance: str, values: dict, allowed: tuple) -> dict:
+    clean = {k: v for k, v in (values or {}).items() if k in allowed}
+    if not clean:
+        return get_keepalive(instance)
+    cols = ",".join(clean)
+    marks = ",".join("?" for _ in clean)
+    sets = ",".join(f"{k}=excluded.{k}" for k in clean)
+    with _lock, _conn() as c:
+        c.execute(
+            f"INSERT INTO line_keepalive(instance,{cols}) VALUES(?,{marks}) "
+            f"ON CONFLICT(instance) DO UPDATE SET {sets}",
+            (str(instance), *clean.values()),
+        )
+    return get_keepalive(instance)
+
+
+def save_keepalive_config(instance: str, values: dict) -> dict:
+    """Write only the user-editable fields; scheduler state is never clobbered by a save."""
+    return _save_keepalive_fields(instance, values, _KEEPALIVE_CONFIG_KEYS)
+
+
+def save_keepalive_state(instance: str, values: dict) -> dict:
+    """Write only scheduler-owned fields, so a run in flight cannot revert the user's config."""
+    return _save_keepalive_fields(instance, values, _KEEPALIVE_STATE_KEYS)
+
+
+def touch_line_registered(instance: str, ts: int | None = None) -> None:
+    """Remember that this line held a registration. Called from the status poller, so it is
+    deliberately a single narrow UPDATE-or-INSERT and nothing else."""
+    stamp = int(ts if ts is not None else time.time())
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT INTO line_keepalive(instance,last_registered_ts) VALUES(?,?) "
+            "ON CONFLICT(instance) DO UPDATE SET last_registered_ts=excluded.last_registered_ts",
+            (str(instance), stamp),
+        )
+
+
+def claim_keepalive_run(instance: str, slot: str, ts: int | None = None) -> bool:
+    """True for exactly one caller per (line, due date). The claim is what makes a restart
+    mid-sweep safe: the action being scheduled costs the user real money."""
+    stamp = int(ts if ts is not None else time.time())
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO keepalive_runs_claim(instance,slot,claimed_ts) "
+            "VALUES(?,?,?)", (str(instance), str(slot), stamp))
+        if not cur.rowcount:
+            return False
+        # Bounded like allowance_queries: the ledger only needs enough history to keep
+        # recent slots from re-firing.
+        c.execute("DELETE FROM keepalive_runs_claim WHERE instance=? AND slot NOT IN "
+                  "(SELECT slot FROM keepalive_runs_claim WHERE instance=? "
+                  "ORDER BY claimed_ts DESC LIMIT 20)", (str(instance), str(instance)))
+    return True
+
+
+VOICEMAIL_KEEP_PER_LINE = 30
+VOICEMAIL_KEEP_BYTES = 200 * 1024 * 1024
+
+
+def add_voicemail(instance: str, peer: str, path: str, duration_seconds: int,
+                  size_bytes: int, ts: int | None = None) -> tuple[dict, list[str]]:
+    """Store one recording and report which files fell out of the retention window.
+
+    messages/calls grow without bound and are only ever trimmed by hand; audio cannot afford
+    that on an SD card, so this bounds itself at insert time the way allowance_queries does.
+    Deleting the files is the caller's job — the store does not touch the filesystem.
+    """
+    stamp = int(ts if ts is not None else time.time())
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT INTO voicemails(instance,peer,ts,duration_seconds,path,size_bytes) "
+            "VALUES(?,?,?,?,?,?)",
+            (str(instance), str(peer or ""), stamp, int(duration_seconds), str(path),
+             int(size_bytes)))
+        vid = int(cur.lastrowid)
+        rows = [dict(r) for r in c.execute(
+            "SELECT id,path,size_bytes FROM voicemails WHERE instance=? ORDER BY ts DESC,id DESC",
+            (str(instance),))]
+        evicted, running = [], 0
+        for index, row in enumerate(rows):
+            running += int(row["size_bytes"] or 0)
+            if index >= VOICEMAIL_KEEP_PER_LINE or running > VOICEMAIL_KEEP_BYTES:
+                evicted.append(row)
+        if evicted:
+            c.execute(
+                f"DELETE FROM voicemails WHERE id IN ({_placeholders(len(evicted))})",
+                [row["id"] for row in evicted])
+        record = dict(c.execute("SELECT * FROM voicemails WHERE id=?", (vid,)).fetchone())
+    return record, [str(row["path"]) for row in evicted]
+
+
+def list_voicemails(instance: str, limit: int = 100) -> list[dict]:
+    with _lock, _conn() as c:
+        rows = c.execute("SELECT * FROM voicemails WHERE instance=? "
+                         "ORDER BY ts DESC, id DESC LIMIT ?",
+                         (str(instance), int(limit))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_voicemail(instance: str, vid: int) -> dict | None:
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM voicemails WHERE instance=? AND id=?",
+                        (str(instance), int(vid))).fetchone()
+    return dict(row) if row else None
+
+
+def set_voicemail_listened(instance: str, vid: int, listened: bool = True) -> None:
+    with _lock, _conn() as c:
+        c.execute("UPDATE voicemails SET listened=? WHERE instance=? AND id=?",
+                  (1 if listened else 0, str(instance), int(vid)))
+
+
+def unheard_voicemail_counts() -> dict[str, int]:
+    with _lock, _conn() as c:
+        rows = c.execute("SELECT instance, COUNT(*) AS n FROM voicemails "
+                         "WHERE listened=0 GROUP BY instance").fetchall()
+    return {str(r["instance"]): int(r["n"]) for r in rows}
+
+
+def delete_voicemails(instance: str, ids: list[int] | None = None) -> list[str]:
+    """Remove records and return the paths whose files the caller must now delete."""
+    with _lock, _conn() as c:
+        if ids:
+            rows = c.execute(
+                f"SELECT path FROM voicemails WHERE instance=? AND id IN "
+                f"({_placeholders(len(ids))})", [str(instance), *[int(i) for i in ids]]
+            ).fetchall()
+            c.execute(f"DELETE FROM voicemails WHERE instance=? AND id IN "
+                      f"({_placeholders(len(ids))})",
+                      [str(instance), *[int(i) for i in ids]])
+        else:
+            rows = c.execute("SELECT path FROM voicemails WHERE instance=?",
+                             (str(instance),)).fetchall()
+            c.execute("DELETE FROM voicemails WHERE instance=?", (str(instance),))
+    return [str(r["path"]) for r in rows]
+
+
+def call_has_voicemail(instance: str, call_id: int) -> bool:
+    with _lock, _conn() as c:
+        row = c.execute("SELECT voicemail_id FROM calls WHERE instance=? AND id=?",
+                        (str(instance), int(call_id))).fetchone()
+    return bool(row and row["voicemail_id"])
+
+
+def link_voicemail_to_call(instance: str, peer: str, voicemail_id: int,
+                           within_s: int = 900) -> dict | None:
+    """Attach a recording to the call it was left after — the newest inbound call from that
+    number, mirroring how a service-code reply finds its call in set_ussd_for_peer."""
+    cutoff = int(time.time()) - int(within_s)
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT id FROM calls WHERE instance=? AND direction='in' AND peer=? "
+            "AND start_ts>=? ORDER BY start_ts DESC, id DESC LIMIT 1",
+            (str(instance), str(peer or ""), cutoff)).fetchone()
+        if not row:
+            return None
+        c.execute("UPDATE calls SET voicemail_id=? WHERE id=?", (int(voicemail_id), row["id"]))
+        updated = c.execute("SELECT * FROM calls WHERE id=?", (row["id"],)).fetchone()
+    return dict(updated) if updated else None
 
 
 def start_allowance_query(instance: str, recipient: str, body: str, carrier_key: str,
