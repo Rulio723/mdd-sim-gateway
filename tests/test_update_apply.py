@@ -332,6 +332,15 @@ class UpdaterTests(unittest.TestCase):
             "docker", "tag", "mdd-sim-gateway/control:previous",
             "mdd-sim-gateway/control"])
 
+    def test_dangling_image_cleanup_is_scoped_and_best_effort(self):
+        completed = SimpleNamespace(returncode=1)
+        with patch.object(mdd_update.subprocess, "run", return_value=completed) as run:
+            self.assertFalse(mdd_update.prune_dangling_images())
+        self.assertEqual(run.call_args.args[0],
+                         ["docker", "image", "prune", "--force"])
+        self.assertEqual(run.call_args.kwargs["stdout"], mdd_update.subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs["stderr"], mdd_update.subprocess.DEVNULL)
+
     def test_apply_tree_preserves_installation_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, source = Path(tmp, "repo"), Path(tmp, "source")
@@ -401,7 +410,8 @@ class UpdaterTests(unittest.TestCase):
                              destination)
 
             with patch.object(mdd_update, "download", side_effect=fake_download), \
-                    patch.object(mdd_update, "reload_services", return_value=0):
+                    patch.object(mdd_update, "reload_services", return_value=0), \
+                    patch.object(mdd_update, "prune_dangling_images"):
                 mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status)
 
             self.assertEqual((repo / "VERSION").read_text().strip(), "9.9.9")
@@ -441,7 +451,8 @@ class UpdaterTests(unittest.TestCase):
                                  return_value=distributed) as load_engine, \
                     patch.object(mdd_update, "backup", return_value=base / "backup.tar.gz"), \
                     patch.object(mdd_update, "apply_tree"), \
-                    patch.object(mdd_update, "reload_services", return_value=0) as reload:
+                    patch.object(mdd_update, "reload_services", return_value=0) as reload, \
+                    patch.object(mdd_update, "prune_dangling_images") as prune:
                 mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status)
 
             command, _, env = reload.call_args.args[:3]
@@ -454,6 +465,7 @@ class UpdaterTests(unittest.TestCase):
             self.assertTrue(any(call.args[0].name == engine_name
                                 and call.args[2] == "ARM64 Engine image"
                                 for call in verify_file.call_args_list))
+            prune.assert_called_once_with()
 
     def test_amd64_refreshes_engine_and_docker_control_locally(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -485,7 +497,8 @@ class UpdaterTests(unittest.TestCase):
                     patch.object(mdd_update, "apply_tree"), \
                     patch.object(mdd_update, "load_release_engine") as load_engine, \
                     patch.object(mdd_update, "load_control_image") as load_control, \
-                    patch.object(mdd_update, "reload_services", return_value=0) as reload:
+                    patch.object(mdd_update, "reload_services", return_value=0) as reload, \
+                    patch.object(mdd_update, "prune_dangling_images"):
                 mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status)
 
             command, _, env = reload.call_args.args[:3]
@@ -534,7 +547,8 @@ class UpdaterTests(unittest.TestCase):
                     patch.object(mdd_update, "extract", return_value=source), \
                     patch.object(mdd_update, "backup", return_value=base / "backup.tar.gz"), \
                     patch.object(mdd_update, "apply_tree"), \
-                    patch.object(mdd_update, "reload_services", return_value=0):
+                    patch.object(mdd_update, "reload_services", return_value=0), \
+                    patch.object(mdd_update, "prune_dangling_images"):
                 mdd_update.perform(repo, data, "9.9.9", "MddIdd/mdd-sim-gateway", status,
                                    routes=routes)
 

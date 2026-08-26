@@ -22,7 +22,7 @@ MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 
 
 ![MDD Sim Gateway 中文界面导览（使用虚构演示数据）](assets/product-tour.zh-CN.gif)
 
-<p align="center">概览 → 设备管理 → 浏览器通话 → 短信　·　界面中的身份与内容均为虚构演示数据</p>
+<p align="center">概览 → 设备管理 → 浏览器通话 → 短信 → 余额与保号 → 系统更新　·　界面中的身份与内容均为虚构演示数据</p>
 
 ## 快速安装
 
@@ -45,7 +45,7 @@ sudo ./install.sh install
 ## 完整截图
 
 <details>
-<summary>查看概览、设备、通话和短信页面</summary>
+<summary>查看概览、设备、通话、短信、余额与保号及系统更新页面</summary>
 
 ![MDD Sim Gateway 中文概览（使用虚构演示数据）](screenshots/overview-redacted.zh-CN.png)
 
@@ -55,23 +55,27 @@ sudo ./install.sh install
 
 ![MDD Sim Gateway 中文短信页（使用虚构演示数据）](screenshots/sms-redacted.zh-CN.png)
 
+![MDD Sim Gateway 中文余额与保号页（使用虚构演示数据）](screenshots/keepalive-redacted.zh-CN.png)
+
+![MDD Sim Gateway 中文系统更新页（使用虚构演示数据）](screenshots/settings-redacted.zh-CN.png)
+
 </details>
 
 ## 核心能力
 
 - 自动识别蜂窝模块与普通 PC/SC 读卡器；模块可同时管理 4G 和 VoWiFi，读卡器仅显示其支持的 VoWiFi 能力。
 - 每个物理模块独立保存 4G、飞行模式和 VoWiFi 期望状态：4G 开关只控制移动数据承载，飞行模式单独控制射频，VoWiFi 独立启停；状态按各自 ModemManager 对象读取。
-- 后台每 6 小时检查新版本；发现新版本时左下角版本号显示红点，并可通过已启用的通知通道推送。可选择通知所有版本，或忽略最后一位版本号变化、仅通知功能更新。
+- 在“余额与保号”页统一查看余额、套餐到期、在线状态和保号结果；预付费线路可定时发送一条真实计费短信，套餐线路可监测续费余额并在不足时提醒。
+- 后台每 6 小时检查新版本；可选择自动更新或仅提示更新，并将范围设为主版本或全部版本。无人值守安装仍须由 `update-policy.json` 明确许可具体版本和最早执行时间。
 - 使用物理 SIM/eSIM 完成 EAP-AKA 与 IMS-AKA；不读取、不保存 Ki/OP/OPc，也不使用演示鉴权向量。
 - 自动读取 IMSI、ICCID、MCC/MNC、SIM SPN/GID 和模块 IMEI；使用内置 AOSP Carrier ID 数据离线识别宿主网络与部分 MVNO，PIN 开启时仅在本机加密边界内使用。
 - 每张模块 SIM 显式展示三条逻辑通道的容量、实际分配、用途和错误；部分分配失败会主动释放已打开通道。
-- 登录后使用的浏览器软电话、短信收发、通话记录和来电通知；不开放独立 SIP 客户端接入。
+- 登录后使用的浏览器软电话、短信收发、通话记录、未接来电通知和可按线路启用的本地语音留言；录音只保存在网关，不随通知或支持包发送；不开放独立 SIP 客户端接入。
 - 可建立包含多个订阅、具体节点和 SOCKS5 的代理库，再为国家出口复用其中一项；Reality/XHTTP 节点由 Xray-core 兼容层承载，其余节点与国家 TUN 由 sing-box 管理。候选节点必须通过 UDP 健康检查，失败时按 SIM 故障关闭，不泄漏到错误国家。
 - 标准 GET/POST Webhook、Telegram（直连/手动代理/国家出口）和 PushPlus。
 - Telegram 仅用于单向推送来电、短信和设备状态通知，不接受远程控制指令。
-- 自动更新默认关闭；即使开启，发布 Release 也不会直接安装，只有另行加入更新许可并到达计划时间的版本才会自动更新。
 - 使用 lpac 管理 eUICC 配置文件；支持需要显式选择安全元件的双 SE 卡。
-- 中英文界面、HTTPS、首次管理员设置、支持按钮或 Enter 提交的会话登录、CSRF、防暴力登录、审计记录、脱敏支持包、备份与版本检查。
+- 中英文界面、HTTPS、首次管理员设置、可持久化的 12 小时或 30 天会话登录、CSRF、防暴力登录、审计记录、脱敏支持包、备份与版本检查。
 
 ## 硬件模型
 

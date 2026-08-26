@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 import AllowancePanel from './AllowancePanel.jsx'
@@ -39,13 +39,23 @@ function KeepaliveForm({ line, onSaved, showToast }) {
   const { t } = useI18n()
   const [draft, setDraft] = useState(line.keepalive)
   const [busy, setBusy] = useState(false)
-  useEffect(() => { setDraft(line.keepalive) }, [line.keepalive])
-  const set = (patch) => setDraft(d => ({ ...d, ...patch }))
+  const dirty = useRef(false)
+  // Summary polling replaces `line.keepalive` with a fresh object every 30 seconds. Keep
+  // server-side status fresh while the form is untouched, but never erase a draft the user is
+  // still editing. Closing the row unmounts the form, so reopening always starts from the server.
+  useEffect(() => {
+    if (!dirty.current) setDraft(line.keepalive)
+  }, [line.keepalive])
+  const set = (patch) => {
+    dirty.current = true
+    setDraft(d => ({ ...d, ...patch }))
+  }
   const sms = draft.action === 'sms'
   const save = async () => {
     setBusy(true)
     try {
       const result = await api.saveKeepalive(line.instance, draft)
+      dirty.current = false
       setDraft(result.keepalive); showToast?.(t('Saved')); onSaved?.()
     } catch (error) { showToast?.(error.message) } finally { setBusy(false) }
   }
@@ -57,6 +67,7 @@ function KeepaliveForm({ line, onSaved, showToast }) {
     setBusy(true)
     try {
       const result = await api.runKeepalive(line.instance)
+      dirty.current = false
       setDraft(result.keepalive); showToast?.(t('Done')); onSaved?.()
     } catch (error) { showToast?.(error.message) } finally { setBusy(false) }
   }

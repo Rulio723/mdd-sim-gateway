@@ -316,6 +316,21 @@ def load_control_image(artifact: Path, version: str):
         raise UpdateError(f"Release control image identity mismatch: {actual or 'unreadable'}")
 
 
+def prune_dangling_images() -> bool:
+    """Reclaim images orphaned by a successful update, without touching rollback tags.
+
+    Docker refuses to prune images used by containers, and the installer's explicit
+    ``:previous`` Engine/control tags are not dangling. This therefore removes superseded
+    untagged images and obsolete build stages while preserving both the live images and the
+    intentional one-version rollback point. Cleanup is best-effort: a completed service reload
+    must not be reported as failed only because Docker could not reclaim optional cache space.
+    """
+    result = subprocess.run(
+        ["docker", "image", "prune", "--force"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
 def release_engine_fingerprints(source_root: Path) -> tuple[str, str] | None:
     """Return the verified release's Engine inputs, or None for a transitional old release."""
     script = source_root / "tools" / "engine-fingerprint.sh"
@@ -631,6 +646,7 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
             with open(log_path, encoding="utf-8", errors="replace") as log:
                 tail = "".join(log.readlines()[-40:])
             raise UpdateError(f"install.sh reload exited with {result_code}\n{tail}")
+        prune_dangling_images()
         status.publish("success", "done", elapsed_seconds=int(time.time()) - status.started,
                        detail="")
     finally:

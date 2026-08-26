@@ -22,7 +22,7 @@ MDD Sim Gateway is a self-hosted multi-SIM communications gateway for Debian, Ub
 
 ![MDD Sim Gateway English interface tour (fictional demo data)](assets/product-tour.gif)
 
-<p align="center">Overview → device management → browser calling → messages · All identities and content shown are fictional demo data</p>
+<p align="center">Overview → device management → browser calling → messages → balance & keeping → system updates · All identities and content shown are fictional demo data</p>
 
 ## Quick install
 
@@ -45,7 +45,7 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 ## Full screenshots
 
 <details>
-<summary>View the Overview, Devices, Calls and Messages screens</summary>
+<summary>View the Overview, Devices, Calls, Messages, Balance & keeping, and System updates screens</summary>
 
 ![MDD Sim Gateway English overview (fictional demo data)](screenshots/overview-redacted.en.png)
 
@@ -55,26 +55,34 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 
 ![MDD Sim Gateway English messages page (fictional demo data)](screenshots/messages-redacted.en.png)
 
+![MDD Sim Gateway English balance and number keeping page (fictional demo data)](screenshots/keepalive-redacted.en.png)
+
+![MDD Sim Gateway English system updates page (fictional demo data)](screenshots/settings-redacted.en.png)
+
 </details>
 
 ## Capabilities
 
 - Detect supported ModemManager cellular modules and ordinary PC/SC readers automatically.
 - Control 4G data, radio flight mode and VoWiFi independently for each physical modem.
+- Show balance, plan expiry, network presence and keeping results on one page. Prepaid lines can
+  schedule a real chargeable SMS, while plan lines can watch the renewal balance and warn when low.
 - Perform EAP-AKA and IMS-AKA in the physical SIM/eSIM without reading or storing Ki/OP/OPc.
 - Show each modem UICC's three logical-channel allocations, roles and explicit failures.
-- Provide an authenticated browser softphone, SMS, call history and incoming-event notifications; standalone SIP clients are not accepted.
+- Provide an authenticated browser softphone, SMS, call history, missed-call notifications and
+  per-line local voicemail. Recordings remain on the gateway and are never attached to notifications
+  or support bundles; standalone SIP clients are not accepted.
 - Maintain reusable subscriptions, individual nodes and SOCKS5 proxies, then assign one to each
   country. sing-box owns the isolated TUNs; Xray-core carries Reality/XHTTP nodes. VoWiFi fails
   closed unless the selected exit passes a runtime UDP check.
 - Send standard/custom Webhooks, Telegram notifications and PushPlus messages.
-- Check releases every six hours in the background and notify on every release or only on
-  major/minor feature updates. Automatic installation is opt-in and requires a separate,
-  time-gated promotion after the GitHub Release is published.
+- Check releases every six hours in the background. Choose automatic installation or notify-only,
+  scoped to main releases or every release. Unattended installation still requires the exact version
+  and earliest rollout time to be approved separately in `update-policy.json`.
 - Telegram is notification-only and does not accept remote control commands.
 - Manage eUICC profiles through a pinned local lpac build, including dual-SE readers.
-- Offer HTTPS, first-run administrator setup, CSRF protection, login throttling, local backups,
-  audit records, redacted support bundles and read-only release checks.
+- Offer HTTPS, first-run administrator setup, persistent 12-hour or 30-day sessions, CSRF protection,
+  login throttling, local backups, audit records, redacted support bundles and release checks.
 
 | Hardware | 4G data | Wi-Fi Calling | SIM access |
 |---|---:|---:|---|
