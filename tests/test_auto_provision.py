@@ -217,6 +217,34 @@ class AutoProvisionTests(unittest.TestCase):
         self.assertIn("country=GB", result["sip"]["pani"])
 
 
+class HotplugDraftPromotionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_vowifi_still_promotes_complete_draft_without_starting_engine(self):
+        draft = {
+            "id": "2", "iccid": "test-card", "provisioning_state": "draft",
+            "enabled": False,
+        }
+        card = {
+            "present": True, "iccid": "test-card", "hardware_id": "test-modem",
+            "hardware_kind": "modem",
+        }
+        promoted = {**draft, "provisioning_state": "ready", "enabled": True}
+        desired = {"devices": {"test-modem": {"vowifi_enabled": False}}}
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(main.cfg, "get_instance", return_value=draft), \
+                patch.object(main.engine, "is_running", return_value=False), \
+                patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(main.device_state, "desired", return_value=desired), \
+                patch.object(main, "_auto_promote_card_draft",
+                             return_value=promoted) as promote, \
+                patch.object(main, "_start_engine_checked") as start:
+            await main._auto_start_hotplugged_line("2")
+
+        promote.assert_called_once_with(draft, card, [card])
+        start.assert_not_called()
+        self.assertNotIn("2", main.hub.hotplug_starts)
+
+
 class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
     def test_modemmanager_number_requires_ims_confirmation(self):
         self.assertTrue(main._needs_ims_msisdn_learning({

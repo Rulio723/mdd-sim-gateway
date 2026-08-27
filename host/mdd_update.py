@@ -142,7 +142,7 @@ def download(url: str, destination: Path, env: dict[str, str], proxy_url: str = 
     # The compressed Engine is the largest Release asset. Keep a finite ceiling, but do not
     # apply the ten-minute source-package budget to a transfer that can legitimately be several
     # hundred megabytes on a Raspberry Pi connection.
-    max_time = "1800" if phase == "engine_image" else "600"
+    max_time = "1800" if phase in {"engine_image", "control_image"} else "600"
     command = [
         "curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
         "--tlsv1.2", "--retry", "0" if allow_fallback else "3", "--retry-all-errors",
@@ -316,21 +316,6 @@ def load_control_image(artifact: Path, version: str):
         raise UpdateError(f"Release control image identity mismatch: {actual or 'unreadable'}")
 
 
-def prune_dangling_images() -> bool:
-    """Reclaim images orphaned by a successful update, without touching rollback tags.
-
-    Docker refuses to prune images used by containers, and the installer's explicit
-    ``:previous`` Engine/control tags are not dangling. This therefore removes superseded
-    untagged images and obsolete build stages while preserving both the live images and the
-    intentional one-version rollback point. Cleanup is best-effort: a completed service reload
-    must not be reported as failed only because Docker could not reclaim optional cache space.
-    """
-    result = subprocess.run(
-        ["docker", "image", "prune", "--force"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return result.returncode == 0
-
-
 def release_engine_fingerprints(source_root: Path) -> tuple[str, str] | None:
     """Return the verified release's Engine inputs, or None for a transitional old release."""
     script = source_root / "tools" / "engine-fingerprint.sh"
@@ -359,7 +344,7 @@ def engine_image_matches_inputs(image: str, runtime_fp: str, base_fp: str) -> bo
 
 def load_release_engine(artifact: Path, version: str, runtime_fp: str, base_fp: str,
                         status: Status | None, log_path: Path) -> str:
-    """Import and identify the verified ARM64 Engine without replacing the running image yet."""
+    """Import and identify the verified native Engine without replacing the running image yet."""
     image = f"{ENGINE_REGISTRY_IMAGE}:v{version}"
     started = time.monotonic()
     with open(log_path, "w", encoding="utf-8") as log:
@@ -370,7 +355,7 @@ def load_release_engine(artifact: Path, version: str, runtime_fp: str, base_fp: 
                 status.publish("running", "engine_image", artifact=artifact.name,
                                engine_image_required=True,
                                elapsed_seconds=max(0, int(time.monotonic() - started)),
-                               detail="importing verified ARM64 Engine image")
+                               detail=f"importing verified {host_arch()} Engine image")
             time.sleep(3)
     if process.returncode:
         raise UpdateError(
@@ -381,7 +366,7 @@ def load_release_engine(artifact: Path, version: str, runtime_fp: str, base_fp: 
          '{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}|'
          '{{index .Config.Labels "io.mdd-sim-gateway.base-fp"}}'],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    expected = f"arm64|{version}|{runtime_fp}|{base_fp}"
+    expected = f"{host_arch()}|{version}|{runtime_fp}|{base_fp}"
     actual = checked.stdout.strip() if checked.returncode == 0 else ""
     if actual != expected:
         raise UpdateError(f"Release Engine image identity mismatch: {actual or 'unreadable'}")
@@ -477,7 +462,8 @@ def perform_engine_handoff(repo: Path, data: Path, version: str, repo_name: str,
     manifest = repo / ENGINE_HANDOFF_MANIFEST
     if not manifest.is_file():
         raise UpdateError("release has no Engine handoff manifest")
-    engine_name = f"mdd-sim-gateway-engine-v{version}-arm64.tar.gz"
+    arch = host_arch()
+    engine_name = f"mdd-sim-gateway-engine-v{version}-{arch}.tar.gz"
     if not any(line.strip().split(None, 1)[-1].lstrip("*") == engine_name
                for line in manifest.read_text(encoding="utf-8").splitlines()
                if len(line.strip().split(None, 1)) == 2):
@@ -503,12 +489,85 @@ def perform_engine_handoff(repo: Path, data: Path, version: str, repo_name: str,
         base = f"https://github.com/{repo_name}/releases/download/v{version}"
         fetch_release_asset(f"{base}/{engine_name}", artifact, engine_name, clean_routes,
                             asset_sizes=asset_sizes, phase="engine_image")
-        verify_release_file(artifact, manifest, "ARM64 Engine image")
+        verify_release_file(artifact, manifest, f"{arch} Engine image")
         fingerprints = release_engine_fingerprints(repo)
         if not fingerprints:
             raise UpdateError("release has no Engine identity metadata")
         return load_release_engine(
             artifact, version, *fingerprints, None, update_dir / "engine-image.log")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def perform_release_image_install(repo: Path, data: Path, version: str, repo_name: str,
+                                  mode: str, network_path: Path | None = None) -> str:
+    """Download and import the native images named by an official release source archive.
+
+    The embedded manifest is generated only after CI has built all image assets and is itself
+    covered by the release source archive checksum. A checkout without that marker deliberately
+    stays on the source-build path.
+    """
+    if not VERSION_RE.fullmatch(version):
+        raise UpdateError(f"invalid target version: {version!r}")
+    if not REPOSITORY_RE.fullmatch(repo_name):
+        raise UpdateError(f"invalid repository: {repo_name!r}")
+    if mode not in {"local", "docker"}:
+        raise UpdateError(f"invalid install mode: {mode!r}")
+    manifest = repo / ENGINE_HANDOFF_MANIFEST
+    if not manifest.is_file():
+        raise UpdateError("release has no image asset manifest")
+
+    arch = host_arch()
+    engine_name = f"mdd-sim-gateway-engine-v{version}-{arch}.tar.gz"
+    control_name = f"mdd-sim-gateway-control-v{version}-{arch}.tar.gz"
+    required = [engine_name] + ([control_name] if mode == "docker" else [])
+    named = {
+        parts[1].lstrip("*")
+        for line in manifest.read_text(encoding="utf-8").splitlines()
+        if len(parts := line.strip().split(None, 1)) == 2
+    }
+    missing = [name for name in required if name not in named]
+    if missing:
+        raise UpdateError(f"release image manifest does not name {', '.join(missing)}")
+
+    update_dir = data / "update"
+    update_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    minimum_free = (3 if mode == "docker" else 2) * 1024 * 1024 * 1024
+    if shutil.disk_usage(update_dir).free < minimum_free:
+        raise UpdateError("not enough persistent disk space to import the Release images")
+    network = read_network_config(network_path) if network_path else {}
+    fallback_proxy = str(network.get("proxy_url") or os.environ.get("HTTPS_PROXY")
+                         or os.environ.get("https_proxy") or "")
+    clean_routes = validated_download_routes(
+        fallback_proxy,
+        route=str(network.get("route") or ("library" if fallback_proxy else "direct")),
+        route_name=str(network.get("route_name") or ""),
+        routes=network.get("routes") if isinstance(network.get("routes"), list) else None)
+    asset_sizes = network.get("asset_sizes") if isinstance(
+        network.get("asset_sizes"), dict) else {}
+    staging = Path(tempfile.mkdtemp(prefix="release-images.", dir=str(update_dir)))
+    try:
+        base = f"https://github.com/{repo_name}/releases/download/v{version}"
+        engine_archive = staging / engine_name
+        active_route = fetch_release_asset(
+            f"{base}/{engine_name}", engine_archive, engine_name, clean_routes,
+            asset_sizes=asset_sizes, phase="engine_image")
+        verify_release_file(engine_archive, manifest, f"{arch} Engine image")
+        fingerprints = release_engine_fingerprints(repo)
+        if not fingerprints:
+            raise UpdateError("release has no Engine identity metadata")
+        distributed = load_release_engine(
+            engine_archive, version, *fingerprints, None, update_dir / "engine-image.log")
+        engine_archive.unlink(missing_ok=True)
+
+        if mode == "docker":
+            control_archive = staging / control_name
+            fetch_release_asset(
+                f"{base}/{control_name}", control_archive, control_name, clean_routes,
+                active_route, asset_sizes=asset_sizes, phase="control_image")
+            verify_release_file(control_archive, manifest, f"{arch} control image")
+            load_control_image(control_archive, version)
+        return distributed
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -529,8 +588,9 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
         mode = installed_mode(data)
         asset_sizes = asset_sizes or {}
         archive_name = f"mdd-sim-gateway-v{version}.tar.gz"
-        control_name = f"mdd-sim-gateway-control-v{version}-arm64.tar.gz"
-        engine_name = f"mdd-sim-gateway-engine-v{version}-arm64.tar.gz"
+        arch = host_arch()
+        control_name = f"mdd-sim-gateway-control-v{version}-{arch}.tar.gz"
+        engine_name = f"mdd-sim-gateway-engine-v{version}-{arch}.tar.gz"
         base = f"https://github.com/{repo_name}/releases/download/v{version}"
         url = f"{base}/{archive_name}"
         # Publish the transfer skeleton before curl starts so the dialog shows a sized bar from
@@ -570,8 +630,7 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
         engine_refresh_required = bool(
             engine_fingerprints and not engine_image_matches_inputs(
                 "mdd-sim-gateway/engine", *engine_fingerprints))
-        release_images_supported = host_arch() == "arm64"
-        if engine_refresh_required and release_images_supported:
+        if engine_refresh_required:
             if shutil.disk_usage(data / "update").free < 2 * 1024 * 1024 * 1024:
                 raise UpdateError("not enough persistent disk space to import the Engine image")
             status.publish("running", "engine_image", artifact=engine_name,
@@ -585,15 +644,16 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
                 clean_routes, active_route, asset_sizes=asset_sizes, status=status,
                 phase="engine_image")
             status.publish("running", "engine_image", artifact=engine_name,
-                           engine_image_required=True, detail="verifying ARM64 Engine image",
+                           engine_image_required=True, detail=f"verifying {arch} Engine image",
                            downloaded_bytes=0, total_bytes=0,
                            bytes_per_second=0, elapsed_seconds=0)
-            verify_release_file(engine_archive, sums, "ARM64 Engine image")
+            verify_release_file(engine_archive, sums, f"{arch} Engine image")
             distributed_engine = load_release_engine(
                 engine_archive, version, *engine_fingerprints, status,
                 data / "update" / "engine-image.log")
+            engine_archive.unlink(missing_ok=True)
 
-        if mode == "docker" and release_images_supported:
+        if mode == "docker":
             if shutil.disk_usage(data / "update").free < 1024 * 1024 * 1024:
                 raise UpdateError("not enough persistent disk space to import the control image")
             status.publish("running", "control_image", artifact=control_name, detail="",
@@ -608,7 +668,7 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
             status.publish("running", "control_image", artifact=control_name,
                            downloaded_bytes=0, total_bytes=0, bytes_per_second=0,
                            elapsed_seconds=0, detail="")
-            verify_release_file(control_archive, sums, "ARM64 control image")
+            verify_release_file(control_archive, sums, f"{arch} control image")
             load_control_image(control_archive, version)
 
         status.publish("running", "backup")
@@ -628,14 +688,12 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
         selected_proxy_url = clean_routes[active_route]["proxy_url"]
         env = network_environment(selected_proxy_url)
         env["MDD_REUSE_WEBUI"] = "1"
-        if mode == "docker" and release_images_supported:
+        env["MDD_PRUNE_BUILD_CACHE"] = "1"
+        if mode == "docker":
             env["MDD_REUSE_CONTROL_IMAGE"] = "1"
         if distributed_engine:
             env["MDD_ENGINE_DISTRIBUTION_IMAGE"] = distributed_engine
         reload_command = ["sh", str(repo / "install.sh"), "reload"]
-        # Release images are ARM64-only. On amd64, leave Engine preservation disabled when
-        # its inputs changed so install.sh refreshes or builds the native image locally;
-        # Docker-mode control is likewise rebuilt locally instead of loading an ARM64 asset.
         if not distributed_engine and not engine_refresh_required:
             reload_command.append("--no-engines")
         result_code = reload_services(
@@ -646,7 +704,6 @@ def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status
             with open(log_path, encoding="utf-8", errors="replace") as log:
                 tail = "".join(log.readlines()[-40:])
             raise UpdateError(f"install.sh reload exited with {result_code}\n{tail}")
-        prune_dangling_images()
         status.publish("success", "done", elapsed_seconds=int(time.time()) - status.started,
                        detail="")
     finally:
@@ -661,13 +718,27 @@ def main():
     parser.add_argument("--repository", required=True)
     parser.add_argument("--network-config", type=Path)
     parser.add_argument("--engine-handoff", action="store_true")
+    parser.add_argument("--install-images", action="store_true")
+    parser.add_argument("--install-mode", choices=("local", "docker"), default="local")
     args = parser.parse_args()
     data = args.data.resolve()
     network_path = args.network_config.resolve() if args.network_config else None
+    if args.engine_handoff and args.install_images:
+        parser.error("--engine-handoff and --install-images are mutually exclusive")
     if args.engine_handoff:
         try:
             image = perform_engine_handoff(
                 args.repo.resolve(), data, args.version, args.repository, network_path)
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(1)
+        print(image)
+        return
+    if args.install_images:
+        try:
+            image = perform_release_image_install(
+                args.repo.resolve(), data, args.version, args.repository,
+                args.install_mode, network_path)
         except Exception as exc:
             print(str(exc), file=sys.stderr)
             raise SystemExit(1)

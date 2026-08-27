@@ -46,6 +46,26 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertEqual(result["asset_sizes"]["mdd-sim-gateway-v9.9.9.tar.gz"], 1234)
         self.assertNotIn("apply", result)
 
+    def test_bilingual_release_notes_are_not_truncated_at_the_old_limit(self):
+        newer = list(update_check._version_tuple(update_check.VERSION))
+        newer[-1] += 1
+        notes = "中" * 4500 + "\n---\n" + "English release notes"
+        payload = {"tag_name": "v" + ".".join(map(str, newer)), "body": notes}
+        with patch("control.app.update_check.requests.Session.get",
+                   return_value=_Response(payload)):
+            result = update_check.check(True)
+        self.assertEqual(result["notes"], notes)
+
+    def test_release_notes_still_have_a_bounded_size(self):
+        newer = list(update_check._version_tuple(update_check.VERSION))
+        newer[-1] += 1
+        notes = "x" * (update_check._MAX_RELEASE_NOTES_CHARS + 10)
+        payload = {"tag_name": "v" + ".".join(map(str, newer)), "body": notes}
+        with patch("control.app.update_check.requests.Session.get",
+                   return_value=_Response(payload)):
+            result = update_check.check(True)
+        self.assertEqual(len(result["notes"]), update_check._MAX_RELEASE_NOTES_CHARS)
+
     def test_semantic_comparison(self):
         self.assertGreater(update_check._version_tuple("v1.10.0"), update_check._version_tuple("1.9.9"))
 

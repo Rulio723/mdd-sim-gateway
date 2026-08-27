@@ -14,6 +14,7 @@ import tarfile
 import time
 import zipfile
 
+import docker
 import yaml
 
 from . import config as cfg
@@ -127,6 +128,86 @@ def redact_jsonl(text: str) -> str:
 
 
 CALL_EVENTS = ("call_out", "call_result", "ussd")
+
+_MDD_IMAGE_PREFIXES = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
+_CURRENT_IMAGE_TAGS = {
+    "mdd-sim-gateway/engine:latest",
+    "mdd-sim-gateway/control:latest",
+    "mdd-sim-gateway/engine-base:trusted",
+}
+
+
+def _managed_image(image) -> bool:
+    tags = [str(tag) for tag in (getattr(image, "tags", None) or [])]
+    attrs = getattr(image, "attrs", None) or {}
+    labels = ((attrs.get("Config") or {}).get("Labels") or {})
+    return labels.get("io.mdd-sim-gateway.managed") == "true" or any(
+        tag.startswith(_MDD_IMAGE_PREFIXES) for tag in tags)
+
+
+def _image_layer_bytes(report: dict) -> int:
+    usage = report.get("ImageUsage") or {}
+    return max(0, int(usage.get("TotalSize") or report.get("LayersSize") or 0))
+
+
+def prune_old_mdd_images() -> dict:
+    """Delete unused MDD history while preserving current/base and every live container.
+
+    This is deliberately separate from automatic one-generation rollback retention: an
+    administrator invokes it when free space matters more than one-click rollback. Removing by
+    image ID with ``force=True`` drops historical aliases together, but only after the ID has
+    been excluded from every container and every stable current/base tag.
+    """
+    client = docker.from_env(timeout=30)
+    try:
+        before = _image_layer_bytes(client.df())
+        protected_ids = {
+            str(container.image.id) for container in client.containers.list(all=True)
+            if getattr(container, "image", None) is not None
+        }
+        images = client.images.list(all=True)
+        for image in images:
+            if any(tag in _CURRENT_IMAGE_TAGS for tag in (image.tags or [])):
+                protected_ids.add(str(image.id))
+        candidates = [image for image in images
+                      if _managed_image(image) and str(image.id) not in protected_ids]
+        removed = 0
+        for image in candidates:
+            client.images.remove(str(image.id), force=True, noprune=False)
+            removed += 1
+        after = _image_layer_bytes(client.df())
+    except docker.errors.DockerException as exc:
+        raise RuntimeError(f"could not remove old MDD images: {exc}") from exc
+    finally:
+        try:
+            client.close()
+        except docker.errors.DockerException:
+            pass
+    return {"ok": True, "removed_images": removed,
+            "space_reclaimed_bytes": max(0, before - after)}
+
+
+def prune_dangling_build_cache() -> dict:
+    """Remove only dangling Docker builder records and report the reclaimed bytes.
+
+    Legacy builder records have no MDD ownership labels. This deliberately mirrors
+    ``docker builder prune`` without ``--all``: images, containers, volumes, and reusable
+    cache records remain untouched.
+    """
+    client = docker.from_env(timeout=30)
+    try:
+        # ``all=False`` is Docker's dangling-only builder prune. Unlike image prune, the
+        # build/prune API does not accept a ``dangling`` filter (Docker 28 returns HTTP 400).
+        result = client.api.prune_builds(all=False) or {}
+    except docker.errors.DockerException as exc:
+        raise RuntimeError(f"could not prune Docker build cache: {exc}") from exc
+    finally:
+        try:
+            client.close()
+        except docker.errors.DockerException:
+            pass
+    return {"ok": True, "space_reclaimed_bytes": max(
+        0, int(result.get("SpaceReclaimed") or 0))}
 
 
 def call_event_evidence(text: str) -> str:

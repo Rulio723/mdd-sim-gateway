@@ -168,9 +168,159 @@ def disk(path: str) -> dict:
         usage = shutil.disk_usage(path)
     except OSError:
         return {}
-    return {"total_mb": usage.total // (1024 * 1024), "free_mb": usage.free // (1024 * 1024),
+    return {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free,
+            "total_mb": usage.total // (1024 * 1024), "free_mb": usage.free // (1024 * 1024),
             "used_percent": round((usage.total - usage.free) * 100 / usage.total, 1)
             if usage.total else 0.0}
+
+
+def _path_usage_bytes(path: str) -> int:
+    """Allocated bytes under one project path, without following symlinks."""
+    try:
+        result = subprocess.run(["du", "-sk", os.path.abspath(path)], capture_output=True,
+                                text=True, timeout=15)
+        value = result.stdout.split(None, 1)[0] if result.returncode == 0 else ""
+        if value.isdigit():
+            return int(value) * 1024
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    total = 0
+    try:
+        for root, dirs, files in os.walk(path, followlinks=False):
+            for name in [*dirs, *files]:
+                try:
+                    stat = os.lstat(os.path.join(root, name))
+                except OSError:
+                    continue
+                total += stat.st_blocks * 512 if stat.st_blocks else stat.st_size
+    except OSError:
+        return 0
+    return total
+
+
+def _project_paths(data_dir: str) -> list[str]:
+    """Runtime data plus native-install source/venv paths, with nested paths counted once."""
+    candidates = [data_dir, os.environ.get("MDD_REPO_DIR", ""),
+                  os.environ.get("MDD_VENV_DIR", "")]
+    paths = []
+    for candidate in sorted({os.path.realpath(item) for item in candidates if item}, key=len):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            if any(os.path.commonpath([candidate, parent]) == parent for parent in paths):
+                continue
+        except ValueError:
+            pass
+        paths.append(candidate)
+    return paths
+
+
+def _docker_storage() -> dict:
+    """MDD image/container usage plus separately identified shared builder cache.
+
+    Image ``Size`` values are virtual sizes and repeat shared layers. Docker's aggregate usage
+    objects carry the real layer-store total and reclaimable bytes. Builder records created by
+    legacy releases have no project label, so report the daemon's shared cache separately and
+    use Docker's own conservative-prune estimate rather than treating every ``InUse=false``
+    record as deletable.
+    """
+    try:
+        import docker
+        client = docker.from_env(timeout=10)
+    except Exception:
+        return {}
+    try:
+        report = client.df()
+    except Exception:
+        return {}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    repositories = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
+    image_bytes, image_ids = 0, set()
+    for item in report.get("Images") or []:
+        image_id = str(item.get("Id") or item.get("ID") or "")
+        labels = item.get("Labels") or {}
+        labels = labels if isinstance(labels, dict) else {}
+        tags = [str(tag) for tag in (item.get("RepoTags") or []) if tag]
+        managed = labels.get("io.mdd-sim-gateway.managed") == "true" or any(
+            tag.startswith(repositories) for tag in tags)
+        if managed and image_id not in image_ids:
+            image_ids.add(image_id)
+            image_bytes += max(0, int(item.get("Size") or 0))
+
+    writable_bytes, container_ids = 0, set()
+    for item in report.get("Containers") or []:
+        container_id = str(item.get("Id") or item.get("ID") or "")
+        labels = item.get("Labels") or {}
+        labels = labels if isinstance(labels, dict) else {}
+        image = str(item.get("Image") or "")
+        managed = labels.get("io.mdd-sim-gateway.managed") == "true" or image.startswith(
+            repositories)
+        if managed and container_id not in container_ids:
+            container_ids.add(container_id)
+            writable_bytes += max(0, int(item.get("SizeRw") or 0))
+
+    image_usage = report.get("ImageUsage") or {}
+    image_items = image_usage.get("Items") or report.get("Images") or []
+    all_image_ids = {str(item.get("Id") or item.get("ID") or "")
+                     for item in image_items if item.get("Id") or item.get("ID")}
+    all_images_are_mdd = bool(all_image_ids) and all_image_ids == image_ids
+    current_tags = {"mdd-sim-gateway/engine:latest",
+                    "mdd-sim-gateway/control:latest",
+                    "mdd-sim-gateway/engine-base:trusted"}
+    old_image_count, protected_unused = 0, False
+    for item in image_items:
+        image_id = str(item.get("Id") or item.get("ID") or "")
+        if image_id not in image_ids or int(item.get("Containers") or 0) != 0:
+            continue
+        tags = {str(tag) for tag in (item.get("RepoTags") or []) if tag}
+        if tags & current_tags:
+            protected_unused = True
+        else:
+            old_image_count += 1
+    layer_bytes = max(0, int(image_usage.get("TotalSize")
+                             or report.get("LayersSize") or 0))
+    image_reclaimable = max(0, int(image_usage.get("Reclaimable") or 0))
+    old_image_reclaimable = (image_reclaimable
+                             if all_images_are_mdd and not protected_unused else None)
+
+    cache = report.get("BuildCache") or []
+    cache_usage = report.get("BuildCacheUsage") or {}
+    cache_bytes = max(0, int(cache_usage.get("TotalSize")
+                             or sum(max(0, int(item.get("Size") or 0)) for item in cache)))
+    if "Reclaimable" in cache_usage:
+        cache_reclaimable = max(0, int(cache_usage.get("Reclaimable") or 0))
+    else:
+        # Older daemons do not publish the aggregate. Shared records are parents of reusable
+        # cache and survive the default prune; unshared, unused records are the safe estimate.
+        cache_reclaimable = sum(max(0, int(item.get("Size") or 0)) for item in cache
+                                if not item.get("InUse") and not item.get("Shared"))
+    return {"docker_images_bytes": image_bytes,
+            "docker_image_layers_bytes": layer_bytes,
+            "docker_image_reclaimable_bytes": image_reclaimable,
+            "docker_images_all_managed": all_images_are_mdd,
+            "mdd_old_image_count": old_image_count,
+            "mdd_old_images_reclaimable_bytes": old_image_reclaimable,
+            "container_writable_bytes": writable_bytes,
+            "build_cache_bytes": cache_bytes,
+            "build_cache_reclaimable_bytes": cache_reclaimable}
+
+
+def project_storage(data_dir: str) -> dict:
+    files = sum(_path_usage_bytes(path) for path in _project_paths(data_dir))
+    result = {"files_bytes": files}
+    result.update(_docker_storage())
+    image_storage = (result.get("docker_image_layers_bytes", 0)
+                     if result.get("docker_images_all_managed")
+                     else result.get("docker_images_bytes", 0))
+    result["known_total_bytes"] = (files + image_storage
+                                   + result.get("container_writable_bytes", 0))
+    result["known_total_is_logical"] = not bool(result.get("docker_images_all_managed"))
+    return result
 
 
 def uptime_seconds() -> int:
@@ -281,6 +431,7 @@ def collect(data_dir: str = "/") -> dict:
         "load": load(),
         "memory": memory(),
         "disk": disk(data_dir),
+        "project_storage": project_storage(data_dir),
         "network": network(),
     }
     for key, value in (("throttling", throttling()),

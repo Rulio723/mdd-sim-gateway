@@ -810,25 +810,23 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
                           and str(item.get("iccid") or "") == str(inst.get("iccid") or "")), None)
         if not card_info:
             return
-        device_id, device_type = _device_for_card(card_info, cards)
-        desired = device_state.desired()
-        wanted = ((desired.get("devices") or {}).get(device_id)
-                  or desired.get("defaults") or {})
-        if not wanted.get("vowifi_enabled", True):
-            return
 
-        # A newly-seen SIM is intentionally persisted as a stopped draft while the card
-        # monitor is still learning its identity. Once the settled hotplug snapshot has all
-        # mandatory values, promote that same line automatically. This makes inserting a
-        # modem/SIM a complete operation instead of leaving the user to discover and submit
-        # the manual provisioning form. Only drafts are promoted here: a ready line that the
-        # user explicitly disabled remains disabled.
+        # Completing a newly discovered line describes the SIM and its hardware; it does not
+        # start VoWiFi. Do this before consulting the device switch so a deliberately disabled
+        # modem still gets a usable line record whose switch can be enabled later in the UI.
         if inst.get("provisioning_state") == "draft":
             inst = await asyncio.to_thread(_auto_promote_card_draft, inst, card_info, cards)
             if inst.get("provisioning_state") == "draft":
                 log.info("hotplug draft %s awaiting: %s", iid,
                          ", ".join(inst.get("auto_provision_missing") or []))
                 return
+
+        device_id, device_type = _device_for_card(card_info, cards)
+        desired = device_state.desired()
+        wanted = ((desired.get("devices") or {}).get(device_id)
+                  or desired.get("defaults") or {})
+        if not wanted.get("vowifi_enabled", True):
+            return
         if not inst.get("enabled", True):
             return
         await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
@@ -4194,6 +4192,23 @@ async def api_system_backup_delete(name: str):
 @app.post("/api/system/maintenance")
 async def api_system_maintenance(body: dict):
     action = str(body.get("action") or "")
+    if action in {"prune_build_cache", "prune_old_images"}:
+        try:
+            operation = (operations.prune_dangling_build_cache
+                         if action == "prune_build_cache" else operations.prune_old_mdd_images)
+            result = await asyncio.to_thread(operation)
+        except RuntimeError as exc:
+            # Keep Docker's actionable reason instead of returning a generic Internal Error.
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # Refresh immediately so the button's follow-up status request shows the reclaimed
+        # space. Keep alert acknowledgement semantics instead of resurrecting a cleared banner.
+        previous = hub.host_snapshot or None
+        snapshot = await asyncio.to_thread(sysinfo.collect, cfg.DATA_DIR)
+        current_alerts = sysinfo.alerts(snapshot, previous)
+        state = hub.host_alert_state or _load_host_alert_state()
+        hub.host_snapshot = snapshot
+        hub.host_alerts = _visible_host_alerts(current_alerts, state)
+        return {**result, "action": action}
     if action == "clear_notification_history":
         notify_push.clear_delivery_history()
         return {"ok": True, "action": action}

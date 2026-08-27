@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from control.app import config, operations
 
@@ -17,6 +17,46 @@ except ImportError:      # the Docker SDK is a manager runtime dependency this d
 
 
 class OperationsTests(unittest.TestCase):
+    def test_old_image_cleanup_keeps_live_current_and_trusted_images(self):
+        def image(image_id, tags, managed=True):
+            value = Mock(id=image_id, tags=tags)
+            value.attrs = {"Config": {"Labels": {
+                "io.mdd-sim-gateway.managed": "true" if managed else "false"}}}
+            return value
+
+        current = image("current", ["mdd-sim-gateway/engine:latest",
+                                     "mdd-sim-gateway/engine:previous"])
+        base = image("base", ["mdd-sim-gateway/engine-base:trusted"])
+        live_old = image("live-old", ["mdd-sim-gateway/engine:emergency"])
+        rollback = image("rollback", ["mdd-sim-gateway/engine:previous",
+                                       "mdd-sim-gateway/engine:old-test"])
+        unrelated = image("other", ["other/app:latest"], managed=False)
+        client = Mock()
+        client.df.side_effect = [
+            {"ImageUsage": {"TotalSize": 10_000}},
+            {"ImageUsage": {"TotalSize": 6_000}},
+        ]
+        client.images.list.return_value = [current, base, live_old, rollback, unrelated]
+        client.containers.list.return_value = [Mock(image=live_old)]
+        with patch.object(operations.docker, "from_env", return_value=client):
+            result = operations.prune_old_mdd_images()
+
+        self.assertEqual(result, {"ok": True, "removed_images": 1,
+                                  "space_reclaimed_bytes": 4_000})
+        client.images.remove.assert_called_once_with(
+            "rollback", force=True, noprune=False)
+        client.containers.list.assert_called_once_with(all=True)
+        client.close.assert_called_once_with()
+
+    def test_build_cache_cleanup_uses_dangling_mode_without_all(self):
+        client = Mock()
+        client.api.prune_builds.return_value = {"SpaceReclaimed": 12345}
+        with patch.object(operations.docker, "from_env", return_value=client):
+            result = operations.prune_dangling_build_cache()
+        self.assertEqual(result, {"ok": True, "space_reclaimed_bytes": 12345})
+        client.api.prune_builds.assert_called_once_with(all=False)
+        client.close.assert_called_once_with()
+
     def test_engine_sources_do_not_log_authentication_secrets(self):
         root = Path(__file__).resolve().parents[1]
         sources = "\n".join(

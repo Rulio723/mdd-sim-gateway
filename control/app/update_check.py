@@ -23,6 +23,7 @@ _cache: tuple[float, dict] | None = None
 _stars_cache: int | None = None
 _stars_checked_at = 0.0
 _STARS_CACHE_SECONDS = 15 * 60
+_MAX_RELEASE_NOTES_CHARS = 16_000
 # How long a "running" progress document may go unrefreshed before it stops counting as proof
 # that an update is alive. The orchestrator retires abandoned runs within a minute by asking
 # systemd whether the updater unit still exists; these are the control plane's own fallback for
@@ -261,7 +262,7 @@ def check(force: bool = False) -> dict:
                 "update_available": _version_tuple(latest) > _version_tuple(VERSION),
                 "release_url": str(payload.get("html_url") or ""),
                 "published_at": str(payload.get("published_at") or ""),
-                "notes": str(payload.get("body") or "")[:4000],
+                "notes": str(payload.get("body") or "")[:_MAX_RELEASE_NOTES_CHARS],
                 "network": selection,
                 "asset_sizes": assets,
                 "stars": _stargazers(session, headers, repository_name),

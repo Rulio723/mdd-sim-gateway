@@ -28,6 +28,13 @@ MDD Sim Gateway is a self-hosted multi-SIM communications gateway for Debian, Ub
 
 Use an ARM64 Debian, Ubuntu or Armbian host with systemd, Docker, USB and a stable network connection.
 
+Storage requirements: keep at least **4 GiB free on the root filesystem** before installation.
+A **16 GB or larger** system disk is recommended, with about **6 GiB free** before an upgrade so
+the new image and one rollback generation can coexist. Development checkouts and explicit source
+builds create substantially more temporary build cache and are unsuitable for space-constrained
+devices. Enlarging a VM's virtual disk alone is not enough: grow its root partition and filesystem,
+then use `df -h /` as the authoritative capacity.
+
 ```bash
 git clone https://github.com/MddIdd/mdd-sim-gateway.git
 cd mdd-sim-gateway

@@ -18,6 +18,14 @@ class Result:
         self.stderr = stderr
 
 
+def is_create_call(args, modem_path=None):
+    prefix = [
+        "busctl", "--system", "call", "org.freedesktop.ModemManager1",
+        modem_path, "org.freedesktop.ModemManager1.Modem.Messaging", "Create",
+    ]
+    return len(args) >= len(prefix) and args[:len(prefix)] == prefix
+
+
 class MemoryTracker:
     """Small successful durable-tracker stand-in for command-focused tests."""
 
@@ -52,7 +60,7 @@ class CellularSmsTests(unittest.TestCase):
         kwargs.setdefault("epoch_getter", lambda: TEST_EPOCH)
         return cellular_sms.send(*args, **kwargs)
 
-    def test_received_sms_is_mapped_to_instance_by_iccid(self):
+    def test_received_sms_is_mapped_to_instance_by_case_insensitive_iccid(self):
         modem = "/org/freedesktop/ModemManager1/Modem/0"
         sim = "/org/freedesktop/ModemManager1/SIM/0"
         sms = "/org/freedesktop/ModemManager1/SMS/7"
@@ -73,7 +81,7 @@ class CellularSmsTests(unittest.TestCase):
         def runner(args, **_kwargs):
             return responses.get(tuple(args), Result(returncode=1))
 
-        rows = cellular_sms.discover([{"id": "3", "iccid": "card-a"}], runner=runner)
+        rows = cellular_sms.discover([{"id": "3", "iccid": "CARD-A"}], runner=runner)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["instance"], "3")
         self.assertEqual(rows[0]["direction"], "in")
@@ -175,7 +183,7 @@ class CellularSmsTests(unittest.TestCase):
         scanner.discover([{"id": "3", "iccid": "card-a"}])
         self.assertEqual(tracker.prunes, [])
 
-    def test_send_matches_iccid_and_passes_body_via_private_file(self):
+    def test_send_matches_case_insensitive_iccid_and_passes_typed_dbus_text(self):
         modem = "/org/freedesktop/ModemManager1/Modem/2"
         sim = "/org/freedesktop/ModemManager1/SIM/2"
         sms = "/org/freedesktop/ModemManager1/SMS/41"
@@ -195,18 +203,16 @@ class CellularSmsTests(unittest.TestCase):
             if args == ["mmcli", "-m", modem, "--messaging-status", "--output-json"]:
                 return Result(json.dumps({"modem": {"messaging": {
                     "supported-storages": ["me"]}}}))
-            if "--messaging-create-sms=number=6700" in args:
-                text_arg = next(item for item in args
-                                if item.startswith("--messaging-create-sms-with-text="))
-                with open(text_arg.split("=", 1)[1], encoding="utf-8") as handle:
-                    captured["body"] = handle.read()
-                return Result(json.dumps({"modem": {"messaging": {"created-sms": sms}}}))
+            if is_create_call(args, modem):
+                captured["body"] = args[-1]
+                captured["properties"] = args[7:-1]
+                return Result(f'o "{sms}"\n')
             if args == ["mmcli", "-s", sms, "--send", "--output-json"]:
                 return Result("{}")
             return Result(returncode=1)
 
         result = self.send(
-            [{"id": "3", "iccid": "card-b"}], "3", "6700", body, runner=runner)
+            [{"id": "3", "iccid": "CARD-B"}], "3", "6700", body, runner=runner)
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "sent")
@@ -214,7 +220,10 @@ class CellularSmsTests(unittest.TestCase):
         self.assertEqual(result["sms_path"], sms)
         self.assertEqual(result["transport"], "cellular")
         self.assertEqual(captured["body"], body)
-        self.assertFalse(any(body in arg for call in calls for arg in call))
+        self.assertEqual(captured["properties"],
+                         ["a{sv}", "2", "number", "s", "6700", "text", "s"])
+        self.assertFalse(any(any(arg.startswith("--messaging-create-sms") for arg in call)
+                             for call in calls))
 
     def test_scanner_suppresses_sms_object_created_by_send(self):
         modem = "/org/freedesktop/ModemManager1/Modem/3"
@@ -232,8 +241,8 @@ class CellularSmsTests(unittest.TestCase):
                 return Result(json.dumps({"sim": {"properties": {"iccid": "card-c"}}}))
             if args == ["mmcli", "-m", modem, "--messaging-status", "--output-json"]:
                 return Result("{}")
-            if "--messaging-create-sms=number=888" in args:
-                return Result(json.dumps({"modem": {"messaging": {"created-sms": sms}}}))
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
             if args == ["mmcli", "-s", sms, "--send", "--output-json"]:
                 return Result("{}")
             if args == ["mmcli", "-m", modem, "--messaging-list-sms", "--output-json"]:
@@ -265,9 +274,8 @@ class CellularSmsTests(unittest.TestCase):
                 return Result(json.dumps({"sim": {"properties": {"iccid": "card-d"}}}))
             if "--messaging-status" in args:
                 return Result("{}")
-            if any(item.startswith("--messaging-create-sms=") for item in args):
-                return Result(json.dumps({"modem": {"messaging": {
-                    "created-sms": "/tmp/not-an-sms"}}}))
+            if is_create_call(args, modem):
+                return Result('o "/tmp/not-an-sms"\n')
             return Result(returncode=1)
 
         result = self.send(
@@ -293,8 +301,8 @@ class CellularSmsTests(unittest.TestCase):
                 return Result(json.dumps({"sim": {"properties": {"iccid": "card-e"}}}))
             if "--messaging-status" in args:
                 return Result("{}")
-            if any(item.startswith("--messaging-create-sms=") for item in args):
-                return Result(json.dumps({"modem": {"messaging": {"created-sms": sms}}}))
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
             if "--send" in args:
                 send_calls.append(tuple(args))
                 raise subprocess.TimeoutExpired(args, kwargs["timeout"])
@@ -352,7 +360,7 @@ class CellularSmsTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["stage"], "track")
-        self.assertFalse(any("--messaging-create-sms=number=6700" in call for call in calls))
+        self.assertFalse(any(is_create_call(list(call), modem) for call in calls))
         self.assertFalse(any("--send" in call for call in calls))
 
     def test_send_is_refused_when_created_path_cannot_be_durably_bound(self):
@@ -371,8 +379,8 @@ class CellularSmsTests(unittest.TestCase):
                 return Result(json.dumps({"sim": {"properties": {"iccid": "card-h"}}}))
             if "--messaging-status" in args:
                 return Result("{}")
-            if "--messaging-create-sms=number=888" in args:
-                return Result(json.dumps({"modem": {"messaging": {"created-sms": sms}}}))
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
             return Result(returncode=1)
 
         result = cellular_sms.send(
@@ -399,7 +407,7 @@ class CellularSmsTests(unittest.TestCase):
                 return Result(json.dumps({"sim": {"properties": {"iccid": "card-j"}}}))
             if "--messaging-status" in args:
                 return Result("{}")
-            if any(item.startswith("--messaging-create-sms=") for item in args):
+            if is_create_call(args, modem):
                 raise subprocess.TimeoutExpired(args, kwargs["timeout"])
             return Result(returncode=1)
 
@@ -573,8 +581,8 @@ class CellularSmsTests(unittest.TestCase):
                 return Result(json.dumps({"sim": {"properties": {"iccid": "card-i"}}}))
             if "--messaging-status" in args:
                 return Result("{}")
-            if "--messaging-create-sms=number=6700" in args:
-                return Result(json.dumps({"modem": {"messaging": {"created-sms": sms}}}))
+            if is_create_call(args, modem):
+                return Result(f'o "{sms}"\n')
             if args == ["mmcli", "-s", sms, "--send", "--output-json"]:
                 return Result("{}")
             if args == ["mmcli", "-m", modem, "--messaging-list-sms", "--output-json"]:

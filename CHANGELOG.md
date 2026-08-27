@@ -2,6 +2,80 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.5.3] - 2026-08-27
+
+### Changed
+
+- Official releases now provide native ARM64 and amd64 Engine and Control image assets. Fresh
+  installs from the official source archive and one-click upgrades download only the host's
+  architecture, verify its checksum and image identity, and avoid compiling Asterisk or Docker
+  control images on the gateway. Development checkouts retain an explicit source-build path.
+  Continuous integration now builds and validates the Engine natively on both architectures so
+  an architecture-specific packaging difference is caught before a release tag is created.
+
+- After moving an official installation to verified prebuilt images, the installer removes
+  dangling legacy Docker build cache left by earlier on-device builds. It uses the conservative
+  builder prune mode without `--all` and does not remove images, containers, or volumes.
+
+- Host diagnostics now show the filesystem's total, used and available space together with
+  separate MDD file, image, container-layer and shared Docker build-cache figures. System
+  maintenance can explicitly remove dangling builder records and reports the bytes reclaimed,
+  without deleting images, containers, volumes or reusable cache.
+
+- Administrators can explicitly remove unused old and rollback MDD images when disk space matters
+  more than one-click rollback. Current images, the trusted Engine base and every image referenced
+  by a container remain protected. The product overview now states the minimum free space,
+  recommended system-disk capacity and the need to expand a VM's root partition after its disk.
+
+### Fixed
+
+- The update dialog no longer truncates bilingual Release notes at 4,000 characters. It retains
+  a bounded 16,000-character response so important notices, patch changes and the current feature
+  release summary remain visible together.
+
+- Host storage diagnostics no longer present the sum of repeated Docker virtual image sizes as
+  physical MDD disk usage. They now show Docker's real layer-store total and independently report
+  the image and build-cache bytes Docker considers reclaimable. The maintenance button displays
+  its conservative build-cache estimate before confirmation. Build-cache cleanup no longer sends
+  Docker's unsupported `dangling` build/prune filter, and a daemon failure is returned as an
+  actionable error instead of a generic Internal Error.
+
+- Existing amd64 Docker-control installations on v1.4.x can now complete a direct v1.5.3
+  upgrade after the documented one-time mode-marker bootstrap. The target installer detects the
+  live Docker control plane, imports both verified amd64 Engine and Control assets through the
+  old updater's selected route, and restores the persisted Docker mode only after reload succeeds.
+  The bootstrap remains necessary because the immutable v1.4.x updater otherwise requests its
+  hard-coded ARM64 Control asset before any v1.5.3 code can run.
+
+- The navigation sidebar now follows Safari's dynamic viewport and provides native momentum
+  touch scrolling with bottom safe-area padding, so iPad users can reach version, repository and
+  sign-out controls instead of having the lower sidebar clipped behind browser chrome.
+
+- [Issue #17](https://github.com/MddIdd/mdd-sim-gateway/issues/17): cellular SMS sending
+  relied on an `mmcli` text-file option that is absent from ModemManager 1.20 on Ubuntu 22.04.
+  SMS objects are now created through ModemManager's stable D-Bus interface, preserving message
+  punctuation and Unicode without requiring a newer command-line client.
+
+- [Issue #18](https://github.com/MddIdd/mdd-sim-gateway/issues/18): ModemManager can report the
+  hexadecimal portion of an ICCID in uppercase while the saved PC/SC identity is lowercase.
+  Cellular SMS modem lookup and receive mapping now compare canonical case-insensitive ICCIDs.
+
+- [Issue #19](https://github.com/MddIdd/mdd-sim-gateway/issues/19): inserting a new SIM while
+  VoWiFi was disabled left its automatically discovered line permanently in draft state and
+  disabled the UI switch needed to recover it. Complete drafts are now promoted to usable line
+  records before the VoWiFi start policy is evaluated; the engine remains stopped until enabled.
+
+- [Issue #15](https://github.com/MddIdd/mdd-sim-gateway/issues/15): the v1.5.2 image cleanup
+  ran in the updater process copied from the installed version, so the first upgrade from an
+  older release could not execute the newly added cleanup. Cleanup now runs from the target
+  release's installer after a successful reload, making it effective on that first upgrade.
+
+- Superseded version tags in the MDD Control and Engine release repositories kept old images
+  from becoming dangling, so `docker image prune` alone could not enforce one-generation
+  rollback retention. Reload now removes only old MDD release-version tags before pruning,
+  while preserving the current version, `:previous`, the trusted Engine base, unrelated images,
+  and every image still referenced by a container.
+
 ## [1.5.2] - 2026-08-26
 
 ### Fixed

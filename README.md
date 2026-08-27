@@ -28,6 +28,11 @@ MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 
 
 推荐使用具备 systemd、Docker、USB 和稳定网络的 Debian、Ubuntu 或 Armbian ARM64 主机。
 
+存储要求：根文件系统安装前至少应有 **4 GiB 可用空间**；建议使用 **16 GB 或更大**的系统盘，
+并在升级前保留约 **6 GiB**，以同时容纳新镜像和一代回滚镜像。开发 checkout 或显式源码构建
+还会产生更大的临时构建缓存，不适合空间紧张的设备。虚拟机只扩大虚拟硬盘还不够，必须同步
+扩展根分区和文件系统，并以 `df -h /` 显示的容量为准。
+
 ```bash
 git clone https://github.com/MddIdd/mdd-sim-gateway.git
 cd mdd-sim-gateway

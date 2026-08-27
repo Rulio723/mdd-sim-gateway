@@ -13,7 +13,6 @@ import json
 import math
 import re
 import subprocess
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -66,6 +65,20 @@ def _invoke(args: list[str], runner, timeout: float):
         return None, "error"
 
 
+def _invoke_busctl(args: list[str], runner, timeout: float):
+    """Run one bounded system-bus call with the same failure contract as ``_invoke``."""
+    try:
+        result = runner(["busctl", "--system", "call", *args], capture_output=True, text=True,
+                        timeout=timeout, check=False)
+        return result, None
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError:
+        return None, "unavailable"
+    except Exception:
+        return None, "error"
+
+
 def _decode_json(result) -> dict:
     try:
         value = json.loads(getattr(result, "stdout", "") or "{}")
@@ -103,6 +116,11 @@ def _response(instance_id, *, ok: bool, status: str, error: str | None,
 def _content_hash(recipient: str, text: str) -> str:
     """Stable, non-plaintext identity shared by the sender and receive scanner."""
     return hashlib.sha256(f"{recipient}\0{text}".encode("utf-8")).hexdigest()
+
+
+def _normalize_iccid(value) -> str:
+    """Return the canonical comparison/storage form for a modem or configured ICCID."""
+    return str(value or "").strip().casefold()
 
 
 def _boot_id() -> str:
@@ -170,7 +188,7 @@ def _instance_iccid(instances: list[dict], instance_id) -> str:
     iid = str(instance_id)
     for item in instances or []:
         if isinstance(item, dict) and str(item.get("id")) == iid:
-            return str(item.get("iccid") or "").strip()
+            return _normalize_iccid(item.get("iccid"))
     return ""
 
 
@@ -206,9 +224,9 @@ def _find_modem(iccid: str, runner, timeout: float) -> tuple[str | None, str | N
             continue
         sim_doc = _decode_json(sim_detail)
         sim = sim_doc.get("sim") or {}
-        modem_iccid = str((sim.get("properties") or {}).get("iccid")
-                          or sim_doc.get("sim.properties.iccid") or "").strip()
-        if modem_iccid == iccid:
+        modem_iccid = _normalize_iccid((sim.get("properties") or {}).get("iccid")
+                                       or sim_doc.get("sim.properties.iccid"))
+        if modem_iccid == _normalize_iccid(iccid):
             return modem_path, None
 
     if inspection_failed:
@@ -222,7 +240,8 @@ def _created_sms_path(result) -> str:
     path = str((modem.get("messaging") or {}).get("created-sms")
                or doc.get("modem.messaging.created-sms") or "")
     if not path:
-        # Older mmcli versions may ignore the requested output format for this action.
+        # The D-Bus Create reply is printed by busctl as: o "/org/.../SMS/N".
+        # Keep accepting the old mmcli JSON shape for compatibility with focused callers/tests.
         match = re.search(r"/org/freedesktop/ModemManager1/SMS/\d+",
                           getattr(result, "stdout", "") or "")
         path = match.group(0) if match else ""
@@ -304,69 +323,53 @@ def send(instances: list[dict], instance_id, recipient: str, text: str,
                          error="Could not durably track the cellular SMS; it was not sent.",
                          stage="track", modem_path=modem_path)
 
-    try:
-        # Passing the body via a mode-0600 temporary file avoids both shell interpolation and
-        # mmcli's comma-separated key/value parser. The recipient grammar is restricted above.
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="mdd-sms-",
-                                         delete=True) as body_file:
-            body_file.write(text)
-            body_file.flush()
-            create_args = [
-                "-m", modem_path,
-                f"--messaging-create-sms=number={recipient}",
-                f"--messaging-create-sms-with-text={body_file.name}",
-                "--output-json",
-            ]
-            # Scanner takes this same lock while obtaining the modem's SMS path snapshot, so it
-            # cannot observe the new object in the tiny gap before its path is registered.
-            with _local_sms_lock:
-                create_result, problem = _invoke(create_args, runner, timeout)
-                if not problem and not getattr(create_result, "returncode", 1):
-                    sms_path = _created_sms_path(create_result)
-                    if sms_path:
-                        # The D-Bus owner must still be the one that accepted Create. A daemon
-                        # restart here makes the returned numeric path ambiguous, so never send
-                        # it through the new owner.
-                        if epoch_getter() != daemon_epoch:
-                            return _response(
-                                instance_id, ok=False, status="failed",
-                                error=("ModemManager restarted while creating the SMS; "
-                                       "it was not sent."),
-                                stage="track", modem_path=modem_path, sms_path=sms_path,
-                                reservation_id=reservation_id)
-                        try:
-                            tracked = bool(local_sms_tracker.bind_local_modem_sms(
-                                reservation_id, daemon_epoch, modem_path, sms_path))
-                        except Exception:
-                            tracked = False
-                        if not tracked:
-                            return _response(
-                                instance_id, ok=False, status="failed",
-                                error=("Could not durably bind the cellular SMS object; "
-                                       "it was not sent."),
-                                stage="track", modem_path=modem_path, sms_path=sms_path,
-                                reservation_id=reservation_id)
-                        _remember_local_sms(modem_path, iccid, sms_path)
-                    else:
-                        try:
-                            local_sms_tracker.cancel_local_modem_sms(reservation_id)
-                        except Exception:
-                            pass
-                        return _response(
-                            instance_id, ok=False, status="failed",
-                            error="ModemManager returned an invalid SMS object path.",
-                            stage="create", modem_path=modem_path,
-                            reservation_id=reservation_id)
-                else:
-                    sms_path = None
-    except OSError:
-        try:
-            local_sms_tracker.cancel_local_modem_sms(reservation_id)
-        except Exception:
-            pass
-        return _response(instance_id, ok=False, status="failed",
-                         error="Could not prepare the SMS body securely.", stage="create",
-                         modem_path=modem_path, reservation_id=reservation_id)
+    # mmcli 1.20 has no --messaging-create-sms-with-text option, while the underlying D-Bus
+    # Create(a{sv}) method has supported Number and Text since ModemManager 1.0. Passing an argv
+    # list (never a shell command) preserves punctuation and quotes as one typed string value.
+    create_args = [
+        "org.freedesktop.ModemManager1", modem_path,
+        "org.freedesktop.ModemManager1.Modem.Messaging", "Create",
+        "a{sv}", "2", "number", "s", recipient, "text", "s", text,
+    ]
+    # Scanner takes this same lock while obtaining the modem's SMS path snapshot, so it cannot
+    # observe the new object in the tiny gap before its path is registered.
+    with _local_sms_lock:
+        create_result, problem = _invoke_busctl(create_args, runner, timeout)
+        if not problem and not getattr(create_result, "returncode", 1):
+            sms_path = _created_sms_path(create_result)
+            if sms_path:
+                # The D-Bus owner must still be the one that accepted Create. A daemon restart
+                # here makes the returned numeric path ambiguous, so never send it through the
+                # new owner.
+                if epoch_getter() != daemon_epoch:
+                    return _response(
+                        instance_id, ok=False, status="failed",
+                        error="ModemManager restarted while creating the SMS; it was not sent.",
+                        stage="track", modem_path=modem_path, sms_path=sms_path,
+                        reservation_id=reservation_id)
+                try:
+                    tracked = bool(local_sms_tracker.bind_local_modem_sms(
+                        reservation_id, daemon_epoch, modem_path, sms_path))
+                except Exception:
+                    tracked = False
+                if not tracked:
+                    return _response(
+                        instance_id, ok=False, status="failed",
+                        error="Could not durably bind the cellular SMS object; it was not sent.",
+                        stage="track", modem_path=modem_path, sms_path=sms_path,
+                        reservation_id=reservation_id)
+                _remember_local_sms(modem_path, iccid, sms_path)
+            else:
+                try:
+                    local_sms_tracker.cancel_local_modem_sms(reservation_id)
+                except Exception:
+                    pass
+                return _response(
+                    instance_id, ok=False, status="failed",
+                    error="ModemManager returned an invalid SMS object path.",
+                    stage="create", modem_path=modem_path, reservation_id=reservation_id)
+        else:
+            sms_path = None
 
     if problem == "timeout":
         # Create may have succeeded even though its reply timed out. Keep the reservation so a
@@ -445,7 +448,7 @@ class Scanner:
             if not sim_path:
                 continue
             sim_doc = _run_json(["-i", sim_path], self.runner).get("sim") or {}
-            iccid = str((sim_doc.get("properties") or {}).get("iccid") or "")
+            iccid = _normalize_iccid((sim_doc.get("properties") or {}).get("iccid"))
             if iccid:
                 topology.append((modem_path, iccid))
         if topology != self._topology:
@@ -466,7 +469,7 @@ class Scanner:
             self._daemon_epoch = daemon_epoch
         if now >= self._topology_expires:
             self._refresh_topology(now)
-        by_iccid = {str(item.get("iccid") or ""): str(item.get("id")) for item in instances
+        by_iccid = {_normalize_iccid(item.get("iccid")): str(item.get("id")) for item in instances
                     if item.get("iccid") and item.get("id") is not None}
         found = []
         live_keys = set()
