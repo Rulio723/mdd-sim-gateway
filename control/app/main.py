@@ -2024,15 +2024,33 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
     try:
         allowed, blocked_reason = _line_auto_start_allowed(inst)
         if not allowed:
-            hub.reset_health(iid)
             no_card = blocked_reason == "no_card"
+            if no_card:
+                # Card discovery is a sampled cache, not an authoritative removal event. A
+                # native reader can briefly lose its ICCID/match while pcscd settles after the
+                # health policy removes the old container. Clearing the frozen state here made
+                # that one missed sample terminal: the ordinary poller then saw only STOPPED
+                # and had no recovery timer left to recreate the line. A real card-removal
+                # event still cancels recovery in _on_card_remove(); this path merely re-arms
+                # the cheap eligibility check until the cache identifies the card again.
+                h["auto_retrying"] = False
+                h["next_retry_at"] = time.monotonic() + delay
+                h["frozen_reason"] = (
+                    "The SIM card is temporarily unavailable; automatic recovery will retry.")
+            else:
+                # A disabled line or VoWiFi switch is durable user intent, unlike a transient
+                # card-cache miss. It must cancel a pending automatic start.
+                hub.reset_health(iid)
             stopped = _with_status_activity(iid, {
                 "state": "NO_CARD" if no_card else "STOPPED",
                 "label": "No SIM card" if no_card else status_mod.LABELS["STOPPED"],
                 "reason_code": blocked_reason,
                 "reason": ("SIM card is not available." if no_card
                            else "The line or its device VoWiFi switch is disabled."),
-                "detail": {}, "retry": {"count": 0, "max": 0}})
+                "detail": {}, "retry": {
+                    "count": h.get("retry_count", 0) if no_card else 0,
+                    "max": h.get("retry_count", 0) if no_card else 0,
+                }})
             hub.status_cache[str(iid)] = stopped
             hub.status_sampled_at[str(iid)] = time.monotonic()
             await hub.broadcast({"type": "status", "instance": str(iid), **stopped})

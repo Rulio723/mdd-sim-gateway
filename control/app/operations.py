@@ -41,13 +41,36 @@ _MULTILINE_SECRET = re.compile(
 )
 
 
-def redact(value, key: str = ""):
-    if _SECRET_KEYS.search(key):
+def _path_secret(path: tuple[str, ...]) -> bool:
+    """Fields whose generic names become private only in a specific document context."""
+    if not path:
+        return False
+    key = path[-1]
+    if _SECRET_KEYS.search(key) or key in {"profile_id", "proxy_profile_id"}:
+        return True
+    if "egress" in path and key in {"node", "pinned_node", "candidates"}:
+        return True
+    if "network" in path and "addresses" in path and key == "address":
+        return True
+    if len(path) >= 3 and path[0:2] == ("proxy", "profiles") \
+            and key in {"name", "value", "server", "username", "outbound_tag"}:
+        return True
+    return False
+
+
+def redact(value, key: str = "", path: tuple[str, ...] = ()):
+    current = path + ((key,) if key else ())
+    if _path_secret(current):
         return "<redacted>" if value not in (None, "", [], {}) else value
     if isinstance(value, dict):
-        return {str(k): redact(v, str(k)) for k, v in value.items()}
+        # Profile ids are operator-controlled labels and can themselves name a provider or
+        # account. Keep the number and shape of entries without exporting those labels.
+        if current == ("proxy", "profiles"):
+            return {f"profile-{index}": redact(v, path=current + ("[]",))
+                    for index, v in enumerate(value.values(), 1)}
+        return {str(k): redact(v, str(k), current) for k, v in value.items()}
     if isinstance(value, list):
-        return [redact(v, key) for v in value]
+        return [redact(v, path=current + ("[]",)) for v in value]
     if isinstance(value, str):
         value = _ACTIVATION_CODE.sub("<redacted-activation-code>", value)
         value = _URL.sub("<redacted-url>", value)
@@ -84,23 +107,24 @@ def redact_log(text: str) -> str:
     return "\n".join(lines)
 
 
-def _redact_record(value, key: str = ""):
+def _redact_record(value, key: str = "", path: tuple[str, ...] = ()):
     """Redact inside a diagnostic record, blanking only the strings that carry key material.
 
     Same rules as ``redact_log``, applied per string rather than per line. A captured log tail
     is a list of log lines, so each element gets exactly the treatment it would have got in
     its own file, and the registration/SIP/host evidence beside it survives.
     """
-    if _SECRET_KEYS.search(key):
+    current = path + ((key,) if key else ())
+    if _path_secret(current):
         return "<redacted>" if value not in (None, "", [], {}) else value
     if isinstance(value, dict):
-        return {str(k): _redact_record(v, str(k)) for k, v in value.items()}
+        return {str(k): _redact_record(v, str(k), current) for k, v in value.items()}
     if isinstance(value, list):
-        return [_redact_record(item, key) for item in value]
+        return [_redact_record(item, path=current + ("[]",)) for item in value]
     if isinstance(value, str):
         if _MULTILINE_SECRET.search(value) or _KEY_MATERIAL.search(value):
             return "<redacted cryptographic material>"
-        return redact(value)
+        return redact(value, path=current)
     return value
 
 

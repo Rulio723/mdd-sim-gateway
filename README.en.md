@@ -85,7 +85,9 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 - Send standard/custom Webhooks, Telegram notifications and PushPlus messages.
 - Check releases every six hours in the background. Choose automatic installation or notify-only,
   scoped to main releases or every release. Unattended installation still requires the exact version
-  and earliest rollout time to be approved separately in `update-policy.json`.
+  and earliest rollout time to be approved separately in `update-policy.json`. All-version
+  devices follow the approved latest Release, while main-only devices follow an independently
+  configured main Release even after newer patches have been published.
 - Telegram is notification-only and does not accept remote control commands.
 - Manage eUICC profiles through a pinned local lpac build, including dual-SE readers.
 - Offer HTTPS, first-run administrator setup, persistent 12-hour or 30-day sessions, CSRF protection,

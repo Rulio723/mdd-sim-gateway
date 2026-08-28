@@ -125,12 +125,13 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 main._line_auto_start_allowed(inst), (False, "vowifi_disabled"))
 
-    async def test_auto_recovery_does_not_recreate_an_absent_line(self):
+    async def test_auto_recovery_rechecks_a_transiently_absent_card(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
         main.hub.health_for("offline").update({
             "frozen_code": "tunnel_sim_auth", "frozen_reason": "failed",
-            "auto_retrying": True,
+            "auto_retrying": True, "retry_count": 3,
         })
+        started = main.time.monotonic()
         with patch.object(main, "_line_auto_start_allowed",
                           return_value=(False, "no_card")), \
                 patch.object(main, "_start_engine_checked") as start, \
@@ -139,6 +140,28 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
 
         start.assert_not_called()
         self.assertEqual(main.hub.status_cache["offline"]["state"], "NO_CARD")
+        health = main.hub.health["offline"]
+        self.assertEqual(health["frozen_code"], "tunnel_sim_auth")
+        self.assertFalse(health["auto_retrying"])
+        self.assertGreaterEqual(health["next_retry_at"], started + 60)
+
+    async def test_disabled_vowifi_still_cancels_pending_recovery(self):
+        inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
+        main.hub.health_for("offline").update({
+            "frozen_code": "tunnel_network", "frozen_reason": "failed",
+            "auto_retrying": True, "next_retry_at": 12345,
+        })
+        with patch.object(main, "_line_auto_start_allowed",
+                          return_value=(False, "vowifi_disabled")), \
+                patch.object(main, "_start_engine_checked") as start, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            await main._auto_recover_instance("offline", inst, 60)
+
+        start.assert_not_called()
+        health = main.hub.health["offline"]
+        self.assertIsNone(health["frozen_code"])
+        self.assertIsNone(health["next_retry_at"])
+        self.assertEqual(main.hub.status_cache["offline"]["state"], "STOPPED")
 
     async def test_card_removal_cancels_a_pending_recovery_without_a_container(self):
         inst = {"id": "removed", "iccid": "saved-card"}

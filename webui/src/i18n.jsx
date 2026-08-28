@@ -24,7 +24,7 @@ const zh = {
   'Choose automatic installation or notify-only, then select which versions it applies to.': '选择自动更新或提示更新，再设置适用的版本范围。',
   'Update method': '更新方式', 'Automatic update': '自动更新', 'Notify before updating': '提示更新',
   'Version range': '版本范围', 'Main versions only': '仅主版本', 'All versions': '全部版本',
-  'Main releases are explicitly marked in update-policy.json; version numbers are not used to classify them. Only releases marked as main are selected by “Main versions only”.': '主版本由 update-policy.json 明确标记，不根据版本号判断；选择“仅主版本”时，只处理被标记为主版本的 Release。',
+  'The All versions option follows the approved latest Release. Main versions only follows the independently configured stable main Release, even when newer patches exist.': '“全部版本”跟随获准推送的最新 Release；“仅主版本”跟随独立配置的稳定主版本，即使已有更新补丁也能补装该主版本。',
   'Matching releases only send one notice. Installation starts only after you review and confirm it manually.': '符合范围的版本只提示一次；查看版本说明并手动确认后才会开始安装。',
   'Delete this local backup? This cannot be undone.': '确定删除这份本地备份吗？删除后无法恢复。', 'Backup deleted': '备份已删除',
   'Importing the verified control image…': '正在导入已校验的控制镜像…',

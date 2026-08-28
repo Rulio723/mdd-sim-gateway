@@ -109,6 +109,48 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertEqual(early["release_kind"], "main")
         self.assertTrue(ready["authorized"])
 
+    def test_channel_policy_authorizes_main_independently_of_latest_patch(self):
+        info = {"update_available": True, "latest": "1.6.0",
+                "network": {"proxy_mode": "direct", "proxy_profile_id": ""}}
+        policy = {
+            "schema": 1,
+            "release": {"version": "1.6.1", "kind": "patch"},
+            "auto_update": {"version": "1.6.1", "not_before": "2026-09-01T00:00:00Z"},
+            "channels": {
+                "all": {"version": "1.6.1", "not_before": "2026-09-01T00:00:00Z"},
+                "main": {"version": "1.6.0", "not_before": "2026-08-01T00:00:00Z"},
+            },
+        }
+        result = update_check.auto_update_authorization(
+            info, datetime(2026, 8, 27, tzinfo=timezone.utc), scope="main", policy=policy)
+        self.assertTrue(result["authorized"])
+        self.assertEqual(result["release_kind"], "main")
+        self.assertEqual(result["target_version"], "1.6.0")
+
+    def test_tagged_release_lookup_can_fetch_an_older_configured_main(self):
+        payload = {"tag_name": "v1.6.0", "html_url": "https://example.invalid/v1.6.0",
+                   "assets": [{"name": "mdd-sim-gateway-v1.6.0.tar.gz", "size": 1024}]}
+        session = MagicMock()
+        session.get.return_value = _Response(payload)
+        with patch.object(update_check, "_network_candidates", return_value=[{
+                "proxy_mode": "direct", "proxy_profile_id": ""}]), \
+                patch.object(update_check, "_session", return_value=session):
+            result = update_check.check_release("1.6.0")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["latest"], "1.6.0")
+        self.assertTrue(result["update_available"])
+        self.assertIn("/releases/tags/v1.6.0", session.get.call_args.args[0])
+
+    def test_tagged_main_target_must_be_a_stable_release(self):
+        session = MagicMock()
+        session.get.return_value = _Response({"tag_name": "v1.6.0", "prerelease": True})
+        with patch.object(update_check, "_network_candidates", return_value=[{
+                "proxy_mode": "direct", "proxy_profile_id": ""}]), \
+                patch.object(update_check, "_session", return_value=session):
+            result = update_check.check_release("1.6.0")
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["update_available"])
+
     def test_unpromoted_release_cannot_auto_update(self):
         info = {"update_available": True, "latest": "1.5.0",
                 "network": {"proxy_mode": "direct", "proxy_profile_id": ""}}
@@ -122,6 +164,21 @@ class UpdateCheckTests(unittest.TestCase):
             result = update_check.auto_update_authorization(info)
         self.assertFalse(result["authorized"])
         self.assertEqual(result["reason"], "not_promoted")
+
+    def test_repository_policy_keeps_legacy_and_all_channel_in_sync(self):
+        policy = __import__("json").loads(
+            (Path(__file__).resolve().parents[1] / "update-policy.json").read_text())
+        self.assertEqual(policy["auto_update"], policy["channels"]["all"])
+        self.assertEqual(
+            update_check._policy_target(
+                policy, "all", policy["release"]["version"]),
+            policy["channels"]["all"]["version"],
+        )
+        self.assertEqual(
+            update_check._policy_target(
+                policy, "main", policy["release"]["version"]),
+            policy["channels"]["main"]["version"],
+        )
 
     def test_repository_can_be_overridden_without_changing_the_ui(self):
         self.assertEqual(update_check.repository(), "MddIdd/mdd-sim-gateway")
@@ -218,15 +275,28 @@ class UpdateAutomationTests(unittest.TestCase):
             "webhook": {"enabled": False}, "pushplus": {"enabled": False},
         }
 
+    def _policy(self, *, all_version="1.5.0", main_version="1.5.0",
+                all_not_before="2026-01-01T00:00:00Z",
+                main_not_before="2026-01-01T00:00:00Z"):
+        return {
+            "schema": 1,
+            "release": {"version": all_version, "kind": "patch"},
+            # Old clients continue to follow the latest/all rollout.
+            "auto_update": {"version": all_version, "not_before": all_not_before},
+            "channels": {
+                "all": {"version": all_version, "not_before": all_not_before},
+                "main": {"version": main_version, "not_before": main_not_before},
+            },
+        }
+
     def test_release_is_not_applied_without_promotion(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(config, "DATA_DIR", temp), \
                 patch.object(update_check, "check", return_value=dict(self.INFO)), \
                 patch.object(config, "get_settings",
                              return_value=self._settings()), \
-                patch.object(update_check, "auto_update_authorization",
-                             return_value={"authorized": False, "reason": "not_promoted",
-                                           "release_kind": "main"}), \
+                patch.object(update_check, "_load_update_policy", return_value=self._policy(
+                    main_not_before="2099-01-01T00:00:00Z")), \
                 patch.object(update_check, "request_apply") as apply, \
                 patch("control.app.notify_push.dispatch"):
             result = update_check.automation_cycle()
@@ -239,9 +309,8 @@ class UpdateAutomationTests(unittest.TestCase):
                 patch.object(update_check, "check", return_value=dict(self.INFO)), \
                 patch.object(config, "get_settings",
                              return_value=self._settings()), \
-                patch.object(update_check, "auto_update_authorization",
-                             return_value={"authorized": True, "reason": "promoted",
-                                           "release_kind": "main"}), \
+                patch.object(update_check, "_load_update_policy",
+                             return_value=self._policy()), \
                 patch.object(update_check, "request_apply", return_value={"ok": True}) as apply, \
                 patch("control.app.notify_push.dispatch") as dispatch:
             first = update_check.automation_cycle()
@@ -261,25 +330,32 @@ class UpdateAutomationTests(unittest.TestCase):
                 patch.object(config, "get_settings",
                              return_value=self._settings(update_mode="notify",
                                                          version_scope="main")), \
-                patch.object(update_check, "auto_update_authorization",
-                             return_value={"authorized": False, "release_kind": "patch"}), \
+                patch.object(update_check, "_load_update_policy", return_value=self._policy(
+                    all_version=patch_info["latest"], main_version=update_check.VERSION)), \
+                patch.object(update_check, "check_release", return_value={
+                    "ok": True, "latest": update_check.VERSION, "update_available": False}), \
                 patch("control.app.notify_push.dispatch") as dispatch:
             result = update_check.automation_cycle()
         self.assertFalse(result["notified"])
         dispatch.assert_not_called()
 
     def test_notify_main_scope_announces_policy_classified_main_release(self):
+        latest = {**self.INFO, "latest": "1.6.1"}
+        main_info = {**self.INFO, "latest": "1.6.0"}
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(config, "DATA_DIR", temp), \
-                patch.object(update_check, "check", return_value=dict(self.INFO)), \
+                patch.object(update_check, "check", return_value=latest), \
                 patch.object(config, "get_settings", return_value=self._settings(
                     update_mode="notify", version_scope="main")), \
-                patch.object(update_check, "auto_update_authorization",
-                             return_value={"authorized": False, "release_kind": "main"}), \
+                patch.object(update_check, "_load_update_policy", return_value=self._policy(
+                    all_version="1.6.1", main_version="1.6.0")), \
+                patch.object(update_check, "check_release", return_value=main_info) as tagged, \
                 patch("control.app.notify_push.dispatch") as dispatch:
             result = update_check.automation_cycle()
         self.assertTrue(result["notified"])
         dispatch.assert_called_once()
+        tagged.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[3], "1.6.0")
 
     def test_automatic_all_scope_installs_a_stable_patch_without_notice(self):
         patch_info = {**self.INFO, "latest": update_check.VERSION.rsplit(".", 1)[0] + ".99"}
@@ -288,8 +364,8 @@ class UpdateAutomationTests(unittest.TestCase):
                 patch.object(update_check, "check", return_value=patch_info), \
                 patch.object(config, "get_settings", return_value=self._settings(
                     update_mode="automatic", version_scope="all")), \
-                patch.object(update_check, "auto_update_authorization",
-                             return_value={"authorized": True, "reason": "promoted"}), \
+                patch.object(update_check, "_load_update_policy", return_value=self._policy(
+                    all_version=patch_info["latest"])), \
                 patch.object(update_check, "request_apply", return_value={"ok": True}) as apply, \
                 patch("control.app.notify_push.dispatch") as dispatch:
             result = update_check.automation_cycle()
@@ -298,23 +374,24 @@ class UpdateAutomationTests(unittest.TestCase):
         dispatch.assert_not_called()
         apply.assert_called_once()
 
-    def test_automatic_main_scope_ignores_policy_classified_patch(self):
-        patch_info = {**self.INFO, "latest": update_check.VERSION.rsplit(".", 1)[0] + ".99"}
+    def test_automatic_main_scope_installs_configured_main_behind_latest_patch(self):
+        patch_info = {**self.INFO, "latest": "1.6.1"}
+        main_info = {**self.INFO, "latest": "1.6.0"}
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(config, "DATA_DIR", temp), \
                 patch.object(update_check, "check", return_value=patch_info), \
                 patch.object(config, "get_settings", return_value=self._settings()), \
-                patch.object(update_check, "auto_update_authorization",
-                             return_value={"authorized": True,
-                                           "release_kind": "patch"}) as authorization, \
-                patch.object(update_check, "request_apply") as apply, \
+                patch.object(update_check, "_load_update_policy", return_value=self._policy(
+                    all_version="1.6.1", main_version="1.6.0")), \
+                patch.object(update_check, "check_release", return_value=main_info) as tagged, \
+                patch.object(update_check, "request_apply", return_value={"ok": True}) as apply, \
                 patch("control.app.notify_push.dispatch") as dispatch:
             result = update_check.automation_cycle()
         self.assertFalse(result["notified"])
-        self.assertFalse(result["auto_update_requested"])
+        self.assertTrue(result["auto_update_requested"])
         dispatch.assert_not_called()
-        authorization.assert_called_once()
-        apply.assert_not_called()
+        tagged.assert_called_once_with("1.6.0", patch_info["network"])
+        apply.assert_called_once_with(info=main_info)
 
     def test_notify_all_scope_notifies_without_applying(self):
         with tempfile.TemporaryDirectory() as temp, \

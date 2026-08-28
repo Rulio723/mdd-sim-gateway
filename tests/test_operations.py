@@ -106,6 +106,33 @@ class OperationsTests(unittest.TestCase):
         )
         self.assertEqual(operations.redact_log(diagnostic), diagnostic)
 
+    def test_redaction_removes_proxy_labels_nodes_and_host_addresses_by_path(self):
+        document = {
+            "proxy": {
+                "profiles": {"private-provider": {
+                    "name": "My private provider", "type": "node",
+                    "value": "vless://opaque-share-value",
+                }},
+                "exits": {"gb": {"profile_id": "private-provider",
+                                   "pinned_node": "Residential London"}},
+            },
+            "egress": {"node": "Residential London",
+                       "candidates": ["Residential London", "Backup London"],
+                       "ready": True},
+            "host": {"network": {"addresses": [
+                {"interface": "eth0", "family": "ipv4", "address": "192.0.2.44/24"}
+            ]}},
+        }
+
+        redacted = operations.redact(document)
+        encoded = json.dumps(redacted)
+
+        for private in ("private-provider", "My private provider", "opaque-share-value",
+                        "Residential London", "Backup London", "192.0.2.44"):
+            self.assertNotIn(private, encoded)
+        self.assertTrue(redacted["egress"]["ready"])
+        self.assertEqual(list(redacted["proxy"]["profiles"]), ["profile-1"])
+
     def test_apdu_trace_fallback_does_not_repeat_failed_unpack(self):
         source = (Path(__file__).resolve().parents[1] / "engine/swu_ike.py").read_text(
             errors="replace")
@@ -348,6 +375,22 @@ class OperationsTests(unittest.TestCase):
         # A line that will not parse must not become a hole in the redaction.
         self.assertNotIn("00112233445566778899", text)
         self.assertIn("<redacted cryptographic material>", text.splitlines()[-1])
+
+    def test_diagnostic_redaction_removes_issue_21_support_bundle_leaks(self):
+        record = {
+            "reason": "health-freeze:reg_rejected",
+            "egress": {"node": "Private exit name", "selection": "auto", "ready": True},
+            "host": {"alerts": [], "network": {"addresses": [
+                {"interface": "eth0", "family": "ipv4", "address": "198.51.100.8/24"}
+            ]}},
+        }
+
+        parsed = json.loads(operations.redact_jsonl(json.dumps(record)))
+
+        self.assertEqual(parsed["egress"]["node"], "<redacted>")
+        self.assertEqual(parsed["host"]["network"]["addresses"][0]["address"], "<redacted>")
+        self.assertEqual(parsed["reason"], "health-freeze:reg_rejected")
+        self.assertTrue(parsed["egress"]["ready"])
 
     def test_plain_logs_keep_the_strict_whole_line_rules(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):

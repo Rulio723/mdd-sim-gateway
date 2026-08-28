@@ -5,7 +5,7 @@ labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Never include a PIN, IMSI, ICCID, EID, phone number, proxy URL or token.
+      value: Never include a PIN, IMSI, ICCID, EID, phone number, proxy URL or token. A read-only Codex workflow may analyze this public report and post a clearly marked draft response; a maintainer makes the final decision.
   - type: input
     id: version
     attributes:

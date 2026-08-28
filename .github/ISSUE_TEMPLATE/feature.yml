@@ -3,6 +3,9 @@ description: Propose a device, carrier-independent capability, or UX improvement
 title: "[Feature] "
 labels: [enhancement]
 body:
+  - type: markdown
+    attributes:
+      value: Never include credentials, subscriber identifiers, phone numbers, private URLs or tokens. A read-only Codex workflow may analyze this public request and post a clearly marked draft response; a maintainer makes the final decision.
   - type: textarea
     id: problem
     attributes:
