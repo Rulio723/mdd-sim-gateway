@@ -38,27 +38,33 @@ function ansi(text) {
   return out
 }
 
-export default function Logs({ selected, instances, cards, devices, setSelected }) {
+export default function Logs({ selected, instances, cards, devices, setSelected, initialLoading, loadErrors }) {
   const { t } = useI18n()
   const id = selected?.id
   const [logs, setLogs] = useState({ engine: '', charon: '' })
   const [tab, setTab] = useState('engine')
   const [auto, setAuto] = useState(true)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(false)
 
   const load = useCallback(async () => {
     if (!id) return
-    try { setLogs(await api.logs(id, 400)) } catch {}
+    try { setLogs(await api.logs(id, 400)); setLoadError(false) }
+    catch { setLoadError(true) }
+    finally { setLoading(false) }
   }, [id])
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => { setLogs({ engine: '', charon: '' }); setLoading(true); setLoadError(false); load() }, [load])
   useEffect(() => {
     if (!auto) return
     const t = setInterval(load, 3000)
     return () => clearInterval(t)
   }, [auto, load])
 
-  const rendered = useMemo(() => ansi(logs[tab] || t('(empty)')), [logs, tab, t])
+  const rendered = useMemo(() => ansi(loading ? `${t('Loading')}…` : loadError ? t('Loading failed') : (logs[tab] || t('(empty)'))), [logs, tab, loading, loadError, t])
 
+  if (initialLoading && !id) return <p role="status">{t('Loading')}…</p>
+  if (loadErrors?.instances && !id) return <p className="u-error">{t('Loading failed')}</p>
   if (!id) return (
     <div>
       <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} label={t('Show logs for')} />

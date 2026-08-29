@@ -21,6 +21,83 @@ from control.app.notify_push import (
 
 
 class NotificationChannelTests(unittest.TestCase):
+    def test_message_templates_are_scoped_to_one_event(self):
+        sms = build_payload(EV_INCOMING_SMS, {"id": 1, "name": "UK SIM"}, "+44700", "hello")
+        cfg = {"message_templates": {EV_INCOMING_SMS: {
+            "title": "{{sim_name}} 收到 {{event}}",
+            "content": "{{from}}: {{text}}",
+        }}}
+        self.assertEqual(build_notification_message(sms, cfg), {
+            "title": "UK SIM 收到 incoming_sms", "content": "+44700: hello"})
+        call = build_payload(EV_INCOMING_CALL, {"id": 1, "name": "UK SIM"}, "+44700", None)
+        self.assertIn("来电", build_notification_message(call, cfg)["title"])
+
+    def test_message_templates_can_wrap_the_default_title_and_content(self):
+        payload = build_payload(EV_INCOMING_SMS, {"id": 1, "name": "UK SIM"}, "+44700", "hello")
+        message = build_notification_message(payload, {"message_templates": {EV_INCOMING_SMS: {
+            "title": "[Home] {{title}}", "content": "---\n{{content}}",
+        }}})
+        self.assertTrue(message["title"].startswith("[Home] MDD"))
+        self.assertIn("hello", message["content"])
+
+    def test_unknown_message_template_fields_are_rejected(self):
+        payload = build_payload(EV_INCOMING_SMS, {"id": 1}, "+100", "hello")
+        with self.assertRaisesRegex(ValueError, "unknown notification template field"):
+            build_notification_message(payload, {"message_templates": {EV_INCOMING_SMS: {
+                "content": "{{arbitrary_code}}",
+            }}})
+
+    def test_message_template_configuration_is_validated_before_save(self):
+        notify_push.validate_message_templates({"message_templates": {EV_INCOMING_SMS: {
+            "title": "{{title}}", "content": "{{text}}",
+        }}})
+        with self.assertRaisesRegex(ValueError, "channel configuration must be an object"):
+            notify_push.validate_message_templates([])
+        with self.assertRaisesRegex(ValueError, "unknown notification template event"):
+            notify_push.validate_message_templates({"message_templates": {"shell": {
+                "content": "no",
+            }}})
+        with self.assertRaisesRegex(ValueError, "unknown notification template property"):
+            notify_push.validate_message_templates({"message_templates": {EV_INCOMING_SMS: {
+                "execute": "no",
+            }}})
+
+    def test_standard_webhook_includes_rendered_human_message(self):
+        payload = build_payload(EV_INCOMING_SMS, {"id": 1, "name": "UK SIM"}, "+100", "hello")
+        _method, _url, kwargs = build_webhook_request({
+            "url": "https://example.test/hook",
+            "message_templates": {EV_INCOMING_SMS: {"title": "SMS · {{sim_name}}"}},
+        }, payload)
+        self.assertEqual(kwargs["json"]["title"], "SMS · UK SIM")
+        self.assertIn("hello", kwargs["json"]["content"])
+
+    def test_custom_webhook_payload_uses_rendered_message_fields(self):
+        payload = build_payload(EV_INCOMING_SMS, {"id": 1, "name": "UK SIM"}, "+100", "hello")
+        _method, _url, kwargs = build_webhook_request({
+            "format": "custom", "url": "https://example.test/hook",
+            "payload_template": '{"subject":"{{title}}","body":"{{content}}"}',
+            "message_templates": {EV_INCOMING_SMS: {
+                "title": "Custom {{sim_name}}", "content": "Body {{text}}",
+            }},
+        }, payload)
+        self.assertEqual(kwargs["json"], {"subject": "Custom UK SIM", "body": "Body hello"})
+
+    def test_telegram_uses_the_selected_event_template(self):
+        payload = build_payload(EV_INCOMING_SMS, {"id": 1, "name": "UK SIM"}, "+100", "hello")
+        rendered = notify_push._telegram_text(payload, {"message_templates": {EV_INCOMING_SMS: {
+            "title": "SMS from {{from}}", "content": "{{text}}",
+        }}})
+        self.assertEqual(rendered, "SMS from +100\n\nhello")
+
+    def test_telegram_keeps_its_own_default_content_for_a_blank_override(self):
+        payload = build_payload(EV_INCOMING_SMS, {"id": 1, "name": "UK SIM"}, "+100", "hello")
+        rendered = notify_push._telegram_text(payload, {"message_templates": {EV_INCOMING_SMS: {
+            "title": "Custom title", "content": "",
+        }}})
+        self.assertTrue(rendered.startswith("Custom title\n\nSIM: UK SIM"))
+        self.assertIn("From: +100", rendered)
+        self.assertTrue(rendered.endswith("hello"))
+
     def test_legacy_private_preset_migrates_to_standard_custom_webhook(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), patch.object(
                 config, "CONFIG_PATH", os.path.join(temp, "config.yaml")):
@@ -73,14 +150,16 @@ class NotificationChannelTests(unittest.TestCase):
         response.json.return_value = {"code": 200, "msg": "success"}
         post.return_value = response
         result = send_pushplus({"token": "secret", "topic": "family", "template": "html",
-                                "channel": "wechat"},
+                                "channel": "wechat", "message_templates": {
+                                    EV_INCOMING_CALL: {"title": "Call · {{from}}",
+                                                       "content": "Line {{instance}}"}}},
                                build_payload(EV_INCOMING_CALL, {"id": 1}, "+100", None))
         self.assertTrue(result["ok"])
         request = post.call_args.kwargs["json"]
         self.assertEqual(request["token"], "secret")
         self.assertEqual(request["topic"], "family")
-        self.assertIn("title", request)
-        self.assertIn("content", request)
+        self.assertEqual(request["title"], "Call · +100")
+        self.assertEqual(request["content"], "Line 1")
 
     def test_manual_telegram_proxy_is_applied_without_environment_proxy(self):
         session = telegram_session({"proxy_mode": "manual",

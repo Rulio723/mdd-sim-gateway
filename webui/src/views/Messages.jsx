@@ -3,7 +3,7 @@ import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
 
-export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected }) {
+export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected, initialLoading, loadErrors }) {
   const { t: tr } = useI18n()
   const id = selected?.id
   const [threads, setThreads] = useState([])
@@ -183,6 +183,8 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     } catch (e) { toast('Delete failed: ' + e.message) }
   }
 
+  if (initialLoading && !id) return <p role="status">{tr('Loading')}…</p>
+  if (loadErrors?.instances && !id) return <p className="u-error">{tr('Loading failed')}</p>
   if (!id) return (
     <div>
       <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />

@@ -36,21 +36,35 @@ def render(**overrides) -> str:
 class DialplanTests(unittest.TestCase):
     def test_disabled_leaves_the_inbound_path_exactly_as_it_was(self):
         out = render(vm_enabled=False)
-        self.assertIn("same => n,Dial(PJSIP/webrtc,60)", out)
+        self.assertIn("Set(BROWSER_PICKUP_DEADLINE=$[${EPOCH}+60])", out)
+        self.assertIn("Set(BROWSER_CONTACTS=${PJSIP_DIAL_CONTACTS(webrtc)})", out)
+        self.assertIn("same => n,Dial(PJSIP/webrtc,${BROWSER_PICKUP_REMAINING})", out)
+        self.assertIn("same => n(unanswered),NoOp(Browser pickup window expired)", out)
         self.assertNotIn("Record(", out)
         self.assertNotIn("[mdd_voicemail]", out)
 
     def test_enabled_replaces_the_ring_timeout_and_branches_to_the_recorder(self):
         out = render(vm_enabled=True)
-        self.assertIn("same => n,Dial(PJSIP/webrtc,25)", out)
+        self.assertIn("Set(BROWSER_PICKUP_DEADLINE=$[${EPOCH}+25])", out)
+        self.assertIn("same => n(unanswered),GotoIf", out)
         self.assertIn("same => n,Goto(mdd_voicemail,vm,1)", out)
         self.assertIn("Record(/logs/voicemail/", out)
+
+    def test_an_offline_browser_is_waited_for_without_extending_the_answer_window(self):
+        out = render(vm_enabled=True)
+        wait = out.index("same => n(wait_browser),Set(BROWSER_CONTACTS=")
+        dial = out.index("same => n(dial_browser),Set(BROWSER_PICKUP_REMAINING=")
+        voicemail = out.index("same => n,Goto(mdd_voicemail,vm,1)")
+        self.assertLess(wait, dial)
+        self.assertLess(dial, voicemail)
+        self.assertIn('GotoIf($["${DIALSTATUS}"="CHANUNAVAIL" & '
+                      '${EPOCH}<${BROWSER_PICKUP_DEADLINE}]?wait_browser)', out)
 
     def test_a_declined_call_is_never_recorded(self):
         # BUSY on the inbound Dial means the user pressed decline. Recording then would be the
         # opposite of what they just asked for.
         out = render(vm_enabled=True)
-        self.assertIn('same => n,GotoIf($["${DIALSTATUS}"="BUSY"]?bye)', out)
+        self.assertIn('same => n(unanswered),GotoIf($["${DIALSTATUS}"="BUSY"]?bye)', out)
         self.assertLess(out.index('GotoIf($["${DIALSTATUS}"="BUSY"]?bye)'),
                         out.index("Goto(mdd_voicemail,vm,1)"))
 

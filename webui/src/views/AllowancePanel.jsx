@@ -18,6 +18,8 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
   const [editing, setEditing] = useState(false)
   const [editingRule, setEditingRule] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(false)
   const pollRef = useRef(null)
   const activeId = useRef(instanceId)
   activeId.current = instanceId
@@ -36,12 +38,14 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
       setRule(queryRule.rule)
       const effective = queryRule.rule?.effective || {}
       setRuleDraft({ recipient: effective.recipient || '', body: effective.body || '' })
-    } catch (error) { toast(`${t('Could not load allowance data')}: ${error.message}`) }
+      setLoadError(false)
+    } catch (error) { setLoadError(true); toast(`${t('Could not load allowance data')}: ${error.message}`) }
+    finally { if (String(activeId.current) === forId) setLoading(false) }
   }, [instanceId, t])
 
   useEffect(() => {
     clearInterval(pollRef.current)
-    setEditing(false); setEditingRule(false); setRule(null); setValue({ ...EMPTY })
+    setEditing(false); setEditingRule(false); setRule(null); setValue({ ...EMPTY }); setLoading(true); setLoadError(false)
     load()
     return () => clearInterval(pollRef.current)
   }, [load])
@@ -123,6 +127,8 @@ export default function AllowancePanel({ instanceId, mode = 'overview', transpor
   const updated = value.updated_ts
     ? new Date(value.updated_ts * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-GB') : t('Not recorded')
   const compact = mode === 'messages'
+  if (loading) return <div className="card" role="status" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>{t('Loading')}…</div>
+  if (loadError) return <div className="card u-error" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>{t('Loading failed')}</div>
   return <div className="card" style={{ padding: compact ? 12 : 14, marginTop: compact ? 0 : 12, marginBottom: compact ? 12 : 0 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <div style={{ flex: 1, minWidth: 180 }}><b>{t('Balance and allowance')}</b>

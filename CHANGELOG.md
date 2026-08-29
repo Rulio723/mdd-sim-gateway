@@ -4,18 +4,82 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
-### Changed
-
-- Public Issue triage now analyzes a new Issue only once, accepts reruns only from the maintainer,
-  caps each Issue at three attempts, preserves the last successful analysis when a later attempt
-  fails, and manages only AI-prefixed labels so human decisions are never removed automatically.
+## [1.6.0] - 2026-08-29
 
 ### Added
 
-- New public Issues and maintainer-approved reruns can receive a bounded, read-only Codex triage comment that is
-  refreshed when reporters add information. Automated labels expose the inferred category,
-  priority, missing-information state and need for maintainer review; the workflow cannot change
-  code, merge, deploy, close an Issue or expose its API credential to the model's command process.
+- Webhook, Telegram and PushPlus notifications can now override title and content per event,
+  with a shared field-only `{{variable}}` syntax, an in-page preview, per-event test delivery
+  and one-click restore. Empty templates preserve the existing wording. Standard webhooks now
+  also include rendered `title` and `content` fields, while custom webhook payloads can keep
+  using those fields inside their JSON/form/raw templates. Unknown events, properties and
+  variables are rejected when settings are saved; templates cannot evaluate expressions or run
+  code. PushPlus's existing HTML/text/Markdown/JSON selector is now labelled “content format”
+  so it is not confused with the new message templates.
+
+- Incoming VoWiFi calls now remain available for the configured answer window while the browser
+  is closed. After a call notification, signing in opens a global Answer/Decline overlay from any
+  WebUI page and automatically registers every enabled line; voicemail still begins at the same
+  configured deadline when nobody answers.
+
+- Testing an individual node now returns a redacted summary of how the gateway parsed the
+  link — protocol, transport, TLS/Reality, SNI, ALPN, obfuscation, UDP capability and which
+  engine carries it, with no address or secret — so a node that works in another client can
+  be compared field by field.
+
+### Changed
+
+- VLESS REALITY nodes now run on the bundled Xray-core instead of sing-box, over the same
+  loopback bridge XHTTP already used. REALITY's wire details move with Xray, so a server on a
+  newer Xray build could answer Xray clients while sing-box failed the handshake with
+  "reality verification failed" — a version skew the gateway no longer sits in the middle of.
+  Nodes sing-box handles correctly are untouched. The pinned Xray version stays on the newest
+  release upstream marks stable; `MDD_XRAY_VERSION` may now be overridden together with
+  `MDD_XRAY_SHA256_AMD64`/`_ARM64` for an operator who must match a prerelease server.
+
+### Fixed
+
+- Opening the Calls or Devices page during its first refresh no longer briefly claims that a
+  line is unregistered or that a known device has no SIM. The softphone now keeps its initial
+  connection state until registration produces real evidence, and device/SIM cards stay on the
+  discovery placeholder until the control plane finishes its first hardware scan.
+
+- Asynchronous WebUI data now consistently distinguishes loading, confirmed empty state and
+  request failure. First sign-in, line/device switches, call history, logs, allowance, keeping,
+  eSIM capability, proxy status, notification delivery and system settings no longer flash a
+  false “none”, “off”, “not connected” or default configuration while their APIs are pending.
+
+- [Issue #22](https://github.com/MddIdd/mdd-sim-gateway/issues/22): switching to another
+  device while a VoWiFi, cellular-data or flight-mode request was still pending could carry
+  the first device's temporary “starting/stopping” display into the second device. Capability
+  operation state is now keyed by both device and capability; the request still completes on
+  its original device, while every other device continues to show its own live state.
+
+- [Issue #26](https://github.com/MddIdd/mdd-sim-gateway/issues/26): a physical-eSIM profile
+  switch could report failure — and leave the page and device state on the previous SIM —
+  even though the eUICC had already switched. The modem bridge published the baseband's
+  cached ICCID, so the post-switch rebuild verification timed out; it now reads EF_ICCID
+  from the card itself over AT+CSIM and only falls back to the cache. When the switch
+  succeeds but line recovery still fails, the API now reports the switch with the recovery
+  error instead of a plain failure, and the UI shows the new profile as active with a hint
+  to check its line. Native card readers now retry the post-switch identity probe through
+  the eUICC REFRESH window instead of keeping the old ICCID after a single failed read,
+  and they disable the old profile's line during the switch (restored on failure) so the
+  old and new SIM can no longer both show as enabled.
+
+- [Issue #27](https://github.com/MddIdd/mdd-sim-gateway/issues/27): pasted Hysteria2 and VLESS
+  nodes that other clients connect to could fail here with a generic "no healthy UDP-capable
+  node is ready". Share links now keep the parameters that were silently dropped — Hysteria2
+  obfuscation (`obfs`/`obfs-password`, without which the server discards every packet), an auth
+  string containing a colon, and `alpn` for protocols other than VLESS — and a link naming a
+  transport this gateway cannot render (grpc, httpupgrade, h2, quic) is refused by name instead
+  of being downgraded to a plain TCP outbound that never completes a handshake.
+
+- Country exit failures now say what actually went wrong: a disabled exit, a country-routing
+  master switch left off, and a host orchestrator that is not publishing status are reported
+  as themselves rather than as an unhealthy node pool. An exit whose sing-box refused to start
+  is no longer published as ready, and the node test surfaces what sing-box/Xray-core reported
+  instead of discarding it.
 
 ## [1.5.4] - 2026-08-28
 

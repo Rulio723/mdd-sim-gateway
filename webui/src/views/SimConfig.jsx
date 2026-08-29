@@ -23,6 +23,7 @@ function nextInstanceId(instances) {
 export default function SimConfig({ instances, selected, refresh, cards, setSelected, targetDevice }) {
   const { t } = useI18n()
   const [readers, setReaders] = useState([])
+  const [readersLoading, setReadersLoading] = useState(true)
   const [card, setCard] = useState(null)
   const [pin, setPin] = useState('')
   const [pinMsg, setPinMsg] = useState('')
@@ -35,7 +36,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const [smscMode, setSmscMode] = useState('auto')   // 'auto' = read from SIM, 'manual' = typed
   // Only to label the "use the system default" option with what that default currently is,
   // so the choice does not require a trip to the settings page to interpret.
-  const [systemDefaultVm, setSystemDefaultVm] = useState(false)
+  const [systemDefaultVm, setSystemDefaultVm] = useState(null)
   useEffect(() => {
     let cancelled = false
     api.settings().then((s) => { if (!cancelled) setSystemDefaultVm(!!s.vm_enabled) })
@@ -55,15 +56,18 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       .sort((a, b) => a.index - b.index)
       .map((item) => item.name)
     const load = async () => {
+      if (!readers.length) setReadersLoading(true)
       try {
         const result = await api.readers()
         if (cancelled) return
         const next = Array.isArray(result.readers) ? result.readers : []
         setReaders((previous) => next.length ? next : previous.length ? previous : cached)
+        setReadersLoading(false)
         if (result.stale) retryTimer = setTimeout(load, 2000)
       } catch {
         if (cancelled) return
         setReaders((previous) => previous.length ? previous : cached)
+        setReadersLoading(false)
         retryTimer = setTimeout(load, 2000)
       }
     }
@@ -265,7 +269,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         <Field label={t('Reader')}>
           <select value={form.reader_index} disabled={!!targetDevice} onChange={(e) => upd({ reader_index: +e.target.value, reader_port: portForIdx(+e.target.value) || form.reader_port })}>
             {readers.map((r, i) => <option key={i} value={i}>{i}: {r}{portForIdx(i) ? ` — USB ${portForIdx(i)}` : ''}</option>)}
-            {readers.length === 0 && <option>{t('No readers')}</option>}
+            {readers.length === 0 && <option>{readersLoading ? `${t('Loading')}…` : t('No readers')}</option>}
           </select>
         </Field>
         {form.reader_port &&
@@ -381,7 +385,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           onChange={(e) => updSip({ vm_enabled: e.target.value === 'default' ? undefined
             : e.target.value === 'on' })}>
           <option value="default">{t('Use the system default ({state})',
-            { state: systemDefaultVm ? t('on') : t('off') })}</option>
+            { state: systemDefaultVm === null ? `${t('Loading')}…` : systemDefaultVm ? t('on') : t('off') })}</option>
           <option value="on">{t('On for this line')}</option>
           <option value="off">{t('Off for this line')}</option>
         </select>

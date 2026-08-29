@@ -219,15 +219,16 @@ function AbsentLines({ lines, onChanged, showToast }) {
 export default function Keepalive({ showToast }) {
   const { t } = useI18n()
   const [rows, setRows] = useState(null)
+  const [loadError, setLoadError] = useState(false)
   const [open, setOpen] = useState(null)
 
   const load = useCallback(async () => {
-    try { setRows((await api.keepaliveSummary()).lines || []) }
-    catch (error) { showToast?.(error.message); setRows([]) }
+    try { setRows((await api.keepaliveSummary()).lines || []); setLoadError(false) }
+    catch (error) { showToast?.(error.message); setLoadError(true) }
   }, [showToast])
   useEffect(() => { load(); const id = setInterval(load, 30000); return () => clearInterval(id) }, [load])
 
-  if (rows === null) return <p>{t('Loading')}…</p>
+  if (rows === null) return <p className={loadError ? 'u-error' : ''}>{t(loadError ? 'Loading failed' : 'Loading')} {!loadError && '…'}</p>
   if (!rows.length) return <div className="u-empty"><div className="u-empty-icon">◷</div>
     <h3>{t('No lines yet')}</h3><p>{t('Add a SIM line first; its balance and number keeping show up here.')}</p></div>
 

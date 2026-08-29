@@ -132,7 +132,11 @@ class UpdateCheckTests(unittest.TestCase):
                    "assets": [{"name": "mdd-sim-gateway-v1.6.0.tar.gz", "size": 1024}]}
         session = MagicMock()
         session.get.return_value = _Response(payload)
-        with patch.object(update_check, "_network_candidates", return_value=[{
+        # This exercises an older installed gateway fetching the independently configured
+        # feature release. Keep the installed version explicit so bumping the repository's
+        # VERSION to that target does not silently turn the fixture into a no-update case.
+        with patch.object(update_check, "VERSION", "1.5.4"), \
+                patch.object(update_check, "_network_candidates", return_value=[{
                 "proxy_mode": "direct", "proxy_profile_id": ""}]), \
                 patch.object(update_check, "_session", return_value=session):
             result = update_check.check_release("1.6.0")

@@ -1,6 +1,7 @@
 {% set local_eps = [] %}
 {% if webrtc_enable %}{% set _ = local_eps.append('PJSIP/' ~ webrtc_user) %}{% endif %}
 {% set dialstr = local_eps | join('&') %}
+{% set inbound_ring_seconds = vm_ring_seconds if vm_enabled else 60 %}
 {% set msg_targets = [] %}
 {% if webrtc_enable %}{% set _ = msg_targets.append(webrtc_user) %}{% endif %}
 {# Match every non-empty printable extension without Asterisk's noisy bare `_.` wildcard.
@@ -24,14 +25,33 @@ same => n,TrySystem(/usr/local/bin/notify.py call_in "${CALLERID(num)}" &)
 same => n,WaitForPrecondition(10,2000)
 same => n,Ringing()
 {% if dialstr %}
-same => n,Dial({{ dialstr }},{{ vm_ring_seconds if vm_enabled else 60 }})
+; A push notification is useful only if the caller is still available after the administrator
+; opens and signs in to the WebUI.  Dial(PJSIP/webrtc) returns CHANUNAVAIL immediately when no
+; browser Contact exists, which used to end the call before that could happen.  Keep the inbound
+; IMS dialog ringing for the same bounded answer window and poll the AOR; a browser that registers
+; during the window is dialled with exactly the time remaining, so this does not extend voicemail
+; or leave an INVITE alive indefinitely.
+same => n,Set(BROWSER_PICKUP_DEADLINE=$[${EPOCH}+{{ inbound_ring_seconds }}])
+same => n(wait_browser),Set(BROWSER_CONTACTS=${PJSIP_DIAL_CONTACTS({{ webrtc_user }})})
+same => n,GotoIf($["${BROWSER_CONTACTS}"!=""]?dial_browser)
+same => n,GotoIf($[${EPOCH}>=${BROWSER_PICKUP_DEADLINE}]?unanswered)
+same => n,Wait(1)
+same => n,Goto(wait_browser)
+same => n(dial_browser),Set(BROWSER_PICKUP_REMAINING=$[${BROWSER_PICKUP_DEADLINE}-${EPOCH}])
+same => n,GotoIf($[${BROWSER_PICKUP_REMAINING}<=0]?unanswered)
+same => n,Dial({{ dialstr }},${BROWSER_PICKUP_REMAINING})
+; A Contact can disappear between the poll and Dial().  Resume waiting only for that transport
+; race; a real decline/busy/no-answer remains the user's final decision.
+same => n,GotoIf($["${DIALSTATUS}"="CHANUNAVAIL" & ${EPOCH}<${BROWSER_PICKUP_DEADLINE}]?wait_browser)
 {% if vm_enabled %}
 ; BUSY here means the softphone DECLINED: the user was present and said no, so recording a
 ; message would be the opposite of what they asked for. Everything else reaching this point
 ; (NOANSWER, CHANUNAVAIL — no browser open, no registered contact) is an unattended call,
 ; which is exactly the case voicemail exists for.
-same => n,GotoIf($["${DIALSTATUS}"="BUSY"]?bye)
+same => n(unanswered),GotoIf($["${DIALSTATUS}"="BUSY"]?bye)
 same => n,Goto(mdd_voicemail,vm,1)
+{% else %}
+same => n(unanswered),NoOp(Browser pickup window expired)
 {% endif %}
 {% else %}
 {% if vm_enabled %}

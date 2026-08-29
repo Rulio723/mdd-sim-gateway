@@ -230,6 +230,16 @@ export class Softphone {
     }
   }
 
+  // A second line can ring while another global browser call is already active. Tell the
+  // caller this browser is busy without disturbing the first session or recording a voicemail
+  // as though nobody was present.
+  rejectBusy() {
+    const s = this.session
+    if (!s || s.direction !== 'incoming' || s.isEstablished?.()) return
+    this.session = null
+    try { s.terminate({ status_code: 486, reason_phrase: 'Busy Here' }) } catch { try { s.terminate() } catch {} }
+  }
+
   sendDTMF(tone) { if (this.session) try { this.session.sendDTMF(tone) } catch {} }
 
   setMuted(muted) {

@@ -205,7 +205,7 @@ def _titled(text: str) -> str:
     return text if text.startswith(BRAND) else f"{BRAND} · {text}"
 
 
-def build_notification_message(payload: dict) -> dict:
+def _default_notification_message(payload: dict) -> dict:
     """Build the human-readable title/content shared by templates and vendor channels."""
     event = payload.get("event")
     sim = payload.get("sim_name") or payload.get("iccid") or payload.get("instance") or "SIM"
@@ -248,7 +248,7 @@ def build_notification_message(payload: dict) -> dict:
 
 
 def _template_context(cfg: dict, payload: dict) -> dict:
-    return {**payload, **build_notification_message(payload)}
+    return {**payload, **build_notification_message(payload, cfg)}
 
 
 def _render(value, context: dict):
@@ -263,6 +263,79 @@ def _render(value, context: dict):
     if exact:
         return context.get(exact.group(1))
     return _TOKEN.sub(lambda m: str(context.get(m.group(1)) or ""), value)
+
+
+_MESSAGE_TEMPLATE_FIELDS = {
+    "event", "instance", "sim_name", "iccid", "msisdn", "from", "text",
+    "title", "content",
+}
+_MAX_MESSAGE_TEMPLATE_LENGTH = 4000
+NOTIFICATION_EVENTS = {
+    EV_INCOMING_SMS, EV_INCOMING_CALL, EV_HOST_ALERT, EV_NUMBER_CHANGED,
+    EV_LINE_UNRECOVERABLE, EV_KEEPALIVE_RESULT, EV_BALANCE_LOW, EV_MISSED_CALL,
+    EV_VOICEMAIL, EV_SOFTWARE_UPDATE,
+}
+
+
+def _event_message_template(cfg: dict, event: str) -> dict:
+    if not isinstance(cfg, dict):
+        raise ValueError("notification channel configuration must be an object")
+    templates = cfg.get("message_templates") or {}
+    if not isinstance(templates, dict):
+        raise ValueError("notification message templates must be an object")
+    value = templates.get(event) or {}
+    if not isinstance(value, dict):
+        raise ValueError("notification event template must be an object")
+    return value
+
+
+def _validate_message_template(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("notification message template must be text")
+    text = value
+    if len(text) > _MAX_MESSAGE_TEMPLATE_LENGTH:
+        raise ValueError("notification message template is too long")
+    unknown = sorted(set(_TOKEN.findall(text)) - _MESSAGE_TEMPLATE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown notification template field: {unknown[0]}")
+    return text
+
+
+def validate_message_templates(cfg: dict) -> None:
+    if not isinstance(cfg, dict):
+        raise ValueError("notification channel configuration must be an object")
+    templates = cfg.get("message_templates") or {}
+    if not isinstance(templates, dict):
+        raise ValueError("notification message templates must be an object")
+    for event, template in templates.items():
+        if event not in NOTIFICATION_EVENTS:
+            raise ValueError(f"unknown notification template event: {event}")
+        if not isinstance(template, dict):
+            raise ValueError("notification event template must be an object")
+        unknown = sorted(set(template) - {"title", "content"})
+        if unknown:
+            raise ValueError(f"unknown notification template property: {unknown[0]}")
+        for value in template.values():
+            _validate_message_template(value)
+
+
+def _render_notification_message(payload: dict, cfg: dict, default: dict) -> dict:
+    template = _event_message_template(cfg or {}, str(payload.get("event") or ""))
+    context = {**payload, **default}
+    result = dict(default)
+    for field in ("title", "content"):
+        if field in template and str(template.get(field) or "").strip():
+            result[field] = str(_render(_validate_message_template(template[field]), context))
+    return result
+
+
+def build_notification_message(payload: dict, cfg: dict | None = None) -> dict:
+    """Build the shared message, applying an optional per-event title/content override.
+
+    Templates deliberately support field replacement only. They cannot evaluate expressions,
+    access files or call code, and an unknown field is rejected instead of silently disappearing.
+    """
+    return _render_notification_message(payload, cfg or {}, _default_notification_message(payload))
 
 
 def _json_setting(value, fallback):
@@ -303,7 +376,10 @@ def build_webhook_request(cfg: dict, payload: dict) -> tuple[str, str, dict]:
         else:
             body = _render(_json_setting(raw_template, {}), context)
     else:
-        body = payload
+        # Standard webhooks carry both canonical machine fields and the same rendered title and
+        # content used by vendor channels. Existing receivers keep every original field, while a
+        # receiver that wants human-readable text no longer has to recreate event wording.
+        body = {**payload, **build_notification_message(payload, cfg)}
 
     kwargs = {"headers": headers, "timeout": _TIMEOUT,
               "verify": bool(cfg.get("verify_tls", True))}
@@ -352,7 +428,7 @@ def send_pushplus(cfg: dict, payload: dict) -> dict:
     channel = str(cfg.get("channel") or "wechat").strip().lower()
     if channel not in {"wechat", "webhook", "cp", "mail", "sms", "voice", "extension", "app", "clawbot"}:
         raise ValueError("unsupported PushPlus channel")
-    message = build_notification_message(payload)
+    message = build_notification_message(payload, cfg)
     body = {"token": token, **message, "template": template, "channel": channel}
     topic = str(cfg.get("topic") or "").strip()
     if topic:
@@ -377,7 +453,7 @@ def _telegram_headline(icon: str, text: str) -> str:
     return f"{icon} {BRAND} · {text}" if icon else f"{BRAND} · {text}"
 
 
-def _telegram_text(payload: dict) -> str:
+def _default_telegram_text(payload: dict) -> str:
     ev = payload.get("event")
     if ev == EV_LINE_UNRECOVERABLE:
         return "\n".join([_telegram_headline("🛑", f"线路无法自动恢复 · {payload.get('sim_name') or payload.get('instance')}"),
@@ -419,6 +495,17 @@ def _telegram_text(payload: dict) -> str:
         lines.append("")
         lines.append(payload.get("text") or "")
     return "\n".join(lines)
+
+
+def _telegram_text(payload: dict, cfg: dict | None = None) -> str:
+    """Keep Telegram's established layout unless this event has an explicit override."""
+    default_text = _default_telegram_text(payload)
+    if not _event_message_template(cfg or {}, str(payload.get("event") or "")):
+        return default_text
+    title, separator, content = default_text.partition("\n")
+    default = {"title": title, "content": content.lstrip("\n") if separator else ""}
+    message = _render_notification_message(payload, cfg or {}, default)
+    return "\n\n".join(part for part in (message["title"], message["content"]) if part)
 
 
 def telegram_session(cfg: dict) -> requests.Session:
@@ -495,7 +582,7 @@ def send_telegram(cfg: dict, payload: dict) -> dict:
     try:
         response = session.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": _telegram_text(payload),
+            json={"chat_id": chat, "text": _telegram_text(payload, cfg),
                   "disable_web_page_preview": True},
             timeout=_TIMEOUT)
         response.raise_for_status()

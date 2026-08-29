@@ -402,7 +402,7 @@ function isLineRunning(inst) {
   return !!(st && st !== 'STOPPED')
 }
 
-export default function Esim({ cards, instances, refresh, subscribe, showToast }) {
+export default function Esim({ cards, instances, refresh, subscribe, showToast, initialLoading, loadErrors }) {
   const { t } = useI18n()
   const present = useMemo(
     () => [...cards].filter((c) => c.present).sort((a, b) => (a.index ?? 0) - (b.index ?? 0)),
@@ -410,6 +410,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
   )
   const [reader, setReader] = useState('')
   const [status, setStatus] = useState(null)
+  const [statusLoading, setStatusLoading] = useState(true)
+  const [statusError, setStatusError] = useState(false)
   const [ses, setSes] = useState([])
   const [meta, setMeta] = useState({ imei: '' })
   const [loaded, setLoaded] = useState(false)
@@ -449,10 +451,10 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
   useEffect(() => {
     let cancelled = false
     api.esimStatus().then((st) => {
-      if (!cancelled) setStatus(st)
+      if (!cancelled) { setStatus(st); setStatusError(false) }
     }).catch(() => {
-      if (!cancelled) setStatus({ available: false })
-    })
+      if (!cancelled) setStatusError(true)
+    }).finally(() => { if (!cancelled) setStatusLoading(false) })
     return () => { cancelled = true }
   }, [])
 
@@ -490,6 +492,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
     try {
       const st = await api.esimStatus()
       setStatus(st)
+      setStatusError(false)
+      setStatusLoading(false)
       if (!st.available) {
         setErr(t('lpac is not installed. Run "sudo ./install.sh build-lpac" on the host.'))
         setLoaded(false)
@@ -541,7 +545,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
       if (lineRunning && matchedInst) {
         await api.stop(matchedInst.id)
       }
-      await api.esimEnable(p.iccid, target)
+      const res = await api.esimEnable(p.iccid, target)
       // Optimistic view: enabling implicitly disables the previously enabled profile. A
       // fresh read here would race the auto-provisioned line that re-grabs the reader.
       setSes((list) => list.map((s) => (s.id !== se.id ? s : {
@@ -552,11 +556,27 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
             : String(x.profileState || '').toLowerCase() === 'enabled' ? 'disabled' : x.profileState,
         })),
       })))
-      showToast?.(t('Switched to {name} — its line starts automatically', { name: title }))
+      if (res?.recovery_error) {
+        // The eUICC switched but the line did not come back on its own — say exactly
+        // that, so the user starts the line instead of retrying an already-done switch.
+        setErr(t('Switched to {name}, but its line could not start automatically: {error}', { name: title, error: res.recovery_error }))
+        showToast?.(t('Profile switched — check the line for {name}', { name: title }))
+      } else {
+        showToast?.(t('Switched to {name} — its line starts automatically', { name: title }))
+      }
       await refresh?.()
     } catch (e) {
       showToast?.(e.message)
       setErr(e.message)
+      // The request can fail after the card already switched; resync from the gateway's
+      // persisted view instead of leaving the stale optimistic-free state on screen.
+      api.esimChipCached(reader).then((r) => {
+        if (r?.cached) {
+          setSes(r.ses || [])
+          setCachedAt((r.ts || 0) * 1000)
+          setLoaded(false)
+        }
+      }).catch(() => {})
     }
     setBusyOp('')
   }
@@ -672,6 +692,8 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
     setBusyOp('')
   }
 
+  if (initialLoading && !present.length) return <p role="status">{t('Loading')}…</p>
+  if (loadErrors?.cards && !present.length) return <p className="u-error">{t('Loading failed')}</p>
   if (!present.length) {
     return (
       <div className="card" style={{ padding: 24, color: 'var(--text-dim)' }}>
@@ -759,7 +781,11 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast }
         <div style={{ fontWeight: 700, marginBottom: 10 }}>{t('Chip')}</div>
         {!hasEuicc ? (
           <div style={{ color: 'var(--text-mute)', fontSize: 13, lineHeight: 1.5 }}>
-            {status && !status.available
+            {statusLoading
+              ? `${t('Loading')}…`
+              : statusError
+                ? t('Loading failed')
+                : status && !status.available
               ? t('lpac is not installed. Run "sudo ./install.sh build-lpac" on the host.')
               : loading
                 ? t('Reading…')
