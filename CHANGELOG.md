@@ -4,6 +4,171 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-01
+
+### Added
+
+- Feishu/Lark notifications can fan out to multiple independently configured custom bots. Each bot
+  has its own webhook, signing secret, event switches, templates, test action and optional SIM-line
+  filter. Empty filters receive every line and gateway event; filtered bots receive only matching
+  line events. Delivery retries and history remain independent per bot, and existing single-bot
+  configurations migrate automatically without duplicate sends
+  ([PR #36](https://github.com/MddIdd/mdd-sim-gateway/pull/36)).
+
+- DITO Telecommunity (PLMN 515-66) VoWiFi support, contributed in
+  [PR #35](https://github.com/MddIdd/mdd-sim-gateway/pull/35). Its ePDG answers the MODP-2048
+  proposal set with NO_PROPOSAL_CHOSEN and offers only AES-CBC-128 / HMAC-SHA1 / MODP-1024, so
+  that legacy suite is now selected for that PLMN alone — every other carrier keeps the existing
+  four proposals in the same order. The RFC 4187 identity requests DITO sends during the first
+  IKE_AUTH exchange (AT_PERMANENT_ID_REQ and AT_FULLAUTH_ID_REQ) are answered as well, instead of
+  being ignored and reported as NO EAP PAYLOAD RECEIVED.
+
+### Fixed
+
+- An RP-ACK or RP-ERROR — the SMSC reporting on a message the gateway sent — was treated as an
+  unknown message type and then handed to the dialplan anyway. Carrying no TPDU, it arrived
+  empty, so every submitted segment wrote a bodyless inbound record: one six-segment text left
+  six phantom messages behind. Reports are now recognised, answered, and stopped before the
+  dialplan, and a refusal is logged with its RP cause.
+
+- A part of a long message that arrived after its group had been flushed started a new group and
+  was published as a second, near-duplicate fragment of a message already in the thread. Between
+  two carriers the parts of one text arrived ten minutes apart, so this was the normal outcome
+  rather than an edge case. A flushed group now stays addressable for an hour and a late part
+  fills in the gap it left.
+
+- The WebRTC endpoint advertised opus, which no build of the engine image can encode: codec_opus
+  is an external, x86-only binary module, and enabling it in menuselect is silently a no-op on
+  arm64. A peer that offered opus alone got a connected call with no audio and no error. Opus is
+  no longer offered; calls continue over ulaw/alaw as they already did in practice.
+
+### Changed
+
+- The published control image and the engine image are substantially smaller: 194 MB -> 76 MB and
+  272 MB -> 143 MB compressed, 852 MB -> 355 MB and 1.04 GB -> 607 MB on disk. The control image
+  no longer ships the toolchain that built it, and the engine ships only the Asterisk modules it
+  can load, stripped, which also drops 109 packages that were pulled in by modules the engine
+  already refused to load. The documented storage requirements follow: 2 GiB free to install
+  instead of 4 GiB, 3 GiB kept free for an upgrade instead of 6 GiB, and an 8 GB rather than
+  16 GB system disk. Building the engine from source on the device is unchanged and still needs
+  several GiB more.
+
+### Added
+
+- Feishu/Lark notifications can fan out to multiple independently configured custom bots. Each bot
+  has its own webhook, signing secret, event switches, templates, test action and optional SIM-line
+  filter. Empty filters receive every line and gateway event; filtered bots receive only matching
+  line events. Delivery retries and history remain independent per bot, and existing single-bot
+  configurations migrate automatically without duplicate sends.
+
+## [1.7.0] - 2026-09-01
+
+### Added
+
+- Feishu/Lark custom bots are now a native notification channel alongside Webhook, Telegram
+  and PushPlus. Each event can be enabled separately, use its own title and content template,
+  and be tested from the WebUI. Official Feishu and Lark webhook endpoints are accepted, with
+  optional HMAC-SHA256 signing; HTTP success is also checked against the platform response so
+  rejected messages are retried and reported instead of appearing delivered. Webhook tokens and
+  signing secrets are removed from support bundles.
+
+- System Settings can now list published test Releases alongside the latest normal Release,
+  install an explicitly selected test version, and switch a test installation back to the
+  normal version without using the host command line. Drafts stay hidden, automatic updates
+  remain on the stable promotion policy, and the server resolves the selected tag again before
+  publishing the verified host update request. The page also retains the last background or
+  manual check time instead of returning to “Not checked” when it is opened.
+
+- Telegram delivery and software updates can now explicitly use a proxy-library entry or a
+  configured country exit, in addition to direct networking (and automatic fallback for
+  updates). Existing Telegram manual-proxy settings remain usable, while legacy updater manual
+  proxies migrate into the shared library and legacy country selections stay pinned.
+
+### Fixed
+
+- [Issue #33](https://github.com/MddIdd/mdd-sim-gateway/issues/33): a giffgaff/O2 UK VoWiFi
+  line dropped like clockwork every ~2h50m. The carrier silently invalidates its SWu session
+  just before a 3-hour lifetime without sending any IKE message, and the engine's proactive
+  IKE-SA rekey — the mechanism that resets that carrier clock — defaulted to 600 minutes and
+  could not be configured, so it never fired in time. The IKE rekey period is now a real
+  setting (System Settings → Calls & VoWiFi, with a per-line `ike_rekey_minutes` override)
+  and defaults to 150 minutes, which preempts every carrier clock observed so far (giffgaff
+  ~2h50m, EE ~12h). The 30-minute ESP rekey is unchanged and unrelated.
+
+- A `reg_rejected` freeze now records the SIP response code that condemned the line (for
+  example 403) in both the lifecycle record and the frozen diagnostics snapshot. The #33
+  support bundle reached us after every log line holding that code had rotated away, so the
+  bundle could prove the registration was rejected but not why.
+
+- [Issue #30](https://github.com/MddIdd/mdd-sim-gateway/issues/30): a modem bridge identity
+  refresh that temporarily failed to read IMEI could replace the already verified hardware
+  identity with an empty value. If health recovery later rebuilt the line, the restart was
+  blocked by `hardware_imei_required` and VoWiFi stayed off. A bridge now retains its verified
+  immutable IMEI across incomplete refreshes. Recovery no longer accepts a line-saved modem
+  IMEI when the live bridge cannot verify it, because modems without USB serial numbers reuse
+  the same port-derived id after a physical module swap.
+
+- Reopened [Issue #21](https://github.com/MddIdd/mdd-sim-gateway/issues/21): automatic recovery
+  decisions now survive a later VoWiFi toggle in a separate bounded lifecycle log. Redacted
+  support bundles record structured scheduling, blocking, cancellation, start failure and success
+  events without exception text or subscriber/hardware identifiers, so the final reason a rebuild
+  did not happen remains diagnosable. An enabled native-reader line also remains eligible for
+  recovery when the default for newly detected devices has VoWiFi disabled.
+
+- Support bundles now report per-file coverage and truncation, retain both the beginning and end
+  of bounded IKE segments, expose only boolean bridge identity/channel health plus metadata age,
+  and enforce a 10 MiB archive ceiling with deterministic low-priority log omission. New lifecycle
+  and bridge fields have explicit redaction and archive-content regression coverage. Unbounded
+  call history is counted but only its latest 20,000 lines are parsed for safe call evidence.
+
+- Lifecycle writes no longer block the asyncio control loop or contend with multi-megabyte
+  diagnostic rewrites. Cancellation is recorded centrally for manual starts/stops, configuration
+  restarts, eSIM switches, card removal and disabled lines; repeated identical no-card blocks are
+  coalesced so they cannot evict the useful failure history.
+
+- [Issue #27](https://github.com/MddIdd/mdd-sim-gateway/issues/27): a VLESS node using
+  Xray 26.7+ VLESS Encryption could never connect. The share link's `encryption` parameter was
+  dropped and `none` sent in its place, so the client established a connection the server could
+  not read: every request timed out, the server logged nothing, and the node was
+  indistinguishable from a dead one. The declared value is carried through to Xray now, such
+  nodes are routed to Xray automatically whether or not they use REALITY, and the sing-box
+  converter refuses them by name instead of building an outbound that silently never answers.
+  Verified against a server configured this way: unreachable before, 79 ms after.
+
+- The UDP validation probe no longer decides an exit's fate from DNS alone. VoWiFi carries IKE
+  on UDP 500/4500 and never queries a resolver, while port 53 is among the most intercepted and
+  rewritten ports there is. STUN probes now run interleaved with DNS ones on ports nobody
+  rewrites, each with its own SOCKS5 association, and any single answer passes the exit. Both
+  lists are configurable (`MDD_UDP_PROBE_TARGETS`, `MDD_UDP_STUN_TARGETS`), and a failure names
+  every probe tried with what each one did.
+
+- Xray becoming unavailable now fails only the exits it carries. Moving REALITY onto Xray made
+  it load-bearing for ordinary exits, where it had mattered only to the rare XHTTP node, and a
+  missing or crashed Xray took every country down with it — including exits that never touch
+  it. Its absence is reported as what it is, naming REALITY and how to install it.
+
+- VLESS nodes on the Xray path request XUDP packet encoding, which the XHTTP path already did
+  while the raw/ws path sent nothing — UDP is what these exits exist for.
+
+- A failed node test shows why on screen instead of behind a hover, where a vanishing toast was
+  all an operator could screenshot. The parsed summary keeps the SNI behind the
+  sensitive-information switch, since that line names the operator's own server and is the part
+  people screenshot into public issues.
+
+- Notification event switches now collapse like the message-template editor, and channel test
+  buttons show a disabled testing state while their request is running. Update-network guidance
+  is shown beneath the network selection, while release-range guidance is shown beneath the
+  update method and version range instead of the two descriptions appearing swapped.
+
+- Telegram and software-update proxy pickers no longer offer subscription profiles as if they
+  were a single route. Subscriptions remain available through explicit country exits, automatic
+  update fallback skips them, and a previously selected subscription migrates to its first
+  enabled assigned country exit so an upgrade keeps the route it used before.
+
+- A release candidate now recognizes the final Release with the same numeric version as newer
+  (for example, `1.6.1-rc2` → `1.6.1`), so promotion-gated automatic updates can move test
+  installations back onto the normal release line.
+
 ## [1.6.0] - 2026-08-29
 
 ### Added

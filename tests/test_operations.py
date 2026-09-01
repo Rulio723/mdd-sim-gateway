@@ -99,6 +99,30 @@ class OperationsTests(unittest.TestCase):
         self.assertNotIn("001122", log)
         self.assertTrue(log.endswith("normal"))
 
+    def test_redaction_preserves_closed_identity_health_fields(self):
+        value = operations.redact({
+            "imei_valid": True, "iccid_valid": False, "imei_source_matches": True,
+            "imei": "123456789012345", "iccid": "8944000000000000000",
+            "nested": {"imei_valid": "not-a-boolean-secret"},
+        })
+        self.assertEqual(value["imei_valid"], True)
+        self.assertEqual(value["iccid_valid"], False)
+        self.assertEqual(value["imei_source_matches"], True)
+        self.assertEqual(value["imei"], "<redacted>")
+        self.assertEqual(value["iccid"], "<redacted>")
+        self.assertEqual(value["nested"]["imei_valid"], "<redacted>")
+
+    def test_redaction_preserves_registration_failure_evidence(self):
+        # The classified reg-failure verdict is digits and enum words only; losing it would
+        # re-open the #33 gap where a bundle could not say WHY registration was rejected.
+        value = operations.redact({
+            "registration_evidence": {"kind": "rejected", "sip_status": 403},
+            "sip_status": 403,
+        })
+        self.assertEqual(value["registration_evidence"],
+                         {"kind": "rejected", "sip_status": 403})
+        self.assertEqual(value["sip_status"], 403)
+
     def test_redaction_preserves_non_secret_eap_aka_diagnostics(self):
         diagnostic = (
             "IKE_AUTH rejected with AUTHENTICATION_FAILED before any EAP-AKA challenge "
@@ -169,6 +193,15 @@ class OperationsTests(unittest.TestCase):
             "telegram": {"bot_token": "secret"},
             "proxy": {"subscription_url": "https://example.test/sub?token=url-secret"},
             "webhook": {"headers_json": '{"Authorization":"Bearer header-secret"}'},
+            "feishu": {
+                "url": "https://open.feishu.cn/open-apis/bot/v2/hook/private-token",
+                "secret": "feishu-signing-secret",
+                "channels": [{
+                    "id": "ops", "name": "Operations",
+                    "url": "https://open.feishu.cn/open-apis/bot/v2/hook/second-private-token",
+                    "secret": "second-feishu-secret", "instances": ["1"],
+                }],
+            },
         }
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), patch.object(
                 config, "get_settings", return_value=settings_value):
@@ -182,7 +215,13 @@ class OperationsTests(unittest.TestCase):
                 settings = archive.read("settings-redacted.yaml").decode()
                 status = json.loads(archive.read("status-redacted.json"))
                 log = archive.read("logs/sim1-charon.log").decode()
-            self.assertNotIn("secret", settings)
+            self.assertNotIn("feishu-signing-secret", settings)
+            self.assertNotIn("private-token", settings)
+            self.assertNotIn("second-private-token", settings)
+            self.assertNotIn("second-feishu-secret", settings)
+            self.assertNotIn("Operations", settings)
+            self.assertNotIn("header-secret", settings)
+            self.assertNotIn("url-secret", settings)
             self.assertNotIn("001122", log)
             self.assertEqual(status["imei"], "<redacted>")
 
@@ -311,6 +350,127 @@ class OperationsTests(unittest.TestCase):
                 retained = bundle.read(
                     "logs/sim1-charon-20260807-110000.log").decode()
             self.assertIn("STATE 2", retained)
+
+    def test_support_bundle_indexes_coverage_and_keeps_ike_head_and_tail(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            archive_dir = logs / "ike"
+            archive_dir.mkdir(parents=True)
+            lifecycle = [
+                {"ts": 100 + i, "instance": "sim1", "event": "recovery_started"}
+                for i in range(3)]
+            logs.joinpath("lifecycle.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in lifecycle) + "\n")
+            ike = archive_dir / "charon-20260830-100000.log"
+            ike.write_text("\n".join(f"line-{i:02d}" for i in range(60)) + "\n")
+
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}, log_lines=50))) as bundle:
+                retained = bundle.read("logs/sim1-charon-20260830-100000.log").decode()
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        self.assertIn("line-00", retained)
+        self.assertIn("line-59", retained)
+        self.assertNotIn("line-15", retained)
+        ike_meta = manifest["files"]["logs/sim1-charon-20260830-100000.log"]
+        self.assertEqual(ike_meta["raw_lines"], 60)
+        self.assertEqual(ike_meta["included_lines"], 50)
+        self.assertTrue(ike_meta["truncated"])
+        life_meta = manifest["files"]["logs/sim1-lifecycle.jsonl"]
+        self.assertEqual((life_meta["first_ts"], life_meta["last_ts"]), (100, 102))
+
+    def test_lifecycle_file_is_redacted_even_if_a_bad_record_reaches_disk(self):
+        record = {
+            "ts": 100, "instance": "sim1", "event": "recovery_failed",
+            "reason_code": "engine_start_failed", "imei": "123456789012345",
+            "iccid": "8944000000000000000", "error": "https://secret.example/token",
+        }
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("lifecycle.jsonl").write_text(json.dumps(record) + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as bundle:
+                captured = bundle.read("logs/sim1-lifecycle.jsonl").decode()
+
+        for secret in ("123456789012345", "8944000000000000000", "secret.example"):
+            self.assertNotIn(secret, captured)
+        parsed = json.loads(captured)
+        self.assertEqual(parsed["reason_code"], "engine_start_failed")
+
+    def test_support_bundle_enforces_its_archive_budget_and_reports_omissions(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}), \
+                patch.object(operations, "SUPPORT_BUNDLE_CONTENT_BYTES", 900), \
+                patch.object(operations, "SUPPORT_BUNDLE_MAX_BYTES", 4096):
+            run = Path(temp, "instances", "sim1", "run")
+            run.mkdir(parents=True)
+            run.joinpath("charon.log").write_text(
+                "\n".join(f"ordinary-line-{i}-" + "x" * 80 for i in range(100)))
+            content = operations.support_bundle({})
+            with zipfile.ZipFile(BytesIO(content)) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        self.assertLessEqual(len(content), 4096)
+        omitted = manifest["files"]["logs/sim1-charon.log"]
+        self.assertTrue(omitted["omitted"])
+        self.assertFalse(omitted["truncated"])
+        self.assertEqual(omitted["included_lines"], 0)
+
+    def test_call_event_coverage_uses_the_filtered_archived_records(self):
+        records = [
+            {"ts": index, "instance": "sim1", "event": "sms_in", "args": ["1", "secret"]}
+            for index in range(1, 9)
+        ] + [
+            {"ts": 9, "instance": "sim1", "event": "call_out", "args": ["*#21#"]},
+            {"ts": 10, "instance": "sim1", "event": "call_result",
+             "args": ["out", "*#21#", "CHANUNAVAIL", "79"]},
+        ]
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        coverage = manifest["files"]["logs/sim1-call-events.jsonl"]
+        self.assertEqual(coverage["raw_lines"], 10)
+        self.assertEqual(coverage["scanned_lines"], 10)
+        self.assertEqual(coverage["unscanned_lines"], 0)
+        self.assertEqual(coverage["eligible_lines"], 2)
+        self.assertEqual(coverage["filtered_lines"], 8)
+        self.assertEqual(coverage["included_lines"], 2)
+        self.assertEqual((coverage["first_ts"], coverage["last_ts"]), (9, 10))
+        self.assertFalse(coverage["truncated"])
+
+    def test_call_event_scan_is_bounded_and_reports_the_unscanned_prefix(self):
+        records = [
+            {"ts": index, "instance": "sim1", "event": "sms_in", "args": ["1", "secret"]}
+            for index in range(1, 6)
+        ] + [
+            {"ts": 6, "instance": "sim1", "event": "call_out", "args": ["*#21#"]},
+            {"ts": 7, "instance": "sim1", "event": "call_result",
+             "args": ["out", "*#21#", "CHANUNAVAIL", "79"]},
+        ]
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}), \
+                patch.object(operations, "CALL_EVENT_SCAN_LINES", 3):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        coverage = manifest["files"]["logs/sim1-call-events.jsonl"]
+        self.assertEqual(coverage["raw_lines"], 7)
+        self.assertEqual(coverage["scanned_lines"], 3)
+        self.assertEqual(coverage["unscanned_lines"], 4)
+        self.assertEqual(coverage["eligible_lines"], 2)
+        self.assertEqual(coverage["filtered_lines"], 1)
+        self.assertTrue(coverage["truncated"])
 
     def test_diagnostic_records_survive_redaction_instead_of_being_blanked(self):
         # engine.capture_diagnostics embeds the tunnel log tail in each record, and swu_ike

@@ -344,6 +344,23 @@ class BridgeIdentityTests(unittest.TestCase):
         identity = card.identity()
         self.assertEqual(identity["iccid"], self.STALE_AT_ICCID)
 
+    def test_incomplete_refresh_keeps_verified_hardware_imei_only(self):
+        previous = {"imei": "123456789012345", "iccid": self.CARD_ICCID}
+        refreshed = vpcd_modem_bridge.retain_hardware_identity(
+            previous, {"imei": "", "iccid": ""})
+
+        self.assertEqual(refreshed["imei"], previous["imei"])
+        # A blank ICCID is meaningful evidence of removal, unlike a blank IMEI read.
+        self.assertEqual(refreshed["iccid"], "")
+
+    def test_complete_refresh_replaces_the_previous_identity(self):
+        refreshed = vpcd_modem_bridge.retain_hardware_identity(
+            {"imei": "123456789012345", "iccid": self.CARD_ICCID},
+            {"imei": "350000000000018", "iccid": self.STALE_AT_ICCID})
+
+        self.assertEqual(refreshed, {
+            "imei": "350000000000018", "iccid": self.STALE_AT_ICCID})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,12 @@
 import base64
 import json
+import os
 import time
 import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from control.app import egress
@@ -1007,3 +1009,161 @@ class RealityRunsOnXrayTests(unittest.TestCase):
         self.assertTrue(parsed["reality"])
         self.assertEqual(egress.describe_proxy_profile(
             {"type": "node", "value": "trojan://pw@t.example.net:443"})["engine"], "sing-box")
+
+
+class UdpProbeTargetTests(unittest.TestCase):
+    """One hard-coded resolver made the probe a test of that address, not of UDP."""
+
+    def test_defaults_are_three_distinct_public_resolvers(self):
+        self.assertEqual(egress.udp_probe_targets(), ["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+
+    def test_the_list_is_configurable_and_rejects_junk(self):
+        with patch.dict(os.environ, {"MDD_UDP_PROBE_TARGETS": "8.8.4.4, not-an-ip ,8.8.4.4,9.9.9.9"}):
+            self.assertEqual(egress.udp_probe_targets(), ["8.8.4.4", "9.9.9.9"])
+        with patch.dict(os.environ, {"MDD_UDP_PROBE_TARGETS": "garbage"}):
+            self.assertEqual(egress.udp_probe_targets(), ["1.1.1.1"])
+
+    def test_a_blackholed_first_resolver_falls_back_instead_of_failing(self):
+        calls = []
+
+        def probe(host, port, target, timeout, username="", password=""):
+            calls.append(target)
+            if target != ("dns", "9.9.9.9", 53):
+                raise egress.EgressError("timed out")
+            return 42
+
+        with patch.object(egress, "_udp_probe_once", side_effect=probe):
+            self.assertEqual(egress.test_udp_proxy("127.0.0.1", 1080), 42)
+        self.assertEqual(calls[0], ("dns", "1.1.1.1", 53))
+        self.assertEqual(calls[-1], ("dns", "9.9.9.9", 53))
+
+    def test_every_probe_failing_names_each_one(self):
+        with patch.object(egress, "_udp_probe_once",
+                          side_effect=egress.EgressError("timed out")):
+            with self.assertRaises(egress.EgressError) as caught:
+                egress.test_udp_proxy("127.0.0.1", 1080)
+        message = str(caught.exception)
+        for name in ("1.1.1.1", "8.8.8.8", "9.9.9.9",
+                     "stun.cloudflare.com", "stun.l.google.com"):
+            self.assertIn(name, message)
+
+    def test_stun_carries_the_verdict_when_port_53_is_intercepted(self):
+        """The reported case: DNS is rewritten end to end, the exit itself carries UDP.
+
+        VoWiFi runs IKE on UDP 500/4500 and never queries these resolvers, so a panel or
+        provider rewriting port 53 must not be able to condemn the exit.
+        """
+        def probe(host, port, target, timeout, username="", password=""):
+            if target[0] == "dns":
+                raise egress.EgressError("timed out")
+            return 17
+
+        with patch.object(egress, "_udp_probe_once", side_effect=probe):
+            self.assertEqual(egress.test_udp_proxy("127.0.0.1", 1080), 17)
+
+    def test_the_plan_interleaves_so_neither_family_decides_alone(self):
+        kinds = [probe[0] for probe in egress.udp_probe_plan()]
+        self.assertEqual(kinds[:4], ["dns", "stun", "dns", "stun"])
+        # A blocked resolver must not push every STUN probe past the time budget.
+        self.assertIn("stun", kinds[:2])
+
+    def test_stun_targets_are_configurable_and_reject_junk(self):
+        with patch.dict(os.environ, {"MDD_UDP_STUN_TARGETS":
+                                     "a.example:3478, nonsense ,b.example:0,c.example:19302"}):
+            self.assertEqual(egress.stun_probe_targets(),
+                             [("a.example", 3478), ("c.example", 19302)])
+
+
+class VlessEncryptionTests(unittest.TestCase):
+    """Xray 26.7+ VLESS Encryption: the client must echo the server's declared value.
+
+    Issue #27's actual cause. The parameter was dropped and "none" hard-coded, so the
+    client connected, could not be understood, and every probe timed out with the server
+    logging nothing — indistinguishable from a dead node.
+    """
+
+    ENC = "mlkem768x25519plus.native.0rtt.6wD_327L54KNiTgD9LOucKtF6abQ3_-U9qWY7mXTjlk"
+
+    def link(self, encryption=None):
+        extra = f"&encryption={encryption}" if encryption is not None else ""
+        return ("vless://uuid-1@r.example.net:443?security=reality&type=tcp"
+                "&sni=www.apple.com&pbk=public-key&sid=abcd&flow=xtls-rprx-vision" + extra)
+
+    def test_the_encryption_value_reaches_the_xray_outbound(self):
+        node = parse_share_link(self.link(self.ENC))
+        self.assertEqual(node["encryption"], self.ENC)
+        user = xray_outbound(node, "out")["settings"]["vnext"][0]["users"][0]
+        self.assertEqual(user["encryption"], self.ENC)
+
+    def test_an_encrypted_node_is_routed_to_xray(self):
+        # Even without REALITY: only Xray implements this.
+        plain = ("vless://uuid-1@r.example.net:443?security=tls&type=tcp"
+                 f"&sni=x.example.net&encryption={self.ENC}")
+        self.assertTrue(node_needs_xray(parse_share_link(plain)))
+
+    def test_sing_box_refuses_it_by_name_instead_of_timing_out(self):
+        node = parse_share_link(self.link(self.ENC))
+        with self.assertRaises(ValueError) as caught:
+            clash_outbound(node, "exit-gb")
+        self.assertIn("VLESS Encryption", str(caught.exception))
+
+    def test_ordinary_nodes_still_say_none(self):
+        for link in (self.link(), self.link("none")):
+            node = parse_share_link(link)
+            self.assertEqual(node["encryption"], "none")
+            user = xray_outbound(node, "out")["settings"]["vnext"][0]["users"][0]
+            self.assertEqual(user["encryption"], "none")
+            # And they remain describable through the sing-box converter.
+            self.assertEqual(clash_outbound(node, "exit-gb")["type"], "vless")
+
+    def test_the_summary_names_the_family_without_the_key_material(self):
+        parsed = egress.describe_proxy_profile({"type": "node", "value": self.link(self.ENC)})
+        self.assertEqual(parsed["encryption"], "mlkem768x25519plus")
+        self.assertNotIn(self.ENC, json.dumps(parsed))
+        self.assertEqual(parsed["engine"], "xray")
+
+
+class TestProxyDiagnosticsTests(unittest.TestCase):
+    def test_both_engine_streams_are_quoted(self):
+        """Xray logs to stdout and sing-box to stderr; reading one left the other silent."""
+        process = SimpleNamespace(
+            stdout=io.StringIO("xray: proxy/vless/outbound: connection ends\n"),
+            stderr=io.StringIO("sing-box: outbound/socks: timeout\n"))
+        detail = egress._process_detail(process)
+        self.assertIn("xray", detail)
+        self.assertIn("sing-box", detail)
+
+    def test_a_process_without_pipes_is_not_an_error(self):
+        self.assertEqual(egress._process_detail(None), "")
+        self.assertEqual(
+            egress._process_detail(SimpleNamespace(stdout=None, stderr=None)), "")
+
+
+class XrayFailureBlastRadiusTests(unittest.TestCase):
+    """REALITY made Xray load-bearing; its failure must not take unrelated exits down."""
+
+    REALITY = ("vless://uuid-1@r.example.net:443?security=reality&type=tcp"
+               "&sni=www.apple.com&pbk=public-key&sid=abcd&flow=xtls-rprx-vision")
+    PLAIN = "trojan://pw@t.example.net:443?sni=t.example.net"
+
+    def _reconcile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            desired = {"proxy": {"enabled": True, "profiles": {
+                            "r": {"name": "R", "type": "node", "value": self.REALITY},
+                            "p": {"name": "P", "type": "node", "value": self.PLAIN}},
+                        "exits": {"gb": {"enabled": True, "profile_id": "r"},
+                                  "us": {"enabled": True, "profile_id": "p"}}},
+                       "lines": []}
+            with patch.object(Orchestrator, "apply_xray",
+                              side_effect=RuntimeError("Xray-core executable not found")), \
+                    patch.object(Orchestrator, "apply_routes"):
+                app.reconcile_proxy(desired)
+            return json.loads((app.root / "proxy-status.json").read_text())
+
+    def test_only_the_xray_backed_country_fails(self):
+        exits = self._reconcile()["exits"]
+        self.assertFalse(exits["gb"]["ready"])
+        self.assertIn("Xray is unavailable", exits["gb"]["error"])
+        # The trojan exit never touches Xray and must still be routed.
+        self.assertTrue(exits["us"]["ready"], "an unrelated exit was taken down with Xray")

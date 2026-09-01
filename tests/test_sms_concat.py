@@ -73,6 +73,102 @@ class SegmentBufferTests(TempStore):
         self.assertEqual(self._buffered(), 3, "only the completed group is cleared")
 
 
+
+
+class LateSegmentMergeTests(TempStore):
+    """Parts that arrive after their group was flushed belong to the message it produced.
+
+    Measured on live networks: segment 1 of a six-part text landed 11 seconds after it was
+    sent and segments 2-6 arrived ten minutes later, long past the buffer's 180-second life.
+    Without a second window each straggler starts a new group and the thread ends up holding
+    the same text twice, both times incomplete.
+    """
+
+    def _flush(self, seqs, bodies, total=6, ref=0, peer="+15555550100", iid="5"):
+        """Reproduce what the reaper does: publish the partial text, then remember the group."""
+        body = main._join_sms_parts(bodies, seqs, total)
+        rec = store.add_message(iid, "in", peer, body, ts=1000)
+        store.remember_partial_sms_group(iid, peer, ref, total, rec["id"], seqs, bodies,
+                                         ts=1000)
+        return rec
+
+    def _body(self, mid):
+        with store._conn() as c:
+            return c.execute("SELECT body FROM messages WHERE id=?", (mid,)).fetchone()[0]
+
+    def test_a_late_part_completes_the_message_already_published(self):
+        rec = self._flush([1], ["one "], total=3)
+        self.assertIn(main.SMS_GAP_MARK, self._body(rec["id"]))
+
+        merged = store.merge_late_sms_segment("5", "+15555550100", 0, 3, 2, "two ", now=1100)
+        self.assertEqual(merged["message_id"], rec["id"])
+        self.assertFalse(merged["complete"])
+        self.assertEqual(merged["bodies"], ["one ", "two "])
+
+        merged = store.merge_late_sms_segment("5", "+15555550100", 0, 3, 3, "three", now=1200)
+        self.assertTrue(merged["complete"])
+        self.assertEqual(main._join_sms_parts(merged["bodies"], merged["seqs"], 3),
+                         "one two three")
+        # Completing the text retires the memory; a further straggler starts a fresh group.
+        self.assertIsNone(
+            store.merge_late_sms_segment("5", "+15555550100", 0, 3, 1, "one ", now=1300))
+
+    def test_late_parts_are_ordered_not_appended(self):
+        rec = self._flush([6], ["-tail"], total=6)
+        for seq, text in ((3, "c"), (2, "b"), (5, "e"), (4, "d"), (1, "a")):
+            merged = store.merge_late_sms_segment("5", "+15555550100", 0, 6, seq, text,
+                                                  now=1100)
+        store.set_message_body(rec["id"],
+                               main._join_sms_parts(merged["bodies"], merged["seqs"], 6))
+        self.assertEqual(self._body(rec["id"]), "abcde-tail")
+        self.assertNotIn(main.SMS_GAP_MARK, self._body(rec["id"]))
+
+    def test_a_repeat_of_a_merged_part_changes_nothing(self):
+        self._flush([1], ["one "], total=2)
+        first = store.merge_late_sms_segment("5", "+15555550100", 0, 2, 1, "one ", now=1100)
+        self.assertTrue(first["duplicate"])
+        self.assertEqual(first["bodies"], ["one "])
+        self.assertFalse(first["complete"], "a repeat must not complete a group")
+        # ...and the group is still open to the part that is genuinely missing.
+        self.assertTrue(
+            store.merge_late_sms_segment("5", "+15555550100", 0, 2, 2, "two", now=1200)
+            ["complete"])
+
+    def test_a_reused_reference_starts_a_new_message_instead_of_corrupting_the_old(self):
+        # The concatenation reference is one byte; the same sender reuses it. A different text
+        # in a slot that is already filled is a NEW message, not a re-delivery.
+        rec = self._flush([1], ["old text "], total=2)
+        self.assertIsNone(
+            store.merge_late_sms_segment("5", "+15555550100", 0, 2, 1, "new text ", now=1100))
+        self.assertEqual(self._body(rec["id"]), "old text " + main.SMS_GAP_MARK)
+        # The memory is gone, so the following part buffers normally rather than merging.
+        self.assertIsNone(
+            store.merge_late_sms_segment("5", "+15555550100", 0, 2, 2, "tail", now=1200))
+
+    def test_the_window_closes_and_the_memory_is_pruned(self):
+        self._flush([1], ["one "], total=2)
+        self.assertIsNone(
+            store.merge_late_sms_segment("5", "+15555550100", 0, 2, 2, "two",
+                                         now=1000 + store.SEGMENT_LATE_WINDOW + 1))
+        self._flush([1], ["one "], total=2, ref=7)
+        self.assertEqual(
+            store.prune_late_sms_groups(now=1000 + store.SEGMENT_LATE_WINDOW + 1), 1)
+        self.assertIsNone(
+            store.merge_late_sms_segment("5", "+15555550100", 7, 2, 2, "two", now=1100))
+
+    def test_memories_are_isolated_by_line_sender_reference_and_total(self):
+        self._flush([1], ["mine"], total=2, ref=3, peer="888", iid="7")
+        for iid, peer, ref, total in (("5", "888", 3, 2), ("7", "999", 3, 2),
+                                      ("7", "888", 4, 2), ("7", "888", 3, 5)):
+            self.assertIsNone(
+                store.merge_late_sms_segment(iid, peer, ref, total, 2, "x", now=1100),
+                f"{iid}/{peer}/{ref}/{total} must not merge into another group's message")
+        self.assertIsNotNone(
+            store.merge_late_sms_segment("7", "888", 3, 2, 2, "x", now=1100))
+
+    def test_an_ordinary_part_with_no_memory_is_left_to_the_normal_buffer(self):
+        self.assertIsNone(store.merge_late_sms_segment("7", "888", 1, 2, 1, "a", now=1000))
+
 class StaleSegmentTests(TempStore):
     def test_sweep_takes_only_groups_past_the_timeout(self):
         store.add_sms_segment("7", "888", 1, 3, 1, "old", ts=1000)

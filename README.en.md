@@ -28,11 +28,15 @@ MDD Sim Gateway is a self-hosted multi-SIM communications gateway for Debian, Ub
 
 Use an ARM64 Debian, Ubuntu or Armbian host with systemd, Docker, USB and a stable network connection.
 
-Storage requirements: keep at least **4 GiB free on the root filesystem** before installation.
-A **16 GB or larger** system disk is recommended, with about **6 GiB free** before an upgrade so
-the new image and one rollback generation can coexist. Development checkouts and explicit source
-builds create substantially more temporary build cache and are unsuitable for space-constrained
-devices. Enlarging a VM's virtual disk alone is not enough: grow its root partition and filesystem,
+Storage requirements: keep at least **2 GiB free on the root filesystem** before installation.
+An **8 GB or larger** system disk is recommended, with about **3 GiB free** before an upgrade so
+the new image and one rollback generation can coexist. Measured: the engine image is 607 MB, two
+generations share their base layers and come to roughly 676 MB together, and the source checkout
+with its virtualenv is about 102 MB; Docker control-plane mode adds 355 MB. **An explicit source
+build is the exception** — compiling Asterisk on the device needs several GiB more in build cache
+and intermediate output, unrelated to the figures above, and is unsuitable for space-constrained
+devices. A normal installation or upgrade downloads the CI-built images and never takes that
+path. Enlarging a VM's virtual disk alone is not enough: grow its root partition and filesystem,
 then use `df -h /` as the authoritative capacity.
 
 ```bash
@@ -75,6 +79,11 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 - Show balance, plan expiry, network presence and keeping results on one page. Prepaid lines can
   schedule a real chargeable SMS, while plan lines can watch the renewal balance and warn when low.
 - Perform EAP-AKA and IMS-AKA in the physical SIM/eSIM without reading or storing Ki/OP/OPc.
+- Interoperate with DITO Telecommunity (515-66) by selecting its advertised
+  AES-CBC-128/HMAC-SHA1/MODP-1024 IKE suite. That legacy suite is scoped to this PLMN;
+  every other carrier keeps the existing MODP-2048 proposal set.
+- Answer permanent/full-auth EAP-AKA identity requests as specified by RFC 4187 for any carrier
+  that requires the standard identity flow.
 - Show each modem UICC's three logical-channel allocations, roles and explicit failures.
 - Provide an authenticated browser softphone, SMS, call history, missed-call notifications and
   per-line local voicemail. Recordings remain on the gateway and are never attached to notifications
@@ -82,7 +91,8 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 - Maintain reusable subscriptions, individual nodes and SOCKS5 proxies, then assign one to each
   country. sing-box owns the isolated TUNs; Xray-core carries Reality/XHTTP nodes. VoWiFi fails
   closed unless the selected exit passes a runtime UDP check.
-- Send standard/custom Webhooks, Telegram notifications and PushPlus messages.
+- Send standard/custom Webhooks, Telegram and PushPlus notifications, plus multiple independently
+  signed Feishu/Lark custom bots with optional per-SIM-line routing.
 - Check releases every six hours in the background. Choose automatic installation or notify-only,
   scoped to main releases or every release. Unattended installation still requires the exact version
   and earliest rollout time to be approved separately in `update-policy.json`. All-version

@@ -1,10 +1,11 @@
 """
 notify_push.py - Outbound push notifications for incoming events (SMS / calls).
 
-Three independent, separately-configurable channels, all driven from global settings:
+Four independent, separately-configurable channels, all driven from global settings:
   - webhook : GET or POST standard/custom fields to a user-supplied URL.
   - telegram: send a formatted message to a chat/channel via a Telegram bot.
   - pushplus: send through the official PushPlus HTTP API.
+  - feishu  : send text notifications through a Feishu/Lark custom bot webhook.
 
 Both fire on the SAME internal events (incoming_sms, incoming_call) and carry the same
 core fields (SIM ICCID, the line's own MSISDN, the event's source number, the event type,
@@ -15,6 +16,9 @@ failing/slow endpoint only logs a warning.
 from __future__ import annotations
 
 import collections
+import base64
+import hashlib
+import hmac
 import logging
 import json
 import os
@@ -23,6 +27,7 @@ import threading
 import time
 import uuid
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -170,9 +175,58 @@ def _events_enabled(chan: dict) -> dict:
 
 
 def has_enabled_channel(settings: dict, event: str) -> bool:
-    return any(bool((settings.get(key) or {}).get("enabled"))
+    standard = any(bool((settings.get(key) or {}).get("enabled"))
                and bool(_events_enabled(settings.get(key) or {}).get(event))
                for key in ("webhook", "telegram", "pushplus"))
+    return standard or any(
+        bool(channel.get("enabled")) and bool(_events_enabled(channel).get(event))
+        for channel in feishu_channels(settings.get("feishu") or {})
+    )
+
+
+def feishu_channels(cfg: dict) -> list[dict]:
+    """Normalized Feishu destinations, including one legacy single-bot destination.
+
+    An explicit ``channels`` list owns delivery as soon as it is non-empty. This prevents the
+    legacy top-level URL from causing duplicate fan-out after the first multi-channel save.
+    """
+    channels = cfg.get("channels")
+    if isinstance(channels, list):
+        return [dict(channel) for channel in channels if isinstance(channel, dict)]
+    if cfg.get("url") or cfg.get("enabled"):
+        legacy = dict(cfg)
+        legacy.pop("channels", None)
+        legacy.setdefault("id", "legacy")
+        legacy.setdefault("name", "Feishu / Lark")
+        legacy.setdefault("instances", [])
+        return [legacy]
+    return []
+
+
+def feishu_channel_matches(channel: dict, instance_id) -> bool:
+    selected = {str(value) for value in (channel.get("instances") or []) if str(value).strip()}
+    return not selected or str(instance_id or "") in selected
+
+
+def validate_feishu_channels(cfg: dict) -> list[dict]:
+    channels = feishu_channels(cfg)
+    seen = set()
+    for position, channel in enumerate(channels, start=1):
+        channel_id = str(channel.get("id") or position)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", channel_id) or channel_id in seen:
+            raise ValueError("Feishu channel IDs must be unique and use letters, digits, ., _ or -")
+        seen.add(channel_id)
+        if len(str(channel.get("name") or "")) > 120 \
+                or any(char in str(channel.get("name") or "") for char in "\r\n"):
+            raise ValueError("Feishu channel name is invalid")
+        instances = channel.get("instances") or []
+        if not isinstance(instances, list) or any(
+                not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(value)) for value in instances):
+            raise ValueError("Feishu instance filters are invalid")
+        validate_message_templates(channel)
+        if channel.get("enabled"):
+            validate_feishu_url(channel.get("url"))
+    return channels
 
 
 def build_payload(event: str, instance: dict, source: str, text: str | None) -> dict:
@@ -445,6 +499,73 @@ def send_pushplus(cfg: dict, payload: dict) -> dict:
     return {"ok": True, "status_code": response.status_code}
 
 
+def feishu_signature(timestamp: int | str, secret: str) -> str:
+    """Return the signature required by Feishu/Lark custom bots.
+
+    The platform defines the HMAC key as ``<timestamp>\n<secret>`` and signs an empty
+    message. Keeping this in a small pure function makes the slightly unusual contract
+    explicit and gives callers a deterministic unit-test target.
+    """
+    key = f"{timestamp}\n{secret}".encode("utf-8")
+    digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _feishu_text(payload: dict, cfg: dict | None = None) -> str:
+    message = build_notification_message(payload, cfg or {})
+    return "\n\n".join(part for part in (message["title"], message["content"]) if part)
+
+
+def validate_feishu_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        raise ValueError("Feishu webhook URL is required")
+    if not re.fullmatch(
+            r"https://(?:open\.feishu\.cn|open\.larksuite\.com)/open-apis/bot/v2/hook/[^/?#]+",
+            value, re.IGNORECASE):
+        raise ValueError("Feishu webhook URL is invalid")
+    return value
+
+
+def send_feishu(cfg: dict, payload: dict) -> dict:
+    """Send one Feishu/Lark custom-bot text message and validate its JSON result.
+
+    Feishu commonly returns HTTP 200 even when it rejects a payload, so transport success
+    alone is insufficient. Both Feishu's ``code`` response and Lark-compatible
+    ``StatusCode``/``status`` variants are accepted only when they explicitly report success.
+    """
+    url = validate_feishu_url(cfg.get("url"))
+    body: dict[str, Any] = {
+        "msg_type": "text",
+        "content": {"text": _feishu_text(payload, cfg)},
+    }
+    secret = str(cfg.get("secret") or "").strip()
+    if secret:
+        timestamp = int(time.time())
+        body.update({"timestamp": str(timestamp), "sign": feishu_signature(timestamp, secret)})
+    try:
+        response = requests.post(url, json=body, timeout=_TIMEOUT)
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException:
+        # Never include the exception: its URL contains the bot token.
+        raise RuntimeError("Feishu request failed") from None
+    except ValueError:
+        raise RuntimeError("Feishu returned an invalid response") from None
+    if not isinstance(result, dict):
+        raise RuntimeError("Feishu returned an invalid response")
+    success = False
+    if "code" in result:
+        success = str(result.get("code")) == "0"
+    elif "StatusCode" in result:
+        success = str(result.get("StatusCode")) == "0"
+    elif "status" in result:
+        success = str(result.get("status")).lower() in {"ok", "success"}
+    if not success:
+        raise RuntimeError("Feishu rejected the message")
+    return {"ok": True, "status_code": response.status_code}
+
+
 def _telegram_headline(icon: str, text: str) -> str:
     """Telegram's own first line. The icon stays leftmost — it is what makes the event type
     scannable in a chat list — and the brand follows it, for the same reason the titles carry
@@ -513,9 +634,46 @@ def telegram_session(cfg: dict) -> requests.Session:
     session = requests.Session()
     session.trust_env = False
     if mode == "manual":
+        # Kept for configurations saved before the shared proxy library was introduced.
         proxy = str(cfg.get("proxy_url") or "").strip()
         if not re.match(r"^(?:https?|socks5h?)://", proxy, re.IGNORECASE):
             raise ValueError("Telegram proxy must be an HTTP(S) or SOCKS5 URL")
+        session.proxies.update({"http": proxy, "https": proxy})
+    elif mode == "library":
+        from . import config as settings_config
+        settings = settings_config.get_settings()
+        profile_id = str(cfg.get("proxy_profile_id") or "").strip()
+        profile = ((settings.get("proxy") or {}).get("profiles") or {}).get(profile_id) or {}
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) or not profile:
+            raise RuntimeError("selected Telegram proxy is no longer in the proxy library")
+        if profile.get("type") == "socks5":
+            host = str(profile.get("server") or "").strip()
+            try:
+                port = int(profile.get("port") or 1080)
+            except (TypeError, ValueError):
+                port = 0
+            if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
+                raise RuntimeError("selected Telegram SOCKS5 proxy is invalid")
+            username = str(profile.get("username") or "")
+            password = str(profile.get("password") or "")
+            auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" \
+                if username or password else ""
+            proxy = f"socks5h://{auth}{host}:{port}"
+        else:
+            exits = (settings.get("proxy") or {}).get("exits") or {}
+            live = egress.status().get("exits") or {}
+            state = next((live.get(country) or {} for country, exit_cfg in exits.items()
+                          if isinstance(exit_cfg, dict) and exit_cfg.get("enabled")
+                          and exit_cfg.get("profile_id") == profile_id
+                          and (live.get(country) or {}).get("ready")), {})
+            try:
+                port = int(state.get("proxy_port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            host = str(state.get("proxy_host") or "").strip()
+            if not host or not 1 <= port <= 65535:
+                raise RuntimeError("selected Telegram proxy has no ready country exit")
+            proxy = f"socks5h://{host}:{port}"
         session.proxies.update({"http": proxy, "https": proxy})
     elif mode == "country":
         country = egress.normalize_country(cfg.get("proxy_country"))
@@ -539,7 +697,7 @@ def telegram_session(cfg: dict) -> requests.Session:
         proxy = f"socks5h://{proxy_host}:{proxy_port}"
         session.proxies.update({"http": proxy, "https": proxy})
     elif mode != "direct":
-        raise ValueError("Telegram proxy mode must be direct, manual or country")
+        raise ValueError("Telegram proxy mode must be direct, library, country or legacy manual")
     return session
 
 
@@ -624,5 +782,23 @@ def dispatch(settings: dict, event: str, instance: dict, source: str, text: str 
         pp = settings.get("pushplus") or {}
         if pp.get("enabled") and _events_enabled(pp).get(event):
             _deliver_with_retry("pushplus", send_pushplus, pp, payload)
+        feishu_deliveries = []
+        for position, fs in enumerate(feishu_channels(settings.get("feishu") or {}), start=1):
+            if (fs.get("enabled") and _events_enabled(fs).get(event)
+                    and feishu_channel_matches(fs, payload.get("instance"))):
+                channel_id = str(fs.get("id") or position)
+                delivery_channel = "feishu" if channel_id == "legacy" else f"feishu:{channel_id}"
+                feishu_deliveries.append((delivery_channel, fs))
+        # One unavailable bot must not postpone another bot by the full 0/2/5-second retry
+        # ladder. Each destination owns an independent delivery id, retry state and thread.
+        threads = [threading.Thread(
+            target=_deliver_with_retry,
+            args=(delivery_channel, send_feishu, channel_cfg, payload),
+            daemon=True,
+        ) for delivery_channel, channel_cfg in feishu_deliveries]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
     except Exception as e:  # noqa
         log.warning("push dispatch error: %r", e)

@@ -1,9 +1,26 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from control.app import config, engine, main
+
+
+_lifecycle_patcher = None
+
+
+def setUpModule():
+    # Lifecycle persistence itself is covered against a TemporaryDirectory below. Other tests
+    # exercise policy decisions and must never write their fictional line ids into repo data.
+    global _lifecycle_patcher
+    _lifecycle_patcher = patch.object(main, "_record_lifecycle")
+    _lifecycle_patcher.start()
+
+
+def tearDownModule():
+    if _lifecycle_patcher is not None:
+        _lifecycle_patcher.stop()
 
 
 class DeletedCardSuppressionTests(unittest.TestCase):
@@ -29,6 +46,60 @@ class DeletedCardSuppressionTests(unittest.TestCase):
                 self.assertTrue(engine.delete_instance_data("line-1"))
             self.assertFalse(target.parent.exists())
             self.assertTrue((other / "keep").exists())
+
+    def test_lifecycle_records_are_bounded_and_reject_free_text(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "DATA_DIR", temp), \
+                patch.object(engine, "HOST_DATA_DIR", temp), \
+                patch.object(engine, "LIFECYCLE_RECORDS", 3):
+            Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
+            for index in range(5):
+                engine.record_lifecycle(
+                    "line-1", "recovery_failed", reason_code="engine_start_failed",
+                    retry_count=index, card_present=True)
+            path = Path(temp, "instances", "line-1", "logs", "lifecycle.jsonl")
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            with self.assertRaises(ValueError):
+                engine.record_lifecycle(
+                    "line-1", "recovery_failed", reason_code="path=/private/secret")
+            with self.assertRaises(ValueError):
+                engine.record_lifecycle(
+                    "../outside", "recovery_failed", reason_code="engine_start_failed")
+
+        self.assertEqual(len(records), 3)
+        self.assertEqual([item["retry_count"] for item in records], [2, 3, 4])
+        self.assertEqual(set(records[-1]), {
+            "ts", "instance", "event", "reason_code", "retry_count", "card_present"})
+
+    def test_lifecycle_keeps_the_sip_status_that_condemned_the_line(self):
+        # Issue #33: a reg_rejected freeze reached the support bundle without the SIP code
+        # that caused it, because every log holding it had already rotated.
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "DATA_DIR", temp), \
+                patch.object(engine, "HOST_DATA_DIR", temp):
+            Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
+            engine.record_lifecycle(
+                "line-1", "recovery_scheduled", reason_code="reg_rejected",
+                delay_seconds=120, sip_status=403)
+            engine.record_lifecycle(
+                "line-1", "recovery_scheduled", reason_code="reg_rejected",
+                delay_seconds=120, sip_status=None)
+            engine.record_lifecycle(
+                "line-1", "recovery_scheduled", reason_code="reg_rejected",
+                delay_seconds=120, sip_status=12345)
+            path = Path(temp, "instances", "line-1", "logs", "lifecycle.jsonl")
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records[0]["sip_status"], 403)
+        self.assertNotIn("sip_status", records[1])
+        self.assertEqual(records[2]["sip_status"], 999)
+
+    def test_lifecycle_never_recreates_a_deleted_instance_directory(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "DATA_DIR", temp), \
+                patch.object(engine, "HOST_DATA_DIR", temp):
+            engine.record_lifecycle(
+                "deleted", "recovery_cancelled", reason_code="line_deleted")
+            self.assertFalse(Path(temp, "instances", "deleted").exists())
 
 
 class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
@@ -125,6 +196,17 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 main._line_auto_start_allowed(inst), (False, "vowifi_disabled"))
 
+    def test_new_device_default_does_not_disable_an_enabled_native_reader_line(self):
+        inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
+        card = {"present": True, "iccid": "saved-card", "name": "USB reader",
+                "reader_port": "usb:1-2", "hardware_kind": "reader"}
+        desired = {"defaults": {"vowifi_enabled": False}, "devices": {}}
+        with patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(main, "_device_for_card", return_value=("reader-1", "reader")), \
+                patch.object(main.device_state, "desired", return_value=desired) as read_desired:
+            self.assertEqual(main._line_auto_start_allowed(inst), (True, ""))
+        read_desired.assert_not_called()
+
     async def test_auto_recovery_rechecks_a_transiently_absent_card(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
         main.hub.health_for("offline").update({
@@ -135,6 +217,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "_line_auto_start_allowed",
                           return_value=(False, "no_card")), \
                 patch.object(main, "_start_engine_checked") as start, \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
                 patch.object(main.hub, "broadcast", new=AsyncMock()):
             await main._auto_recover_instance("offline", inst, 60)
 
@@ -144,6 +227,15 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["frozen_code"], "tunnel_sim_auth")
         self.assertFalse(health["auto_retrying"])
         self.assertGreaterEqual(health["next_retry_at"], started + 60)
+        lifecycle.assert_called_once_with(
+            "offline", "recovery_blocked", "no_card", retry_count=3,
+            delay_seconds=60, card_present=False)
+
+        # The sampled cache can remain absent for hours. Rechecks re-arm recovery but must not
+        # fill the bounded audit with an identical blocked record every cooldown.
+        health["auto_retrying"] = True
+        await main._auto_recover_instance("offline", inst, 60)
+        lifecycle.assert_called_once()
 
     async def test_disabled_vowifi_still_cancels_pending_recovery(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
@@ -154,6 +246,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "_line_auto_start_allowed",
                           return_value=(False, "vowifi_disabled")), \
                 patch.object(main, "_start_engine_checked") as start, \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
                 patch.object(main.hub, "broadcast", new=AsyncMock()):
             await main._auto_recover_instance("offline", inst, 60)
 
@@ -162,6 +255,35 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(health["frozen_code"])
         self.assertIsNone(health["next_retry_at"])
         self.assertEqual(main.hub.status_cache["offline"]["state"], "STOPPED")
+        lifecycle.assert_called_once_with(
+            "offline", "recovery_cancelled", "vowifi_disabled",
+            retry_count=0, card_present=True)
+
+    async def test_hardware_imei_recovery_failure_is_structured_without_exception_text(self):
+        inst = {"id": "offline", "iccid": "saved-card", "enabled": True,
+                "imei_source_device_id": "modem-a"}
+        main.hub.health_for("offline").update({
+            "frozen_code": "tunnel_network", "frozen_reason": "failed",
+            "auto_retrying": True, "retry_count": 3,
+        })
+        failure = main.HTTPException(409, {
+            "code": "hardware_imei_required",
+            "message": "private path /dev/ttyUSB2 and 123456789012345",
+            "device_id": "modem-a",
+        })
+        with patch.object(main, "_line_auto_start_allowed", return_value=(True, "")), \
+                patch.object(main, "_start_engine_checked", side_effect=failure), \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            await main._auto_recover_instance("offline", inst, 60)
+
+        self.assertEqual(lifecycle.call_count, 2)
+        failed = lifecycle.call_args_list[-1]
+        self.assertEqual(failed.args, (
+            "offline", "recovery_failed", "hardware_imei_required"))
+        self.assertEqual(failed.kwargs["imei_valid"], False)
+        self.assertEqual(failed.kwargs["imei_source_matches"], True)
+        self.assertNotIn("private", str(failed))
 
     async def test_card_removal_cancels_a_pending_recovery_without_a_container(self):
         inst = {"id": "removed", "iccid": "saved-card"}
@@ -172,6 +294,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
                  "iccid": "saved-card"}
         with patch.object(main.cfg, "unsuppress_card"), \
                 patch.object(main.cfg, "get_instance", return_value=inst), \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
                 patch.object(main.engine, "is_running", return_value=False):
             stopped = await main._on_card_remove(entry)
 
@@ -179,6 +302,9 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         health = main.hub.health["removed"]
         self.assertIsNone(health["frozen_code"])
         self.assertIsNone(health["next_retry_at"])
+        lifecycle.assert_called_once_with(
+            "removed", "recovery_cancelled", "no_card",
+            retry_count=0, card_present=False)
 
     async def test_maintenance_restart_only_recreates_the_running_snapshot(self):
         running = {"id": "1", "enabled": True}
@@ -332,6 +458,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         main.hub.reset_health("guarded")
 
     async def test_unanswered_fast_recovery_is_rate_limited_per_line(self):
+        main._record_lifecycle.reset_mock()
         iid = "rate-limited"
         main.hub.reset_health(iid)
         main.hub.reg_unanswered_recovery_at[iid] = main.time.monotonic()
@@ -386,6 +513,14 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capture_and_stop.call_args.args[0], "3")
         self.assertIn("reg_rejected", capture_and_stop.call_args.args[2])
         self.assertIsNone(capture_and_stop.call_args.args[3])
+        main._record_lifecycle.assert_called_once()
+        lifecycle_call = main._record_lifecycle.call_args
+        self.assertEqual(
+            lifecycle_call.args,
+            ("3", "recovery_scheduled", "reg_rejected"))
+        self.assertEqual(lifecycle_call.kwargs["retry_count"], 3)
+        self.assertGreaterEqual(lifecycle_call.kwargs["delay_seconds"], 119)
+        self.assertLessEqual(lifecycle_call.kwargs["delay_seconds"], 120)
         # The exit is NOT asked to move. A carrier that answers registration with a rejection
         # says nothing about the path its packets took, and moving on that evidence is what
         # made a healthy pool churn: measured over fifty freezes, the node blamed most often
@@ -488,6 +623,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
             "frozen_code": "registering", "frozen_reason": "IMS unavailable",
             "next_retry_at": main.time.monotonic() + 1, "last_state": "REGISTERING",
         }
+        main._record_lifecycle.reset_mock()
         with patch.object(main.engine, "stop") as stop, \
                 patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop_ami:
             await main.api_instance_stop("stop-test")
@@ -497,6 +633,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.hub.status_cache["stop-test"]["state"], "STOPPED")
         stop.assert_called_once_with("stop-test")
         drop_ami.assert_awaited_once_with("stop-test")
+        main._record_lifecycle.assert_called_once_with(
+            "stop-test", "recovery_cancelled", "user_requested",
+            retry_count=3, card_present=None)
         main.hub.reset_health("stop-test")
 
     async def test_unknown_registration_only_holds_ok_for_bounded_grace(self):
@@ -855,6 +994,35 @@ class ImeiSourceFollowsReaderTests(unittest.TestCase):
         # overwrite the reader record from whichever SIM happens to be inserted.
         _, saved = self._run([{"id": "5", "imei_source_device_id": "reader-old"}])
         self.assertTrue(all(item["imei_source_device_id"] for item in saved))
+
+
+class HardwareImeiRecoveryTests(unittest.TestCase):
+    CARD = {"iccid": "8900000000000000001"}
+
+    def _resolve(self, inst):
+        with patch.object(main, "_device_for_card", return_value=("modem-a", "modem")), \
+                patch.object(main, "_device_identities",
+                             return_value={"modem-a": {"imei": ""}}), \
+                patch.object(main, "_match_instance_by_iccid", return_value=inst):
+            return main._hardware_imei_for_card(self.CARD, [self.CARD])
+
+    def test_rebuild_does_not_reuse_a_modem_imei_from_a_port_based_id(self):
+        resolved = self._resolve({
+            "imei": "123456789012345", "imei_source_device_id": "modem-a"})
+        self.assertEqual(resolved, ("", "modem-a", "modem"))
+
+    def test_rebuild_never_borrows_an_imei_from_another_modem(self):
+        resolved = self._resolve({
+            "imei": "123456789012345", "imei_source_device_id": "modem-b"})
+        self.assertEqual(resolved, ("", "modem-a", "modem"))
+
+    def test_reader_rebuild_also_reuses_its_verified_line_snapshot(self):
+        inst = {"imei": "123456789012345", "imei_source_device_id": "reader-a"}
+        with patch.object(main, "_device_for_card", return_value=("reader-a", "reader")), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main, "_match_instance_by_iccid", return_value=inst):
+            resolved = main._hardware_imei_for_card(self.CARD, [self.CARD])
+        self.assertEqual(resolved, ("123456789012345", "reader-a", "reader"))
 
 
 class OutageDetailTests(unittest.TestCase):

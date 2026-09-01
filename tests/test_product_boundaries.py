@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import yaml
 from pathlib import Path
 from unittest.mock import patch
 
@@ -47,13 +48,47 @@ class ProductBoundaryTests(unittest.TestCase):
         with temp, paths:
             config.save({
                 "settings": {key: {"events": {"activation_reminder": True}}
-                             for key in ("webhook", "telegram", "pushplus")},
+                             for key in ("webhook", "telegram", "pushplus", "feishu")},
                 "instances": {},
             })
             settings = config.load()["settings"]
-            for key in ("webhook", "telegram", "pushplus"):
+            for key in ("webhook", "telegram", "pushplus", "feishu"):
                 self.assertNotIn("activation_reminder", settings[key]["events"])
                 self.assertTrue(settings[key]["events"]["software_update"])
+
+    def test_legacy_feishu_settings_migrate_to_one_channel(self):
+        temp, paths = self.temp_config()
+        with temp, paths:
+            with open(config.CONFIG_PATH, "w", encoding="utf-8") as handle:
+                yaml.safe_dump({"settings": {"feishu": {
+                    "enabled": True,
+                    "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+                    "secret": "secret",
+                }}, "instances": {}}, handle)
+            feishu = config.load()["settings"]["feishu"]
+            self.assertEqual(len(feishu["channels"]), 1)
+            self.assertEqual(feishu["channels"][0]["id"], "legacy")
+            self.assertEqual(feishu["channels"][0]["url"], feishu["url"])
+
+    def test_explicit_empty_feishu_channels_do_not_restore_legacy_channel(self):
+        temp, paths = self.temp_config()
+        with temp, paths:
+            config.save({"settings": {"feishu": {
+                "enabled": True,
+                "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+                "channels": [],
+            }}, "instances": {}})
+            self.assertEqual(config.load()["settings"]["feishu"]["channels"], [])
+
+    def test_retired_event_is_removed_from_nested_feishu_channels(self):
+        temp, paths = self.temp_config()
+        with temp, paths:
+            config.save({"settings": {"feishu": {"channels": [{
+                "id": "ops", "events": {"activation_reminder": True},
+            }]}}, "instances": {}})
+            channel = config.load()["settings"]["feishu"]["channels"][0]
+            self.assertNotIn("activation_reminder", channel["events"])
+            self.assertTrue(channel["events"]["software_update"])
 
     def test_only_first_five_legacy_lines_are_startable(self):
         temp, paths = self.temp_config()

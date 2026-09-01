@@ -37,6 +37,66 @@ class EgressError(RuntimeError):
     pass
 
 
+def udp_probe_targets() -> list[str]:
+    """Public resolvers the UDP probe may use, in order.
+
+    One hard-coded resolver made the probe a test of that address rather than of UDP: an
+    exit whose provider blackholes 1.1.1.1, or whose panel routes port 53 somewhere of its
+    own, failed a check it should have passed — and the exit it condemned carries IKE on
+    UDP 500/4500, which has nothing to do with DNS. Any one answer proves the path.
+    """
+    raw = os.environ.get("MDD_UDP_PROBE_TARGETS", "1.1.1.1,8.8.8.8,9.9.9.9")
+    targets = []
+    for value in raw.split(","):
+        value = value.strip()
+        try:
+            socket.inet_aton(value)
+        except OSError:
+            continue
+        if value not in targets:
+            targets.append(value)
+    return targets or ["1.1.1.1"]
+
+
+def stun_probe_targets() -> list[tuple[str, int]]:
+    """STUN servers the UDP probe may use, in order.
+
+    STUN is what the DNS probe should have been: a bare UDP round trip, on ports no
+    resolver policy rewrites, answered by servers that exist to confirm exactly this.
+    """
+    raw = os.environ.get("MDD_UDP_STUN_TARGETS",
+                         "stun.cloudflare.com:3478,stun.l.google.com:19302")
+    targets = []
+    for value in raw.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        name, _, port = value.rpartition(":")
+        if not name or not port.isdigit() or not 0 < int(port) <= 65535:
+            continue
+        if (name, int(port)) not in targets:
+            targets.append((name, int(port)))
+    return targets
+
+
+def udp_probe_plan() -> list[tuple]:
+    """DNS and STUN probes interleaved, so neither family decides the verdict alone.
+
+    Interleaved rather than appended: a hard-coded resolver being unreachable must not push
+    the STUN probes past the time budget, which is how one blocked address used to condemn
+    an exit that carries IKE.
+    """
+    dns = [("dns", target, 53) for target in udp_probe_targets()]
+    stun = [("stun", name, port) for name, port in stun_probe_targets()]
+    plan = []
+    for index in range(max(len(dns), len(stun))):
+        if index < len(dns):
+            plan.append(dns[index])
+        if index < len(stun):
+            plan.append(stun[index])
+    return plan or [("dns", "1.1.1.1", 53)]
+
+
 def _recv_exact(stream: socket.socket, size: int) -> bytes:
     chunks = []
     remaining = size
@@ -49,72 +109,117 @@ def _recv_exact(stream: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _udp_probe_once(host: str, port: int, probe: tuple, timeout: float,
+                    username: str = "", password: str = "") -> int:
+    """One complete SOCKS5 UDP ASSOCIATE carrying `probe`, returning the round trip in ms.
+
+    `probe` is (kind, target_host, target_port): "dns" sends an A query, "stun" a Binding
+    Request. The target may be a name — the relay resolves it, which is also what a real
+    exit has to do.
+    """
+    kind, target_host, target_port = probe
+    if kind == "stun":
+        transaction = os.urandom(12)
+        payload = struct.pack("!HH", 0x0001, 0) + b"\x21\x12\xa4\x42" + transaction
+    else:
+        transaction = os.urandom(2)
+        # A cloudflare.com A query with recursion desired.
+        payload = transaction + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" \
+            + b"\x0acloudflare\x03com\x00\x00\x01\x00\x01"
+
+    started = time.monotonic()
+    with socket.create_connection((host, int(port)), timeout=timeout) as stream:
+        stream.settimeout(timeout)
+        methods = b"\x00\x02" if username or password else b"\x00"
+        stream.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        method = _recv_exact(stream, 2)
+        if method == b"\x05\x02":
+            user, secret = username.encode(), password.encode()
+            if not user or len(user) > 255 or len(secret) > 255:
+                raise EgressError("SOCKS5 username or password is invalid")
+            stream.sendall(b"\x01" + bytes([len(user)]) + user
+                           + bytes([len(secret)]) + secret)
+            if _recv_exact(stream, 2) != b"\x01\x00":
+                raise EgressError("SOCKS5 username or password was rejected")
+        elif method != b"\x05\x00":
+            raise EgressError("SOCKS5 proxy rejected UDP test negotiation")
+        stream.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        head = _recv_exact(stream, 4)
+        if head[:2] != b"\x05\x00":
+            raise EgressError(f"SOCKS5 proxy rejected UDP associate (code {head[1]})")
+        atyp = head[3]
+        if atyp == 1:
+            relay_host = socket.inet_ntoa(_recv_exact(stream, 4))
+        elif atyp == 3:
+            relay_host = _recv_exact(stream, _recv_exact(stream, 1)[0]).decode("ascii")
+        elif atyp == 4:
+            relay_host = socket.inet_ntop(socket.AF_INET6, _recv_exact(stream, 16))
+        else:
+            raise EgressError("SOCKS5 proxy returned an invalid UDP relay address")
+        relay_port = struct.unpack("!H", _recv_exact(stream, 2))[0]
+        if relay_host in {"0.0.0.0", "::"}:
+            relay_host = host
+
+        try:
+            destination = b"\x01" + socket.inet_aton(target_host)
+        except OSError:
+            name = target_host.encode("idna")
+            destination = b"\x03" + bytes([len(name)]) + name
+        packet = b"\x00\x00\x00" + destination + struct.pack("!H", target_port) + payload
+        family = socket.AF_INET6 if ":" in relay_host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_DGRAM) as udp:
+            udp.settimeout(timeout)
+            udp.sendto(packet, (relay_host, relay_port))
+            response, _ = udp.recvfrom(4096)
+        if len(response) < 10 or response[0:3] != b"\x00\x00\x00":
+            raise EgressError("SOCKS5 proxy returned an invalid UDP response")
+        # Skip the variable SOCKS destination header before reading the answer itself.
+        response_atyp = response[3]
+        offset = 4 + (4 if response_atyp == 1 else 16 if response_atyp == 4
+                      else 1 + response[4] if response_atyp == 3 else -100) + 2
+        if offset < 6:
+            raise EgressError("SOCKS5 proxy returned an invalid UDP response")
+        answer = response[offset:]
+        if kind == "stun":
+            # Binding Success, same magic cookie and transaction id.
+            if len(answer) < 20 or answer[0:2] != b"\x01\x01" \
+                    or answer[4:8] != b"\x21\x12\xa4\x42" or answer[8:20] != transaction:
+                raise EgressError("STUN response did not match the test request")
+        elif len(answer) < 4 or answer[0:2] != transaction or not (answer[2] & 0x80):
+            raise EgressError("UDP DNS response did not match the test request")
+    return max(1, round((time.monotonic() - started) * 1000))
+
+
 def test_udp_proxy(host: str, port: int, timeout: float = 8.0,
                    username: str = "", password: str = "") -> int:
-    """Send one DNS query through a SOCKS5 UDP ASSOCIATE and return latency in ms.
+    """Prove a SOCKS5 listener carries UDP, and return the round trip in ms.
 
     Country exits expose a loopback/bridge-only SOCKS5 listener. Testing that listener checks
     the complete configured outbound, including the UDP path VoWiFi IKE actually requires.
-    """
-    started = time.monotonic()
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout) as stream:
-            stream.settimeout(timeout)
-            methods = b"\x00\x02" if username or password else b"\x00"
-            stream.sendall(b"\x05" + bytes([len(methods)]) + methods)
-            method = _recv_exact(stream, 2)
-            if method == b"\x05\x02":
-                user, secret = username.encode(), password.encode()
-                if not user or len(user) > 255 or len(secret) > 255:
-                    raise EgressError("SOCKS5 username or password is invalid")
-                stream.sendall(b"\x01" + bytes([len(user)]) + user
-                               + bytes([len(secret)]) + secret)
-                if _recv_exact(stream, 2) != b"\x01\x00":
-                    raise EgressError("SOCKS5 username or password was rejected")
-            elif method != b"\x05\x00":
-                raise EgressError("SOCKS5 proxy rejected UDP test negotiation")
-            stream.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
-            head = _recv_exact(stream, 4)
-            if head[:2] != b"\x05\x00":
-                raise EgressError(f"SOCKS5 proxy rejected UDP associate (code {head[1]})")
-            atyp = head[3]
-            if atyp == 1:
-                relay_host = socket.inet_ntoa(_recv_exact(stream, 4))
-            elif atyp == 3:
-                relay_host = _recv_exact(stream, _recv_exact(stream, 1)[0]).decode("ascii")
-            elif atyp == 4:
-                relay_host = socket.inet_ntop(socket.AF_INET6, _recv_exact(stream, 16))
-            else:
-                raise EgressError("SOCKS5 proxy returned an invalid UDP relay address")
-            relay_port = struct.unpack("!H", _recv_exact(stream, 2))[0]
-            if relay_host in {"0.0.0.0", "::"}:
-                relay_host = host
 
-            query_id = os.urandom(2)
-            # A cloudflare.com A query with recursion desired.
-            dns = query_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" \
-                + b"\x0acloudflare\x03com\x00\x00\x01\x00\x01"
-            packet = b"\x00\x00\x00\x01" + socket.inet_aton("1.1.1.1") \
-                + struct.pack("!H", 53) + dns
-            family = socket.AF_INET6 if ":" in relay_host else socket.AF_INET
-            with socket.socket(family, socket.SOCK_DGRAM) as udp:
-                udp.settimeout(timeout)
-                udp.sendto(packet, (relay_host, relay_port))
-                response, _ = udp.recvfrom(4096)
-            if len(response) < 22 or response[0:3] != b"\x00\x00\x00":
-                raise EgressError("SOCKS5 proxy returned an invalid UDP response")
-            # Skip the variable SOCKS destination header before checking the DNS transaction.
-            response_atyp = response[3]
-            offset = 4 + (4 if response_atyp == 1 else 16 if response_atyp == 4
-                          else 1 + response[4] if response_atyp == 3 else -100) + 2
-            if offset < 6 or response[offset:offset + 2] != query_id \
-                    or not (response[offset + 2] & 0x80):
-                raise EgressError("UDP DNS response did not match the test request")
-    except EgressError:
-        raise
-    except (OSError, ValueError, struct.error) as exc:
-        raise EgressError(f"UDP test failed: {exc}") from exc
-    return max(1, round((time.monotonic() - started) * 1000))
+    DNS alone was the wrong question to ask. VoWiFi carries IKE on UDP 500/4500 and never
+    queries these resolvers, while port 53 is among the most intercepted, redirected and
+    rewritten ports there is — a panel with a DNS rule of its own, or a provider hijacking
+    53, failed exits that carry IMS perfectly well. STUN probes are therefore interleaved
+    with the DNS ones: they answer the actual question (does a UDP round trip survive this
+    exit) on a port nobody rewrites. Any single answer passes.
+
+    Each probe gets its own ASSOCIATE: a relay binds to the source port of the first
+    datagram it sees, so a second target sent through the same session is discarded rather
+    than answered.
+    """
+    plan = udp_probe_plan()
+    per_probe = max(2.0, timeout / len(plan))
+    deadline = time.monotonic() + timeout
+    failures = []
+    for index, probe in enumerate(plan):
+        if index and time.monotonic() >= deadline:
+            break
+        try:
+            return _udp_probe_once(host, port, probe, per_probe, username, password)
+        except (EgressError, OSError, ValueError, struct.error) as exc:
+            failures.append(f"{probe[0]}/{probe[1]}: {exc}")
+    raise EgressError("UDP test failed — " + "; ".join(failures))
 
 
 def _free_loopback_port() -> int:
@@ -129,16 +234,25 @@ def _write_private_json(path: Path, value: dict):
 
 
 def _process_detail(process: subprocess.Popen | None, limit: int = 300) -> str:
-    """Whatever the test proxy printed before giving up, trimmed to one readable line."""
-    if not process or not process.stderr:
+    """Whatever the test proxy printed before giving up, trimmed to one readable line.
+
+    Both streams are drained: sing-box reports on stderr while Xray-core writes its log to
+    stdout, so reading only one of them left whichever engine actually failed unquoted.
+    Call this only after the process has been stopped — these reads run to EOF.
+    """
+    if not process:
         return ""
-    try:
-        text = process.stderr.read() or ""
-    except (OSError, ValueError):
-        return ""
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", "replace")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines: list[str] = []
+    for stream in (process.stdout, process.stderr):
+        if not stream:
+            continue
+        try:
+            text = stream.read() or ""
+        except (OSError, ValueError):
+            continue
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        lines += [line.strip() for line in text.splitlines() if line.strip()]
     return " | ".join(lines[-3:])[:limit]
 
 
@@ -209,10 +323,16 @@ def describe_proxy_profile(profile: dict) -> dict:
             node = {}
         else:
             node = helper.parse_share_link(value)
-            outbound = helper.clash_outbound(node, "describe")
+            # Only to read TLS/transport back out for display. A node carried by Xray is
+            # not describable through the sing-box converter, and refusing to describe it
+            # would hide the very summary that explains why it goes to Xray.
+            outbound = helper.clash_outbound({**node, "encryption": "none"}, "describe")
     except (ValueError, EgressError) as exc:
         return {"error": str(exc)}
     tls = outbound.get("tls") or {}
+    # Report the algorithm family only; the value itself is client key material.
+    encryption = str((node or {}).get("encryption") or "none")
+    encryption = "" if encryption.lower() in ("", "none") else encryption.split(".")[0]
     summary = {
         "protocol": str(outbound.get("type") or ""),
         "transport": str(node.get("network") or "tcp") if node else "",
@@ -225,6 +345,7 @@ def describe_proxy_profile(profile: dict) -> dict:
         "obfs": str((outbound.get("obfs") or {}).get("type") or ""),
         "obfs_password_set": bool((outbound.get("obfs") or {}).get("password")),
         "flow": str(outbound.get("flow") or ""),
+        "encryption": encryption,
         "udp_capable": helper.outbound_supports_udp(outbound),
         # Which engine actually carries this node — the answer to "my other client works".
         "engine": "xray" if node and helper.node_needs_xray(node) else "sing-box",
@@ -309,22 +430,27 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
                     raise EgressError(
                         _config_error("Xray node configuration is invalid", xcheck))
                 xray_process = subprocess.Popen([xray, "run", "-config", str(xray_path)],
-                                                stdout=subprocess.DEVNULL,
+                                                stdout=subprocess.PIPE,
                                                 stderr=subprocess.PIPE, text=True)
                 _wait_tcp(bridge_port, xray_process, what="Xray-core")
             sing_process = subprocess.Popen([singbox, "run", "-c", str(sing_path)],
-                                            stdout=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE,
                                             stderr=subprocess.PIPE, text=True)
             _wait_tcp(local_port, sing_process, what="sing-box")
             try:
                 return test_udp_proxy("127.0.0.1", local_port, timeout)
             except EgressError as exc:
-                # The proxy is up but the node did not carry the probe. Whatever sing-box
-                # logged while trying (handshake refused, auth rejected, no activity) is
-                # the difference between "your node is wrong" and "we built it wrong".
+                # The proxy is up but the node did not carry the probe. What the engines
+                # logged while trying (handshake refused, auth rejected, no activity) is the
+                # difference between "your node is wrong" and "we built it wrong". The node's
+                # own engine is quoted first: for a REALITY node that is Xray, and a bare
+                # "timed out" with sing-box's silence behind it explains nothing.
                 _stop_process(sing_process)
-                detail = _process_detail(sing_process)
-                raise EgressError(f"{exc}" + (f" — {detail}" if detail else "")) from exc
+                _stop_process(xray_process)
+                details = [text for text in (_process_detail(xray_process),
+                                             _process_detail(sing_process)) if text]
+                raise EgressError(
+                    f"{exc}" + (f" — {' ;; '.join(details)}" if details else "")) from exc
         finally:
             _stop_process(sing_process)
             _stop_process(xray_process)

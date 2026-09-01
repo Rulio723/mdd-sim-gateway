@@ -136,14 +136,21 @@ message_context=msg-from-local
 from_domain={{ realm }}
 disallow=all
 allow=amr
+; No opus here on purpose. codec_opus is not an Asterisk source module — codecs/codecs.xml
+; declares it support_level=external, i.e. a prebuilt binary downloaded from Digium, and
+; build_tools/download_externals hard-refuses any non-x86 HOST_CPU. On the aarch64 image there
+; is therefore no codec_opus.so and no opus entry in `core show translation`. Offering opus
+; here was a trap: a browser that only offers opus, or a negotiation that happens to pick it,
+; produces a call with no transcoding path to the AMR-only IMS leg — i.e. silent audio.
+; ulaw/alaw are what actually carries every WebRTC call today. (res_format_attr_opus.so is
+; still loaded so an opus-bearing re-INVITE from the far end parses cleanly instead of erroring.)
 allow=ulaw
 allow=alaw
-allow=opus
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
 ; Never let the WebRTC softphone direct-media with the IMS side:
-; the two legs are incompatible (DTLS-SRTP + opus/ulaw on the client vs plain RTP + AMR on
+; the two legs are incompatible (DTLS-SRTP + ulaw/alaw on the client vs plain RTP + AMR on
 ; the carrier), so Asterisk MUST stay in the media path to bridge/transcode. With direct_media
 ; left on (the default) Asterisk would try to re-INVITE the two ends to talk directly, which
 ; can't work → no audio. (volte_ims already has direct_media=no.)

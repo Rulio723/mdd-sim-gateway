@@ -174,7 +174,9 @@ class DiagnosticCaptureTests(unittest.TestCase):
                 "[2026-08-07 11:17:18+0800] STATE 2:\n")
             engine_log = ("Asterisk ready, triggering registration...\n"
                           "unrelated module chatter\n"
-                          "res_pjsip: SIP/2.0 403 Forbidden\n")
+                          "res_pjsip: SIP/2.0 403 Forbidden\n"
+                          "res_pjsip_outbound_registration.c: Fatal response '403' received "
+                          "from 'sip:pcscf.example' on registration attempt\n")
             with patch.object(engine, "DATA_DIR", temp), \
                     patch.object(engine, "registration_state", lambda iid: "Unregistered"), \
                     patch.object(engine, "read_run_json", lambda iid, name: {"state": "CONNECTED"}), \
@@ -200,6 +202,10 @@ class DiagnosticCaptureTests(unittest.TestCase):
             self.assertEqual(record["egress"]["node"], "US Bravo")
             self.assertIn("SIP/2.0 403 Forbidden", "\n".join(record["sip"]))
             self.assertNotIn("unrelated module chatter", "\n".join(record["sip"]))
+            # Issue #33: the bundle's SIP lines had rotated away, so the snapshot must keep
+            # the classified verdict with its numeric code, not only the raw log lines.
+            self.assertEqual(record["registration_evidence"],
+                             {"kind": "rejected", "sip_status": 403})
 
     def test_snapshots_are_bounded(self):
         engine = EnginePathTests.engine_module()

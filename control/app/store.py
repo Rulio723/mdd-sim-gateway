@@ -7,6 +7,7 @@ layer by the caller (main.py).
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -95,6 +96,25 @@ def init():
                     PRIMARY KEY(instance, peer, concat_ref, total, seq)
                 );
                 CREATE INDEX IF NOT EXISTS idx_sms_segments_age ON sms_segments(created_ts);
+
+                -- A group flushed incomplete, kept so the parts that arrive after the flush
+                -- still land in the message they belong to. Carriers can be minutes late with
+                -- a part (10 minutes measured between segment 1 and segment 2 of one text
+                -- crossing two networks), which is far longer than a buffer meant to hold a
+                -- message can wait. `parts` is the {seq: body} already merged, so the body can
+                -- be rebuilt in sequence order without re-parsing the gap marks in the stored
+                -- message. One row per flushed group; the row dies when the message completes
+                -- or the late window passes.
+                CREATE TABLE IF NOT EXISTS sms_late_groups (
+                    instance TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    concat_ref INTEGER NOT NULL,
+                    total INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    parts TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL,
+                    PRIMARY KEY(instance, peer, concat_ref, total)
+                );
                 -- Inbound SMS that were never meant to be read: 8-bit binary payloads, SIM
                 -- data-download, silent service pushes. They are kept out of `messages` so
                 -- they cannot reach a conversation, a notification or an export, but kept
@@ -490,6 +510,103 @@ def take_stale_sms_segments(timeout: int = SEGMENT_TIMEOUT,
                         "seqs": [int(r["seq"]) for r in rows],
                         "bodies": [r["body"] for r in rows]})
     return out
+
+
+# How long a group flushed incomplete stays open to its missing parts. Measured on live
+# networks: the parts of one text can be split across SMSC frontends and arrive ten minutes
+# apart, so the window that decides "this message is finished" (SEGMENT_TIMEOUT) is far too
+# short to also decide "this part belongs to nothing". An hour costs one small row per
+# incomplete message and spares the user a second, near-duplicate fragment in the thread.
+SEGMENT_LATE_WINDOW = 3600
+
+_LATE_KEY = "instance=? AND peer=? AND concat_ref=? AND total=?"
+
+
+def remember_partial_sms_group(instance: str, peer: str, concat_ref: int, total: int,
+                               message_id: int, seqs: list[int], bodies: list[str],
+                               ts: int | None = None) -> None:
+    """Record which message a flushed-incomplete group produced, and what it already held."""
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT INTO sms_late_groups(instance,peer,concat_ref,total,message_id,parts,"
+            "created_ts) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(instance,peer,concat_ref,total) DO UPDATE SET "
+            "message_id=excluded.message_id, parts=excluded.parts, "
+            "created_ts=excluded.created_ts",
+            (str(instance), peer, int(concat_ref), int(total), int(message_id),
+             json.dumps({str(int(s)): b for s, b in zip(seqs, bodies)}),
+             int(ts or time.time())))
+
+
+def merge_late_sms_segment(instance: str, peer: str, concat_ref: int, total: int, seq: int,
+                           body: str, now: int | None = None,
+                           window: int = SEGMENT_LATE_WINDOW) -> dict | None:
+    """Fold a part that arrived after its group was flushed into the message it produced.
+
+    Returns None when this part belongs to no remembered group — the caller then buffers it
+    normally as the start of a new message. Otherwise returns the merged state: the ordered
+    parts held so far (so the caller can rebuild the body and mark the gaps that remain), the
+    message to update, and whether the text is now whole.
+
+    The concatenation reference is one byte and carriers reuse it, so a repeat of a sequence
+    number already merged is only a re-delivery while the text is identical. A DIFFERENT text
+    in a slot that is already filled means the reference has wrapped onto a new message: the
+    memory is dropped and the part starts a fresh group instead of corrupting the old one."""
+    now = int(now or time.time())
+    key = (str(instance), peer, int(concat_ref), int(total))
+    with _lock, _conn() as c:
+        row = c.execute(
+            f"SELECT message_id,parts,created_ts FROM sms_late_groups WHERE {_LATE_KEY}",
+            key).fetchone()
+        if not row:
+            return None
+        if now - int(row["created_ts"]) > int(window):
+            c.execute(f"DELETE FROM sms_late_groups WHERE {_LATE_KEY}", key)
+            return None
+        try:
+            parts = dict(json.loads(row["parts"]))
+        except (TypeError, ValueError):
+            c.execute(f"DELETE FROM sms_late_groups WHERE {_LATE_KEY}", key)
+            return None
+
+        slot = str(int(seq))
+        held = parts.get(slot)
+        if held is not None and held != body:
+            c.execute(f"DELETE FROM sms_late_groups WHERE {_LATE_KEY}", key)
+            return None
+
+        duplicate = held is not None
+        if not duplicate:
+            parts[slot] = body
+        complete = len(parts) >= int(total)
+        if complete:
+            c.execute(f"DELETE FROM sms_late_groups WHERE {_LATE_KEY}", key)
+        elif not duplicate:
+            c.execute(f"UPDATE sms_late_groups SET parts=? WHERE {_LATE_KEY}",
+                      (json.dumps(parts), *key))
+
+    order = sorted(int(k) for k in parts)
+    return {"message_id": int(row["message_id"]), "seqs": order,
+            "bodies": [parts[str(n)] for n in order],
+            "complete": complete, "duplicate": duplicate}
+
+
+def prune_late_sms_groups(window: int = SEGMENT_LATE_WINDOW, now: int | None = None) -> int:
+    """Forget groups whose missing parts never came, so the table cannot grow without bound."""
+    cutoff = int(now or time.time()) - int(window)
+    with _lock, _conn() as c:
+        return c.execute("DELETE FROM sms_late_groups WHERE created_ts <= ?",
+                         (cutoff,)).rowcount
+
+
+def set_message_body(mid: int, body: str) -> dict | None:
+    """Replace a stored message's text and return the record as it now reads."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE messages SET body=? WHERE id=?", (body, int(mid)))
+        row = c.execute(
+            "SELECT id,instance,direction,peer,body,status,error,ts,transport "
+            "FROM messages WHERE id=?", (int(mid),)).fetchone()
+    return dict(row) if row else None
 
 
 def add_message(instance: str, direction: str, peer: str, body: str, status: str = "ok",

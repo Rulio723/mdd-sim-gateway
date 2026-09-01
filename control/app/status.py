@@ -11,7 +11,6 @@ detail:      raw signals (pin, pcscf, registration, ike classification) for adva
 from __future__ import annotations
 
 import asyncio
-import re
 import socket
 
 from . import engine
@@ -60,28 +59,9 @@ REASONS = {
 }
 
 
-def registration_failure_evidence(log_tail: str) -> dict:
-    """Classify the newest concrete REGISTER failure and retain its SIP response code.
-
-    Asterisk reports both as "Rejected", but they are different events: a "Fatal response
-    '403'" is the IMS refusing this line, while "No response received" is the IMS no longer
-    hearing it — on this gateway almost always an ESP session the carrier aged out while
-    the IKE side still answered keepalives. The newest marker in the log decides.
-    """
-    for line in reversed(log_tail.splitlines()):
-        low = line.lower()
-        # The real Asterisk message says "on registration attempt", not "on REGISTER
-        # attempt".  ``registration`` does not contain the substring ``register``, so the
-        # old extra guard made this production path unreachable.  This exact marker is emitted
-        # by outbound registration's timeout path and is already the evidence retained by
-        # engine._SIP_EVIDENCE.  A Docker log read failure is returned as "error: ...", which
-        # deliberately does not match and therefore remains on the conservative slow path.
-        if "no response received" in low:
-            return {"kind": "unanswered"}
-        match = re.search(r"fatal response '(\d+)'", low)
-        if match:
-            return {"kind": "rejected", "sip_status": int(match.group(1))}
-    return {"kind": "unknown"}
+# The classifier lives in engine.py so the diagnostics capture (which cannot import this
+# module without a cycle) records the same verdict the health policy acted on.
+registration_failure_evidence = engine.registration_failure_evidence
 
 
 def registration_unanswered(log_tail: str) -> bool:

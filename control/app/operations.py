@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from collections import deque
 from pathlib import Path
 import re
 import tarfile
@@ -26,6 +27,7 @@ _SECRET_KEYS = re.compile(
     r"activation|matching_id|confirmation|smdp",
     re.I,
 )
+_SAFE_DIAGNOSTIC_KEYS = {"imei_valid", "iccid_valid", "imei_source_matches"}
 _LONG_DIGITS = re.compile(r"(?<!\d)\+?\d{10,40}(?!\d)")
 _URL = re.compile(r"\b(?:https?|socks5h?)://[^\s\"'<>]+", re.I)
 _ACTIVATION_CODE = re.compile(r"\bLPA:1\$[^\s\"'<>]+", re.I)
@@ -55,11 +57,17 @@ def _path_secret(path: tuple[str, ...]) -> bool:
     if len(path) >= 3 and path[0:2] == ("proxy", "profiles") \
             and key in {"name", "value", "server", "username", "outbound_tag"}:
         return True
+    if "feishu" in path and "channels" in path and key in {"name", "url", "secret"}:
+        return True
     return False
 
 
 def redact(value, key: str = "", path: tuple[str, ...] = ()):
     current = path + ((key,) if key else ())
+    # These closed-schema booleans describe whether evidence exists without carrying the
+    # identity itself. A malformed/non-boolean value remains secret by key name.
+    if current and current[-1] in _SAFE_DIAGNOSTIC_KEYS and isinstance(value, bool):
+        return value
     if _path_secret(current):
         return "<redacted>" if value not in (None, "", [], {}) else value
     if isinstance(value, dict):
@@ -115,6 +123,8 @@ def _redact_record(value, key: str = "", path: tuple[str, ...] = ()):
     its own file, and the registration/SIP/host evidence beside it survives.
     """
     current = path + ((key,) if key else ())
+    if current and current[-1] in _SAFE_DIAGNOSTIC_KEYS and isinstance(value, bool):
+        return value
     if _path_secret(current):
         return "<redacted>" if value not in (None, "", [], {}) else value
     if isinstance(value, dict):
@@ -152,6 +162,11 @@ def redact_jsonl(text: str) -> str:
 
 
 CALL_EVENTS = ("call_out", "call_result", "ussd")
+CALL_EVENT_SCAN_LINES = 20_000
+SUPPORT_BUNDLE_MAX_BYTES = 10 * 1024 * 1024
+# Leave space for ZIP metadata, the manifest and compression overhead. The final archive is
+# still measured and pruned below; this budget keeps that fallback exceptional.
+SUPPORT_BUNDLE_CONTENT_BYTES = 8 * 1024 * 1024
 
 _MDD_IMAGE_PREFIXES = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
 _CURRENT_IMAGE_TAGS = {
@@ -266,8 +281,10 @@ def call_event_evidence(text: str) -> str:
             # That a reply arrived, and how big it was, answers the question. Its text can
             # carry account details and answers nothing.
             args[1] = f"<{len(args[1])} bytes>"
-        out.append(json.dumps({"instance": record.get("instance"), "event": event,
-                               "args": args}, ensure_ascii=False, sort_keys=True))
+        safe = {"instance": record.get("instance"), "event": event, "args": args}
+        if isinstance(record.get("ts"), (int, float)):
+            safe["ts"] = int(record["ts"])
+        out.append(json.dumps(safe, ensure_ascii=False, sort_keys=True))
     return "\n".join(out)
 
 
@@ -395,48 +412,148 @@ def host_diagnostics() -> dict:
 
 def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
     log_lines = max(50, min(2000, int(log_lines)))
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        settings = redact(cfg.get_settings())
-        archive.writestr("settings-redacted.yaml", yaml.safe_dump(settings, allow_unicode=True))
-        archive.writestr("status-redacted.json", json.dumps(
-            redact(status_documents), ensure_ascii=False, indent=2))
-        # The host orchestrator owns systemd, the USB tree and the bridge children; this
-        # process runs in a container that can observe none of them. Without its published
-        # view a modem fault is only diagnosable by asking the operator to run commands.
-        archive.writestr("host-diagnostics-redacted.json", json.dumps(
-            redact(host_diagnostics()), ensure_ascii=False, indent=2))
-        base = Path(cfg.DATA_DIR) / "instances"
-        # Include the current logs, compact rebuild snapshots and retained IKE segments. Every
-        # source goes through the same redaction and contributes only its configured tail.
-        # These globs are an allow-list on purpose. logs/voicemail/*.wav lives under the same
-        # directory and must NEVER be collected: a bundle is meant to be shareable, and a
-        # recording of a caller's voice cannot be redacted into something safe to share.
-        paths = [*base.glob("*/run/*.log"), *base.glob("*/logs/diagnostics.jsonl"),
-                 *base.glob("*/logs/ike/charon-*.log")]
-        # The engine's call events are the only record of the Q.850 cause behind a service
-        # code's verdict, so a bundle without them cannot answer "was it really unsupported?".
-        # They are filtered rather than redacted; see call_event_evidence.
-        for path in sorted(base.glob("*/logs/events.jsonl")):
+    settings = yaml.safe_dump(redact(cfg.get_settings()), allow_unicode=True)
+    status = json.dumps(redact(status_documents), ensure_ascii=False, indent=2)
+    # The host orchestrator owns systemd, the USB tree and the bridge children; this process
+    # can observe none of them. Every value still passes through the same redactor.
+    host = json.dumps(redact(host_diagnostics()), ensure_ascii=False, indent=2)
+    fixed = {
+        "settings-redacted.yaml": settings,
+        "status-redacted.json": status,
+        "host-diagnostics-redacted.json": host,
+    }
+    base = Path(cfg.DATA_DIR) / "instances"
+    candidates: list[dict] = []
+
+    def jsonl_times(lines: list[str]) -> tuple[int | None, int | None]:
+        values = []
+        for line in lines:
             try:
-                lines = path.read_text(errors="replace").splitlines()[-(log_lines * 4):]
-            except OSError:
+                value = int((json.loads(line) or {}).get("ts") or 0)
+            except (ValueError, TypeError, AttributeError):
                 continue
-            evidence = call_event_evidence("\n".join(lines))
-            if evidence:
-                archive.writestr(f"logs/{path.parent.parent.name}-call-events.jsonl", evidence)
-        for path in sorted(paths):
-            try:
-                lines = path.read_text(errors="replace").splitlines()[-log_lines:]
-            except OSError:
-                continue
-            joined = "\n".join(lines)
+            if value:
+                values.append(value)
+        return (min(values), max(values)) if values else (None, None)
+
+    def add_candidate(path: Path, name: str, source: list[str], eligible: list[str],
+                      selected: list[str], text: str, priority: int,
+                      raw_line_count: int | None = None) -> None:
+        archived = text.splitlines()
+        first_ts, last_ts = jsonl_times(archived) if path.suffix == ".jsonl" else (None, None)
+        stat = path.stat()
+        raw_lines = len(source) if raw_line_count is None else raw_line_count
+        coverage = {
+            "raw_lines": raw_lines,
+            "scanned_lines": len(source),
+            "unscanned_lines": max(0, raw_lines - len(source)),
+            "eligible_lines": len(eligible),
+            "filtered_lines": max(0, len(source) - len(eligible)),
+            "included_lines": len(archived),
+            "truncated": raw_lines > len(source) or len(selected) < len(eligible),
+            "mtime": int(stat.st_mtime),
+        }
+        if first_ts is not None:
+            coverage.update({"first_ts": first_ts, "last_ts": last_ts})
+        candidates.append({"name": name, "text": text, "priority": priority,
+                           "coverage": coverage})
+
+    # Events are filtered rather than generically exported: subscriber calls and message
+    # bodies never enter the candidate set at all.
+    for path in sorted(base.glob("*/logs/events.jsonl")):
+        try:
+            tail: deque[str] = deque(maxlen=CALL_EVENT_SCAN_LINES)
+            raw_line_count = 0
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    raw_line_count += 1
+                    tail.append(line.rstrip("\r\n"))
+            source = list(tail)
+            eligible = call_event_evidence("\n".join(source)).splitlines()
+            selected = eligible[-log_lines:]
+            if selected:
+                evidence = "\n".join(selected)
+                add_candidate(path, f"logs/{path.parent.parent.name}-call-events.jsonl",
+                              source, eligible, selected, evidence, 20, raw_line_count)
+        except OSError:
+            continue
+
+    # Explicit allow-list: voicemail recordings and every unknown future file stay excluded.
+    paths = [*base.glob("*/run/*.log"), *base.glob("*/logs/diagnostics.jsonl"),
+             *base.glob("*/logs/lifecycle.jsonl"),
+             *base.glob("*/logs/ike/charon-*.log")]
+    for path in sorted(paths):
+        try:
+            source = path.read_text(errors="replace").splitlines()
+            if path.parent.name == "ike" and len(source) > log_lines:
+                head = max(1, log_lines // 5)
+                selected = source[:head] + source[-(log_lines - head):]
+            else:
+                selected = source[-log_lines:]
+            joined = "\n".join(selected)
             text = redact_jsonl(joined) if path.suffix == ".jsonl" else redact_log(joined)
             iid = path.parents[2].name if path.parent.name == "ike" else path.parent.parent.name
-            archive.writestr(f"logs/{iid}-{path.name}", text)
-        archive.writestr("manifest.json", json.dumps({
+            priority = 50 if path.name == "lifecycle.jsonl" else 40 \
+                if path.name == "diagnostics.jsonl" else 10
+            add_candidate(path, f"logs/{iid}-{path.name}", source, source, selected,
+                          text, priority)
+        except OSError:
+            continue
+
+    def mark_omitted(coverage: dict) -> None:
+        coverage.update({"included_lines": 0, "included_bytes": 0, "omitted": True})
+
+    files = {}
+    included = dict(fixed)
+    used = sum(len(value.encode("utf-8")) for value in fixed.values())
+    for candidate in sorted(candidates, key=lambda item: (-item["priority"], item["name"])):
+        encoded = candidate["text"].encode("utf-8")
+        coverage = {**candidate["coverage"], "included_bytes": len(encoded)}
+        if used + len(encoded) <= SUPPORT_BUNDLE_CONTENT_BYTES:
+            included[candidate["name"]] = candidate["text"]
+            used += len(encoded)
+            coverage["omitted"] = False
+        else:
+            mark_omitted(coverage)
+        files[candidate["name"]] = coverage
+
+    def build() -> bytes:
+        manifest = {
             "created_at": int(time.time()), "redacted": True,
             "contains_credentials": False, "review_before_sharing": True,
             "log_lines_per_file": log_lines,
-        }, indent=2))
-    return output.getvalue()
+            "max_archive_bytes": SUPPORT_BUNDLE_MAX_BYTES,
+            "files": files,
+        }
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, text in included.items():
+                archive.writestr(name, text)
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+        return output.getvalue()
+
+    content = build()
+    # Compression normally makes the 8 MiB raw budget much smaller. If an unusually
+    # incompressible bundle exceeds the public upload contract, inspect the already-built ZIP
+    # once, choose enough low-priority entries to cover the exact compressed deficit, then
+    # rebuild a single time. Recompressing the whole archive after every removed file was
+    # quadratic on a Raspberry Pi.
+    removable = sorted(
+        (item for item in candidates if item["name"] in included),
+        key=lambda item: (item["priority"], item["name"]))
+    if len(content) > SUPPORT_BUNDLE_MAX_BYTES and removable:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            compressed = {info.filename: info.compress_size + 76 + 2 * len(info.filename)
+                          for info in archive.infolist()}
+        deficit = len(content) - SUPPORT_BUNDLE_MAX_BYTES + 1024
+        reclaimed = 0
+        for item in removable:
+            included.pop(item["name"], None)
+            mark_omitted(files[item["name"]])
+            reclaimed += compressed.get(item["name"], 0)
+            if reclaimed >= deficit:
+                break
+        content = build()
+    if len(content) > SUPPORT_BUNDLE_MAX_BYTES:
+        raise RuntimeError("redacted support bundle exceeds its 10 MiB safety budget")
+    return content

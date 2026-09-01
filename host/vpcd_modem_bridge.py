@@ -462,12 +462,30 @@ def write_metadata(path, data):
     os.replace(temporary, path)
 
 
-def refresh_metadata(card, path, static, interval):
+def retain_hardware_identity(previous, observed):
+    """Keep a verified IMEI when a later AT refresh is temporarily incomplete.
+
+    ICCID is deliberately *not* retained: an empty ICCID can be real card removal and has to
+    reach the control plane.  The modem's hardware IMEI cannot change while this bridge owns
+    the same physical device, so replacing it with an empty/garbled read only destroys the
+    evidence needed by an automatic line rebuild.
+    """
+    result = dict(observed or {})
+    imei = str(result.get("imei") or "")
+    retained = str((previous or {}).get("imei") or "")
+    if not re.fullmatch(r"\d{15}", imei) and re.fullmatch(r"\d{15}", retained):
+        result["imei"] = retained
+    return result
+
+
+def refresh_metadata(card, path, static, interval, initial_identity=None):
     """Refresh ICCID after a hot SIM swap without competing for the exclusive AT port."""
+    identity = dict(initial_identity or {})
     while True:
         time.sleep(interval)
         try:
-            write_metadata(path, {**static, **card.identity(), "updated_at": int(time.time())})
+            identity = retain_hardware_identity(identity, card.identity())
+            write_metadata(path, {**static, **identity, "updated_at": int(time.time())})
         except Exception as exc:
             print("[bridge] identity refresh failed: %s" % exc, flush=True)
 
@@ -549,7 +567,7 @@ def main():
     if args.metadata_file and args.identity_refresh > 0:
         threading.Thread(target=refresh_metadata,
                          args=(card, args.metadata_file, static_metadata,
-                               args.identity_refresh), daemon=True).start()
+                               args.identity_refresh, identity), daemon=True).start()
 
     stopping = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopping.set())

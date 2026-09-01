@@ -286,5 +286,46 @@ class WorkerSupervisionTests(unittest.TestCase):
         self.assertIn('"esp-%s.log" % role', source)
         self.assertIn("WORKER_LOG_MAX_BYTES", source)
 
+
+class IkeRekeyConfigTests(unittest.TestCase):
+    """The IKE-SA rekey clock must beat the carrier's session clock (giffgaff/O2: ~2h50m,
+    issue #33), so the period has to be settable end-to-end: per line, globally, and with a
+    default short enough for the shortest observed carrier."""
+
+    @staticmethod
+    def _render(inst_extra=None, settings=None):
+        from control.app import config
+        inst = {"id": "3", "index": 0, "imsi": "234100000000000",
+                "mcc": "234", "mnc": "10", "iccid": "test-card",
+                "imei": "490154203237518", "ami_secret": "test-secret",
+                "sip": {"webrtc": {"enable": True, "password": "test-password"}},
+                **(inst_extra or {})}
+        return config.render_instance_json(inst, settings or {})
+
+    def test_default_preempts_a_three_hour_carrier_clock(self):
+        rendered = self._render()
+        self.assertEqual(rendered["ike_rekey_minutes"], 150)
+        self.assertLess(rendered["ike_rekey_minutes"], 170)  # observed giffgaff clock
+
+    def test_settings_default_applies_and_line_override_wins(self):
+        settings = {"rekey": {"minutes": 30, "ike_minutes": 600}}
+        self.assertEqual(self._render(settings=settings)["ike_rekey_minutes"], 600)
+        self.assertEqual(
+            self._render({"ike_rekey_minutes": 120}, settings)["ike_rekey_minutes"], 120)
+
+    def test_zero_disables_and_garbage_falls_back(self):
+        self.assertEqual(self._render({"ike_rekey_minutes": 0})["ike_rekey_minutes"], 0)
+        self.assertEqual(self._render({"ike_rekey_minutes": -5})["ike_rekey_minutes"], 0)
+        self.assertEqual(
+            self._render({"ike_rekey_minutes": "junk"})["ike_rekey_minutes"], 150)
+        self.assertEqual(self._render({"ike_rekey_minutes": 99999})["ike_rekey_minutes"], 1440)
+
+    def test_render_writes_the_ike_rekey_env(self):
+        root = Path(__file__).resolve().parent.parent
+        source = (root / "engine" / "render.py").read_text(encoding="utf-8")
+        self.assertIn('put("SWU_IKE_REKEY_MINUTES", cfg.get("ike_rekey_minutes", 150))',
+                      source)
+
+
 if __name__ == "__main__":
     unittest.main()

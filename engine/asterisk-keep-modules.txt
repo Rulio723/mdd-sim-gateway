@@ -1,0 +1,188 @@
+# Asterisk modules this gateway ships. Everything else built by the reference build is
+# deleted from /usr/lib/asterisk/modules in the build stage, BEFORE runtime-packages.txt is
+# derived (engine/Dockerfile) — that is the whole point: the closure is computed by running
+# ldd over modules/*.so, so a module that is never loaded still drags its whole library
+# closure into the runtime image. libicu (37 MB) rode in on res_calendar_icalendar,
+# lpcnetfreedv (15 MB) on codec_codec2, perl-libs + net-snmp (17 MB) on res_snmp — none of
+# which this product can even load, because modules.conf.j2 already noloads them.
+#
+# Why a keep-list of built modules rather than menuselect --disable:
+#   - The compile stays byte-identical to the sysmocom reference build. We only choose what
+#     to ship, so any bug report is reproduced by simply not deleting.
+#   - Deleting in its own layer after `make install` leaves the expensive compile layer
+#     cached; only the closure derivation and the strip/staging layer below it rebuild.
+#   - menuselect's dependency tree is implicit and transitive, and it changes across Asterisk
+#     versions. A list of filenames fails loudly and locally instead.
+#
+# modules.conf.j2 keeps its noload list unchanged, as defence in depth. noloading a module
+# whose file is absent is silent — verified, no extra startup warnings.
+#
+# CONTRACT: every name below must exist after `make install` or the build fails. Removing a
+# name is cheap; adding one back is a one-line change. When in doubt, keep it — a missing
+# codec/format/res_pjsip_* module usually shows up as a silent call, not as an error.
+#
+# Verified: with exactly this list, Asterisk loads all 126 modules with zero load failures
+# and the same three startup warnings as the untrimmed image.
+
+# --- Dialplan engine -------------------------------------------------------------------
+pbx_config.so                      # extensions.conf is the only dialplan source
+
+# --- Applications called by extensions.conf.j2 -----------------------------------------
+app_dial.so                        # Dial() — both call legs
+app_exec.so                        # TryExec(), ExecIf()
+app_playback.so                    # Playback() — voicemail beep prompt
+app_record.so                      # Record() — voicemail, writes .wav to bind-mounted /logs
+app_stack.so                       # Return() — ends the h/hangup-handler routines cleanly
+app_system.so                      # TrySystem() — every notify.py hook (8 call sites)
+app_waitforprecondition.so         # WaitForPrecondition() — 3GPP preconditions, sysmocom fork
+app_senddtmf.so                    # registers the AMI PlayDTMF action; kept as DTMF insurance
+# NoOp/Set/Progress/Ringing/GotoIf/Goto/Wait/Answer/Hangup are pbx_builtins (main binary),
+# and MessageSend lives in main/message.c — none of them is a loadable module.
+
+# --- Dialplan functions ----------------------------------------------------------------
+func_callerid.so                   # ${CALLERID(num)}
+func_env.so                        # ${FILE(/logs/...,,,a)} append writes to the call/SMS logs
+func_strings.so                    # STRFTIME, FILTER, STRREPLACE
+func_base64.so                     # BASE64_ENCODE/DECODE — SMS bodies and USSD payloads
+func_cut.so                        # CUT(CUT(MESSAGE(to),@,1),:,2)
+func_logic.so                      # IF() in the h handlers
+func_channel.so                    # CHANNEL(hangup_handler_push) — the USSD report hook
+func_math.so                       # $[...] is core ast_expr2; kept as cheap insurance
+func_hangupcause.so                # ${HANGUPCAUSE} is a core variable; same reasoning
+func_pjsip_aor.so                  # PJSIP CLI/diagnostic functions — a few KB, worth keeping
+func_pjsip_contact.so              #   for on-Pi troubleshooting of registration problems
+func_pjsip_endpoint.so             #
+
+# --- Channel drivers and the bridging core ---------------------------------------------
+# WebRTC<->IMS is always a transcoded bridge (ulaw/alaw + DTLS-SRTP on one side, AMR + plain
+# RTP on the other), so softmix and the builtin bridge features are load-bearing for audio.
+chan_pjsip.so                      # the only channel driver; PJSIP_DIAL_CONTACTS, PJSIPHangup
+chan_bridge_media.so               # bridge media announcer/recorder channels
+bridge_simple.so
+bridge_native_rtp.so
+bridge_softmix.so
+bridge_holding.so
+bridge_builtin_features.so
+bridge_builtin_interval_features.so
+
+# --- Codecs ----------------------------------------------------------------------------
+# Deliberately conservative: only codec_codec2 (drags lpcnetfreedv, 15 MB) and codec_vevs
+# (already noloaded) are dropped. The rest are tens of KB each and a missing transcoder is a
+# silent call, which is far more expensive than the disk it saves.
+codec_amr.so                       # AMR + AMR-WB — the IMS leg's only codec. Critical.
+codec_ulaw.so
+codec_alaw.so
+codec_a_mu.so
+codec_resample.so                  # slin rate conversion between 8k (AMR) and 16k (AMR-WB)
+codec_adpcm.so
+codec_g722.so
+codec_g726.so
+codec_gsm.so
+codec_ilbc.so
+codec_lpc10.so
+codec_speex.so
+
+# --- File formats ----------------------------------------------------------------------
+# format_wav backs Record()/Playback(); format_pcm and format_sln are the internal pipeline.
+# The others are small and kept wholesale rather than reasoned about one by one.
+format_wav.so
+format_pcm.so
+format_sln.so
+format_wav_gsm.so
+format_gsm.so
+format_g719.so
+format_g723.so
+format_g726.so
+format_g729.so
+format_h263.so
+format_h264.so
+format_ilbc.so
+format_ogg_speex.so
+format_ogg_vorbis.so
+format_siren14.so
+format_siren7.so
+format_vox.so
+
+# --- SDP format attribute handlers -----------------------------------------------------
+# Each one parses/renders an fmtp line. Missing one is an SDP negotiation failure, not an
+# error message, so all of them stay (res_format_attr_vevs is the sole exception: noloaded).
+res_format_attr_amr.so             # AMR/AMR-WB mode-set, octet-align — critical for the IMS leg
+res_format_attr_opus.so            # KEEP. We no longer *offer* opus (there is no codec_opus.so on
+                                   #   aarch64 — it is an x86-only external binary from Digium, so
+                                   #   opus was removed from the pjsip.conf allow lists). This
+                                   #   ~50KB module stays anyway so that an opus fmtp line in an
+                                   #   inbound offer/re-INVITE parses instead of erroring out.
+res_format_attr_celt.so
+res_format_attr_g729.so
+res_format_attr_h263.so
+res_format_attr_h264.so
+res_format_attr_ilbc.so
+res_format_attr_silk.so
+res_format_attr_siren14.so
+res_format_attr_siren7.so
+res_format_attr_vp8.so
+
+# --- PJSIP -----------------------------------------------------------------------------
+# Everything the reference build ships except t38 (no T.38 — see udptl.conf.j2) and the
+# five already noloaded by modules.conf.j2 (geolocation, phoneprov, config_wizard, notify).
+# The carrier IMS can send REFER/OPTIONS/302/AOC at any time; these are kept so an unusual
+# peer behaviour degrades gracefully instead of failing silently.
+res_pjsip.so                       # core; also the fork's type=resolve and sec-agree transport
+res_pjsip_session.so
+res_pjsip_sdp_rtp.so
+res_pjsip_outbound_registration.so # IMS REGISTER; carries the P-Associated-URI + 401 patches
+res_pjsip_messaging.so             # SMS-over-IMS; carries the UDH + RP-ACK routing patches
+res_pjsip_header_funcs.so          # PJSIP_HEADER(add,P-Preferred-Identity)
+res_pjsip_rfc3329.so               # IMS sec-agree (Security-Client/Server) — pjsip.conf sec_encryption=yes
+res_pjsip_rfc3326.so               # Reason header -> HANGUPCAUSE
+res_pjsip_nat.so                   # rewrite_contact=yes, force_rport=yes
+res_pjsip_transport_websocket.so   # the wss softphone transport
+res_pjsip_authenticator_digest.so
+res_pjsip_outbound_authenticator_digest.so
+res_pjsip_endpoint_identifier_ip.so    # type=identify, match=<pcscf>
+res_pjsip_endpoint_identifier_user.so
+res_pjsip_endpoint_identifier_anonymous.so
+res_pjsip_caller_id.so
+res_pjsip_acl.so
+res_pjsip_path.so
+res_pjsip_registrar.so
+res_pjsip_refer.so
+res_pjsip_pubsub.so                # required by res_pjsip_mwi and res_pjsip_exten_state
+res_pjsip_mwi.so
+res_pjsip_mwi_body_generator.so
+res_pjsip_exten_state.so
+res_pjsip_pidf_body_generator.so
+res_pjsip_pidf_digium_body_supplement.so
+res_pjsip_pidf_eyebeam_body_supplement.so
+res_pjsip_xpidf_body_generator.so
+res_pjsip_dialog_info_body_generator.so
+res_pjsip_outbound_publish.so
+res_pjsip_publish_asterisk.so
+res_pjsip_aoc.so
+res_pjsip_diversion.so
+res_pjsip_dlg_options.so
+res_pjsip_dtmf_info.so             # SIP INFO DTMF, for clients that do not use RFC 4733
+res_pjsip_empty_info.so
+res_pjsip_history.so               # `pjsip show history` — on-Pi diagnostics
+res_pjsip_logger.so                # `pjsip set logger on` — on-Pi diagnostics
+res_pjsip_one_touch_record_info.so
+res_pjsip_send_to_voicemail.so
+res_pjsip_sips_contact.so
+
+# --- Supporting resources --------------------------------------------------------------
+res_pjproject.so                   # mandatory pjproject glue
+res_resolver_unbound.so            # DNS for the IMS realm / SRV / NAPTR
+res_rtp_asterisk.so                # RTP, ICE, DTLS-SRTP, RFC 4733 DTMF. Critical.
+res_srtp.so                        # WebRTC media encryption
+res_http_websocket.so              # the wss listener behind transport-wss
+res_sorcery_config.so              # pjsip.conf is read through sorcery
+res_sorcery_memory.so
+res_sorcery_astdb.so
+res_sorcery_memory_cache.so
+res_timing_timerfd.so              # timing source for the bridge
+res_timing_pthread.so              # fallback timing source
+res_musiconhold.so                 # moh_passthrough=yes, but hold must not fall off a cliff
+res_crypto.so                      # kept conservatively; no known consumer in this product
+res_security_log.so                # security events for failed authentication
+res_limit.so
+res_mwi_devstate.so                # paired with res_pjsip_mwi

@@ -1,6 +1,9 @@
 import unittest
 import tempfile
 import os
+import base64
+import hashlib
+import hmac
 from unittest.mock import MagicMock, patch
 
 import yaml
@@ -14,6 +17,8 @@ from control.app.notify_push import (
     build_notification_message,
     build_webhook_request,
     send_pushplus,
+    send_feishu,
+    feishu_signature,
     telegram_session,
     _deliver_with_retry,
     delivery_status,
@@ -161,12 +166,188 @@ class NotificationChannelTests(unittest.TestCase):
         self.assertEqual(request["title"], "Call · +100")
         self.assertEqual(request["content"], "Line 1")
 
+    def test_feishu_signature_uses_the_documented_empty_message_hmac(self):
+        timestamp = 1700000000
+        secret = "test-secret"
+        expected = base64.b64encode(hmac.new(
+            f"{timestamp}\n{secret}".encode("utf-8"), b"", hashlib.sha256).digest()
+        ).decode("ascii")
+        self.assertEqual(feishu_signature(timestamp, secret), expected)
+
+    @patch("control.app.notify_push.requests.post")
+    def test_feishu_uses_text_contract_and_optional_signature(self, post):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"code": 0, "msg": "success"}
+        post.return_value = response
+        with patch("control.app.notify_push.time.time", return_value=1700000000):
+            result = send_feishu({
+                "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+                "secret": "test-secret",
+                "message_templates": {EV_INCOMING_SMS: {
+                    "title": "SMS · {{sim_name}}", "content": "{{from}}: {{text}}",
+                }},
+            }, build_payload(EV_INCOMING_SMS, {"id": 1, "name": "UK SIM"}, "+100", "hello"))
+        self.assertTrue(result["ok"])
+        request = post.call_args.kwargs["json"]
+        self.assertEqual(request["msg_type"], "text")
+        self.assertEqual(request["content"]["text"], "SMS · UK SIM\n\n+100: hello")
+        self.assertEqual(request["timestamp"], "1700000000")
+        self.assertEqual(request["sign"], feishu_signature(1700000000, "test-secret"))
+
+    @patch("control.app.notify_push.requests.post")
+    def test_feishu_omits_signature_without_a_secret(self, post):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"StatusCode": 0, "StatusMessage": "success"}
+        post.return_value = response
+        send_feishu({
+            "url": "https://open.larksuite.com/open-apis/bot/v2/hook/test-token",
+        }, build_payload(EV_INCOMING_CALL, {"id": 1}, "+100", None))
+        request = post.call_args.kwargs["json"]
+        self.assertNotIn("timestamp", request)
+        self.assertNotIn("sign", request)
+
+    @patch("control.app.notify_push.requests.post")
+    def test_feishu_rejects_http_200_application_errors(self, post):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"code": 19024, "msg": "Key Words Not Found"}
+        post.return_value = response
+        with self.assertRaisesRegex(RuntimeError, "rejected"):
+            send_feishu({
+                "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+            }, build_payload(EV_INCOMING_SMS, {"id": 1}, "+100", "hello"))
+
+    def test_feishu_requires_an_official_custom_bot_url(self):
+        payload = build_payload(EV_INCOMING_SMS, {"id": 1}, "+100", "hello")
+        with self.assertRaisesRegex(ValueError, "URL is required"):
+            send_feishu({}, payload)
+        with self.assertRaisesRegex(ValueError, "URL is invalid"):
+            send_feishu({"url": "https://example.test/hook"}, payload)
+        with self.assertRaisesRegex(ValueError, "URL is invalid"):
+            send_feishu({
+                "url": "https://open.feishu.cn/open-apis/bot/v2/hook/",
+            }, payload)
+
+    def test_feishu_counts_as_an_enabled_channel(self):
+        settings = {"feishu": {"enabled": True, "events": {
+            EV_INCOMING_SMS: True, EV_INCOMING_CALL: False,
+        }}}
+        self.assertTrue(notify_push.has_enabled_channel(settings, EV_INCOMING_SMS))
+        self.assertFalse(notify_push.has_enabled_channel(settings, EV_INCOMING_CALL))
+
+    def test_legacy_feishu_config_is_exposed_as_one_channel(self):
+        channels = notify_push.feishu_channels({
+            "enabled": True,
+            "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+        })
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(channels[0]["id"], "legacy")
+
+    def test_explicit_empty_feishu_channels_disable_legacy_fallback(self):
+        self.assertEqual(notify_push.feishu_channels({
+            "enabled": True,
+            "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+            "channels": [],
+        }), [])
+
+    def test_feishu_instance_filter_matches_only_selected_lines(self):
+        self.assertTrue(notify_push.feishu_channel_matches({"instances": []}, "9"))
+        self.assertTrue(notify_push.feishu_channel_matches({"instances": ["2", "9"]}, "9"))
+        self.assertFalse(notify_push.feishu_channel_matches({"instances": ["2"]}, "9"))
+        self.assertFalse(notify_push.feishu_channel_matches({"instances": ["2"]}, ""))
+
+    def test_multi_feishu_validation_rejects_duplicate_ids_and_bad_filters(self):
+        with self.assertRaisesRegex(ValueError, "IDs must be unique"):
+            notify_push.validate_feishu_channels({"channels": [
+                {"id": "ops", "enabled": False}, {"id": "ops", "enabled": False},
+            ]})
+        with self.assertRaisesRegex(ValueError, "instance filters"):
+            notify_push.validate_feishu_channels({"channels": [
+                {"id": "ops", "enabled": False, "instances": ["bad/id"]},
+            ]})
+
+    def test_disabled_feishu_channel_can_be_saved_before_url_is_filled(self):
+        channels = notify_push.validate_feishu_channels({"channels": [{
+            "id": "draft", "name": "Draft", "enabled": False, "url": "",
+        }]})
+        self.assertEqual(channels[0]["id"], "draft")
+
+    @patch("control.app.notify_push._deliver_with_retry")
+    def test_dispatch_delivers_through_feishu_without_other_channels(self, deliver):
+        settings = {"feishu": {
+            "enabled": True,
+            "url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token",
+            "events": {EV_INCOMING_SMS: True},
+        }}
+        notify_push.dispatch(settings, EV_INCOMING_SMS, {"id": 1}, "+100", "hello")
+        deliver.assert_called_once()
+        self.assertEqual(deliver.call_args.args[0], "feishu")
+        self.assertIs(deliver.call_args.args[1], send_feishu)
+
+    @patch("control.app.notify_push._deliver_with_retry")
+    def test_dispatch_fans_out_to_matching_feishu_channels(self, deliver):
+        settings = {"feishu": {"channels": [
+            {"id": "all", "enabled": True, "instances": [],
+             "events": {EV_INCOMING_SMS: True}},
+            {"id": "line-2", "enabled": True, "instances": ["2"],
+             "events": {EV_INCOMING_SMS: True}},
+            {"id": "line-3", "enabled": True, "instances": ["3"],
+             "events": {EV_INCOMING_SMS: True}},
+        ]}}
+        notify_push.dispatch(settings, EV_INCOMING_SMS, {"id": "2"}, "+100", "hello")
+        self.assertEqual(deliver.call_count, 2)
+        self.assertEqual([call.args[0] for call in deliver.call_args_list],
+                         ["feishu:all", "feishu:line-2"])
+
+    @patch("control.app.notify_push._deliver_with_retry")
+    def test_line_filtered_feishu_channels_skip_gateway_events(self, deliver):
+        settings = {"feishu": {"channels": [
+            {"id": "lines", "enabled": True, "instances": ["2"],
+             "events": {notify_push.EV_SOFTWARE_UPDATE: True}},
+            {"id": "global", "enabled": True, "instances": [],
+             "events": {notify_push.EV_SOFTWARE_UPDATE: True}},
+        ]}}
+        notify_push.dispatch(settings, notify_push.EV_SOFTWARE_UPDATE, {}, "1.8.0", "update")
+        deliver.assert_called_once()
+        self.assertEqual(deliver.call_args.args[0], "feishu:global")
+
     def test_manual_telegram_proxy_is_applied_without_environment_proxy(self):
         session = telegram_session({"proxy_mode": "manual",
                                      "proxy_url": "socks5h://127.0.0.1:1080"})
         try:
             self.assertFalse(session.trust_env)
             self.assertEqual(session.proxies["https"], "socks5h://127.0.0.1:1080")
+        finally:
+            session.close()
+
+    def test_telegram_uses_a_socks5_entry_from_the_shared_proxy_library(self):
+        settings = {"proxy": {"profiles": {"primary": {
+            "name": "Primary", "type": "socks5", "server": "proxy.example",
+            "port": 1081, "username": "a@b", "password": "p:/w",
+        }}}}
+        with patch.object(config, "get_settings", return_value=settings):
+            session = telegram_session({"proxy_mode": "library",
+                                        "proxy_profile_id": "primary"})
+        try:
+            expected = "socks5h://a%40b:p%3A%2Fw@proxy.example:1081"
+            self.assertEqual(session.proxies["http"], expected)
+            self.assertEqual(session.proxies["https"], expected)
+        finally:
+            session.close()
+
+    def test_telegram_library_node_reuses_its_ready_country_exit(self):
+        settings = {"proxy": {
+            "profiles": {"primary": {"name": "Primary", "type": "node"}},
+            "exits": {"gb": {"enabled": True, "profile_id": "primary"}},
+        }}
+        live = {"exits": {"gb": {"ready": True, "proxy_host": "172.17.0.1",
+                                     "proxy_port": 22027}}}
+        with patch.object(config, "get_settings", return_value=settings), \
+                patch("control.app.notify_push.egress.status", return_value=live):
+            session = telegram_session({"proxy_mode": "library",
+                                        "proxy_profile_id": "primary"})
+        try:
+            self.assertEqual(session.proxies["https"], "socks5h://172.17.0.1:22027")
         finally:
             session.close()
 

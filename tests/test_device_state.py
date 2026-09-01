@@ -335,6 +335,7 @@ modem.3gpp.registration-state : unknown
         def __init__(self, command):
             self.command = command
             self.running = True
+            self.pid = 7
 
         def poll(self):
             return None if self.running else 0
@@ -385,6 +386,64 @@ modem.3gpp.registration-state : unknown
             self.assertIs(app.bridges["a"], bridge_a)
             self.assertIs(app.bridges["b"], bridge_b)
             self.assertTrue(bridge_a.running)
+
+    def test_host_diagnostics_reports_only_bridge_identity_health(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modem = {"id": "a", "name": "A", "tty": "/dev/a"}
+            assignments = {"a": {**modem, "base_port": 15360}}
+            app.bridges["a"] = self.Process(["bridge"])
+            app._bridge_commands["a"] = ["bridge"]
+            metadata = app.data / "modems" / "a.json"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text(json.dumps({
+                "updated_at": int(time.time()) - 12,
+                "imei": "123456789012345", "iccid": "8944000000000000000",
+                "channel_status": "ready", "channel_requested": 3,
+                "channel_allocated": 3,
+            }))
+            with patch.object(app, "virtualization", return_value="kvm"), \
+                    patch.object(app, "vpcd_port_status", return_value={}), \
+                    patch.object(app, "reader_definitions_listing", return_value=[]):
+                app.publish_host_diagnostics([modem], assignments, False, False, True)
+
+            document = device_state._read(str(app.host_diagnostics_path), {})
+            bridge = document["bridges"]["a"]
+
+        self.assertTrue(bridge["imei_valid"])
+        self.assertTrue(bridge["iccid_valid"])
+        self.assertTrue(bridge["channels_ready"])
+        self.assertGreaterEqual(bridge["metadata_age_seconds"], 12)
+        self.assertNotIn("123456789012345", json.dumps(bridge))
+        self.assertNotIn("8944000000000000000", json.dumps(bridge))
+
+    def test_bad_bridge_metadata_is_bounded_instead_of_crashing_publish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modem = {"id": "a", "name": "A", "tty": "/dev/a"}
+            assignments = {"a": {**modem, "base_port": 15360}}
+            app.bridges["a"] = self.Process(["bridge"])
+            metadata = app.data / "modems" / "a.json"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text(json.dumps({
+                "updated_at": "not-a-number", "imei": "123456789012345",
+                "iccid": "89" + "0" * 20, "channel_status": "ready",
+                "channel_requested": {}, "channel_allocated": "nan",
+            }))
+            with patch.object(app, "virtualization", return_value="kvm"), \
+                    patch.object(app, "vpcd_port_status", return_value={}), \
+                    patch.object(app, "reader_definitions_listing", return_value=[]):
+                app.publish_host_diagnostics([modem], assignments, False, False, True)
+
+            bridge = device_state._read(str(app.host_diagnostics_path), {})["bridges"]["a"]
+
+        self.assertIsNone(bridge["metadata_age_seconds"])
+        self.assertTrue(bridge["iccid_valid"])
+        self.assertFalse(bridge["channels_ready"])
 
     def test_unplugging_a_modem_stops_only_its_bridge(self):
         with tempfile.TemporaryDirectory() as temp:

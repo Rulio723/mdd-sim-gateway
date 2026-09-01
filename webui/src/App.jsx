@@ -326,7 +326,7 @@ function UpdateModal({ update, current, t, onClose }) {
   const begin = async () => {
     setError(''); setPhase('requested'); setProgress({ state: 'running', phase: 'requested', target: update.latest, started_at: Math.floor(Date.now() / 1000) }); setPolling(false); setMode('working')
     try {
-      const result = await api.applyUpdate()
+      const result = await api.applyUpdate(update.latest)
       if (result?.ok === false && result?.error_code !== 'update.error.in_progress') {
         setError(result.error || result.error_code || ''); setMode('failed'); return
       }
@@ -370,8 +370,9 @@ function UpdateModal({ update, current, t, onClose }) {
     <div className="u-modal-backdrop" onClick={canClose ? onClose : undefined}>
       <div className="card u-update-modal" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title" onClick={(e) => e.stopPropagation()}>
         {mode === 'confirm' && <>
-          <div id="update-dialog-title" style={{ fontWeight: 700, fontSize: 16, marginBottom: 6 }}>{t('New version available: v{version}', { version: update.latest })}</div>
+          <div id="update-dialog-title" style={{ fontWeight: 700, fontSize: 16, marginBottom: 6 }}>{t('Install version v{version}', { version: update.latest })}</div>
           <div style={{ ...mute, marginBottom: 12 }}>v{current} → v{update.latest}</div>
+          {update.prerelease && <p className="u-note" style={{ margin: '0 0 12px' }}>{t('This is a published test version. It may be less stable than the normal version.')}</p>}
           {update.notes && <>
             <div style={{ ...mute, marginBottom: 4 }}>{t('Release notes')}</div>
             <div style={{ maxHeight: '40vh', overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.5, border: '1px solid var(--border, #8883)', borderRadius: 8, padding: '8px 10px', marginBottom: 12 }}>{update.notes}</div>
@@ -380,7 +381,7 @@ function UpdateModal({ update, current, t, onClose }) {
           <div className="u-modal-actions">
             <button className="btn btn-ghost" onClick={onClose}>{t('Cancel')}</button>
             <a className="btn btn-ghost" href={update.release_url} target="_blank" rel="noreferrer">{t('Release page')}</a>
-            <button ref={primaryAction} className="btn btn-primary" onClick={begin}>{t('Update now')}</button>
+            <button ref={primaryAction} className="btn btn-primary" onClick={begin}>{t('Install selected version')}</button>
           </div>
         </>}
         {(mode === 'working' || mode === 'restarting') && <>

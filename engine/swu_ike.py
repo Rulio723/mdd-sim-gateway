@@ -432,6 +432,66 @@ TV =  1
 KEY_LENGTH = (14, TV)
 
 
+def ike_proposals_for_plmn(mcc, mnc):
+    """Return IKE proposals for the home PLMN.
+
+    DITO Telecommunity's ePDG (515-66) advertises only the legacy 3GPP suite
+    AES-CBC-128 / HMAC-SHA1 / MODP-1024.  Keep the stronger, proven upstream
+    proposal set for every other carrier instead of weakening negotiation globally.
+    """
+    plmn = (str(mcc or "").zfill(3), str(mnc or "").zfill(3))
+    if plmn == ("515", "066"):
+        return [[
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_1024_bit],
+        ]]
+    return [
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 256]],
+            [PRF, PRF_HMAC_SHA2_256],
+            [INTEG, AUTH_HMAC_SHA2_256_128],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA2_256],
+            [INTEG, AUTH_HMAC_SHA2_256_128],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 256]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_2048_bit],
+        ],
+    ]
+
+
+def requests_permanent_eap_identity(attributes):
+    """Whether EAP-AKA asks the UE for a permanent/full-auth identity."""
+    if not attributes:
+        return False
+    return attributes[0][0] in (
+        AT_PERMANENT_ID_REQ,
+        AT_ANY_ID_REQ,
+        AT_FULLAUTH_ID_REQ,
+        AT_IDENTITY,
+    )
+
+
 #states
 OK =                            0
 TIMEOUT =                       1
@@ -903,10 +963,15 @@ class swu():
         # shared response handler credits an error notify against the right rekey driver.
         self._create_child_kind = None
 
-        # Proactive IKE SA rekey (RFC 7296 2.18, UE-initiated make-before-break). Some ePDGs
-        # (EE) rekey the IKE SA themselves at a fixed age (~12 h observed); we do not implement
-        # the responder side of that (state_epdg_create_sa refuses it and the ePDG then deletes
-        # the SA => ~1 min outage). Rekeying FIRST keeps us the exchange initiator, so the SA
+        # Proactive IKE SA rekey (RFC 7296 2.18, UE-initiated make-before-break). Carriers
+        # bound the IKE SA / SWu session by a local clock we cannot see: EE rekeys it at
+        # ~12 h, and giffgaff/O2 UK silently invalidates the session at ~2h50m without any
+        # IKE message at all (issue #33) — IMS then rejects re-REGISTER until a fresh
+        # session exists. We do not implement the responder side of an ePDG-initiated rekey
+        # (state_epdg_create_sa refuses it and the ePDG then deletes the SA => ~1 min
+        # outage), so this period must stay comfortably below the carrier's clock; render.py
+        # supplies it from settings (default 150 min). Rekeying FIRST keeps us the exchange
+        # initiator, so the SA
         # roles, key-selection and header-flag assumptions baked into this file stay valid. The
         # machinery (state_ue_create_sa + the IKE branch of state_epdg_create_sa_response:
         # SKEYSEED' = prf(SK_d, g^ir | Ni | Nr), old-SA answer paths, DELETE old) predates this
@@ -4310,7 +4375,7 @@ class swu():
                         elif i[1][3] in (AKA_Identity,):
                             
                       
-                            if i[1][4][0][0] in (AT_ANY_ID_REQ, AT_IDENTITY):
+                            if requests_permanent_eap_identity(i[1][4]):
                                 self.eap_identifier = i[1][1]
                                 identity = (
                                         '0'
@@ -5403,7 +5468,8 @@ class swu():
         IKE rekey (state_ue_create_sa). Staying the initiator keeps every role assumption in this
         file valid AND resets the ePDG's own rekey clock — the whole point, since we refuse the
         responder role and an ePDG-initiated rekey therefore ends in a teardown (EE does this at
-        ~12 h SA age; keep SWU_IKE_REKEY_MINUTES comfortably below that).
+        ~12 h SA age; giffgaff/O2 UK instead ages the session out silently at ~2h50m — keep
+        SWU_IKE_REKEY_MINUTES comfortably below the shortest carrier clock in use).
 
         An explicit rejection keeps the established IKE SA (retry in ike_rekey_retry_interval).
         An unanswered request is retransmitted verbatim; exhausting the retransmissions leaves the
@@ -6433,42 +6499,6 @@ def main():
         print("[swu_ike] CP mode pinned: %s" % _cp_mode)
 
 
-    # IKE proposals. Telus' ePDG rejects the emulator's stock SHA1/MD5 list with
-    # NO_PROPOSAL_CHOSEN; it requires PRF/INTEG SHA2-256. This list mirrors the engine's
-    # render.py default_ike (the set proven with strongSwan on Telus). MODP_2048 MUST be first
-    # because the IKE_SA_INIT KE payload is derived from the first proposal's DH group.
-    sa_list = [
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,256]],
-       [PRF,PRF_HMAC_SHA2_256],
-       [INTEG,AUTH_HMAC_SHA2_256_128],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,128]],
-       [PRF,PRF_HMAC_SHA2_256],
-       [INTEG,AUTH_HMAC_SHA2_256_128],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,256]],
-       [PRF,PRF_HMAC_SHA1],
-       [INTEG,AUTH_HMAC_SHA1_96],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,128]],
-       [PRF,PRF_HMAC_SHA1],
-       [INTEG,AUTH_HMAC_SHA1_96],
-       [D_H,MODP_2048_bit]
-    ]
-    ]
-
-
     # Child/ESP proposals. AES_CBC_128/HMAC_SHA1_96 first — the transform Telus selected with
     # strongSwan (render.py default_esp). Remaining kept as fallbacks. No DH transform here
     # (no PFS at initial IKE_AUTH).
@@ -6517,6 +6547,9 @@ def main():
                       help="IMEISV (16 digits) for DEVICE_IDENTITY; auto-derived from IMEI if blank")
 
     (options, args) = parser.parse_args()
+    sa_list = ike_proposals_for_plmn(options.mcc, options.mnc)
+    if (str(options.mcc).zfill(3), str(options.mnc).zfill(3)) == ("515", "066"):
+        print("[swu_ike] DITO 515-66: using AES-CBC-128/SHA1/MODP-1024 IKE proposal")
     
     try:
         destination_addr = socket.gethostbyname(options.destination_addr)

@@ -14,6 +14,7 @@ Never fails the caller (all exceptions swallowed).
 import os
 import sys
 import json
+import time
 
 
 def load_env():
@@ -38,7 +39,7 @@ def main():
     env = load_env()
     manager_url = os.environ.get("MANAGER_URL") or env.get("MANAGER_URL", "")
     inst_id = os.environ.get("MDD_ID") or env.get("MDD_ID", "1")
-    payload = {"instance": inst_id, "event": event, "args": args}
+    payload = {"ts": int(time.time()), "instance": inst_id, "event": event, "args": args}
     # Always append to a local event log so nothing is lost if the manager is down.
     try:
         os.makedirs("/logs", exist_ok=True)

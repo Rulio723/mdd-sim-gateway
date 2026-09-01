@@ -30,6 +30,15 @@ log = logging.getLogger("mdd.engine")
 # Bounded so a line that rebuilds every two minutes cannot fill a Pi's SD card. Only the
 # recent tail is diagnostically useful.
 DIAGNOSTIC_RECORDS = 200
+LIFECYCLE_RECORDS = 500
+LIFECYCLE_EVENTS = {
+    "recovery_scheduled", "recovery_blocked", "recovery_started", "recovery_failed",
+    "recovery_succeeded", "recovery_cancelled", "vowifi_disabled",
+}
+_LIFECYCLE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_LIFECYCLE_INSTANCE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_diagnostic_jsonl_lock = threading.Lock()
+_lifecycle_jsonl_lock = threading.Lock()
 # Asterisk writes colour escapes even when captured to a file; strip them so the stored
 # record stays greppable.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -193,6 +202,30 @@ def ike_evidence(iid: str) -> dict:
     return _charon_evidence(base)
 
 
+def registration_failure_evidence(log_tail: str) -> dict:
+    """Classify the newest concrete REGISTER failure and retain its SIP response code.
+
+    Asterisk reports both as "Rejected", but they are different events: a "Fatal response
+    '403'" is the IMS refusing this line, while "No response received" is the IMS no longer
+    hearing it — on this gateway almost always an ESP session the carrier aged out while
+    the IKE side still answered keepalives. The newest marker in the log decides.
+    """
+    for line in reversed(log_tail.splitlines()):
+        low = line.lower()
+        # The real Asterisk message says "on registration attempt", not "on REGISTER
+        # attempt".  ``registration`` does not contain the substring ``register``, so the
+        # old extra guard made this production path unreachable.  This exact marker is emitted
+        # by outbound registration's timeout path and is already the evidence retained by
+        # _SIP_EVIDENCE.  A Docker log read failure is returned as "error: ...", which
+        # deliberately does not match and therefore remains on the conservative slow path.
+        if "no response received" in low:
+            return {"kind": "unanswered"}
+        match = re.search(r"fatal response '(\d+)'", low)
+        if match:
+            return {"kind": "rejected", "sip_status": int(match.group(1))}
+    return {"kind": "unknown"}
+
+
 def _sip_evidence(raw: str) -> list[str]:
     """Keep the SIP protocol lines and registration failures from a container log."""
     kept = []
@@ -235,14 +268,68 @@ def _host_evidence() -> dict:
         return {}
 
 
+def _append_bounded_jsonl(path: str, record: dict, limit: int,
+                          lock: threading.Lock, *, create_parent: bool = True) -> None:
+    """Atomically append one record while retaining only a bounded tail."""
+    if create_parent:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    with lock:
+        keep = max(0, int(limit) - 1)
+        lines = _tail_lines(path, keep) if keep else []
+        lines.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+
+
 def _append_diagnostic(base: str, record: dict):
-    path = os.path.join(base, "logs", "diagnostics.jsonl")
-    lines = _tail_lines(path, DIAGNOSTIC_RECORDS - 1)
-    lines.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-    os.replace(tmp, path)
+    _append_bounded_jsonl(
+        os.path.join(base, "logs", "diagnostics.jsonl"), record, DIAGNOSTIC_RECORDS,
+        _diagnostic_jsonl_lock)
+
+
+def valid_lifecycle_reason(value: object) -> bool:
+    """One shared validator for producers and the persistence boundary."""
+    return bool(_LIFECYCLE_REASON.fullmatch(str(value or "")))
+
+
+def record_lifecycle(iid: str, event: str, *, reason_code: str = "", **facts) -> None:
+    """Persist one recovery decision without exporting identifiers or exception text.
+
+    This is intentionally a closed schema.  Free-form exception strings, paths, hardware ids
+    and subscriber identifiers must never enter a file intended for public support bundles.
+    """
+    event = str(event or "")
+    reason_code = str(reason_code or "")
+    iid = str(iid or "")
+    if event not in LIFECYCLE_EVENTS:
+        raise ValueError("invalid lifecycle event")
+    if not _LIFECYCLE_INSTANCE.fullmatch(iid):
+        raise ValueError("invalid lifecycle instance")
+    if reason_code and not valid_lifecycle_reason(reason_code):
+        raise ValueError("invalid lifecycle reason code")
+    record = {"ts": int(time.time()), "instance": iid, "event": event}
+    if reason_code:
+        record["reason_code"] = reason_code
+    for key in ("retry_count", "delay_seconds"):
+        if key in facts and facts[key] is not None:
+            record[key] = max(0, int(facts[key]))
+    # The SIP response code behind a reg_rejected freeze (e.g. 403). A bare code is
+    # support-safe and is exactly what distinguishes a carrier refusal from a dead tunnel.
+    if facts.get("sip_status") is not None:
+        record["sip_status"] = max(0, min(999, int(facts["sip_status"])))
+    for key in ("card_present", "imei_valid", "imei_source_matches"):
+        if key in facts and facts[key] is not None:
+            record[key] = bool(facts[key])
+    base = os.path.join(DATA_DIR, "instances", iid)
+    # A lifecycle record may only extend an existing line directory.  Creating it here would
+    # resurrect deleted/unknown ids and violate the API's "delete history" guarantee.
+    if not os.path.isdir(base):
+        return
+    _append_bounded_jsonl(
+        os.path.join(base, "logs", "lifecycle.jsonl"), record, LIFECYCLE_RECORDS,
+        _lifecycle_jsonl_lock, create_parent=False)
 
 
 def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
@@ -266,7 +353,12 @@ def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
                   "host": _host_evidence()}
         for name in ("swu_status.json", "usim_status.json", "pin_status.json"):
             record[name[:-5]] = read_run_json(iid, name) or {}
-        record["sip"] = _sip_evidence(logs(iid, 600))
+        tail = logs(iid, 600)
+        record["sip"] = _sip_evidence(tail)
+        # The bare "Rejected" registration string cannot say WHY (issue #33 shipped a bundle
+        # whose SIP response code was already rotated away); keep the classified verdict and
+        # its numeric status code beside it. Digits-only, so redaction passes it through.
+        record["registration_evidence"] = registration_failure_evidence(tail)
         _append_diagnostic(base, record)
     except Exception as exc:  # noqa
         log.warning("diagnostic capture failed for instance %s: %s", iid, exc)

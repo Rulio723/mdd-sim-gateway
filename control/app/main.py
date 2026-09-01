@@ -20,6 +20,7 @@ import os
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from contextlib import asynccontextmanager
@@ -499,14 +500,22 @@ class Hub:
         return self.health.setdefault(str(iid), {
             "fail_start": None, "retry_count": 0, "frozen_code": None,
             "frozen_reason": None, "last_state": None, "next_retry_at": None,
-            "auto_retrying": False,
+            "auto_retrying": False, "last_blocked_reason": None,
         })
 
-    def reset_health(self, iid: str):
+    def reset_health(self, iid: str, cancel_reason: str | None = "state_reset"):
         iid = str(iid)
+        previous = self.health.get(iid) or {}
+        if cancel_reason and (previous.get("frozen_code") or previous.get("next_retry_at")
+                              or previous.get("auto_retrying")):
+            _record_lifecycle(
+                iid, "recovery_cancelled", cancel_reason,
+                retry_count=previous.get("retry_count"),
+                card_present=False if cancel_reason == "no_card" else None)
         self.health[iid] = {"fail_start": None, "retry_count": 0, "frozen_code": None,
                                  "frozen_reason": None, "last_state": None,
-                                 "next_retry_at": None, "auto_retrying": False}
+                                 "next_retry_at": None, "auto_retrying": False,
+                                 "last_blocked_reason": None}
         self.status_cache.pop(iid, None)
         self.status_sampled_at.pop(iid, None)
 
@@ -831,7 +840,7 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
             return
         await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
                                 os.environ.get("MDD_DEV_MOUNTS", "") == "1")
-        hub.reset_health(iid)
+        hub.reset_health(iid, "hotplug_start")
         await hub.broadcast({"type": "engine", "instance": iid, "event": "hotplug_started",
                              "args": []})
     except Exception as exc:  # noqa
@@ -858,7 +867,13 @@ def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
         or str(item.get("matched") or "") == iid)), None)
     if card_info is None:
         return False, "no_card"
-    device_id, _device_type = _device_for_card(card_info, cards)
+    device_id, device_type = _device_for_card(card_info, cards)
+    # A native reader has no entry in device-desired.json: its VoWiFi switch is the line's
+    # ``enabled`` flag checked above. Falling through to the global device default here made
+    # "VoWiFi off for newly detected devices" cancel recovery for every already-enabled
+    # reader line, even though the device page correctly still showed those lines as enabled.
+    if device_type == "reader":
+        return True, ""
     desired = device_state.desired()
     wanted = ((desired.get("devices") or {}).get(device_id)
               or desired.get("defaults") or {})
@@ -976,7 +991,7 @@ async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
     # cooldown even when its container was already removed: otherwise that in-memory recovery
     # timer can recreate an engine minutes after the SIM disappeared.
     if target:
-        hub.reset_health(str(target["id"]))
+        hub.reset_health(str(target["id"]), "no_card")
     if target and await asyncio.to_thread(engine.is_running, str(target["id"])):
         # Stop the SIP server + docker container on card/reader removal.
         await asyncio.to_thread(engine.stop, str(target["id"]))
@@ -1262,7 +1277,7 @@ async def learn_msisdn(iid):
             await hub.drop_ami(iid)
             await asyncio.to_thread(_start_engine_checked, updated, cfg.get_settings(),
                                     os.environ.get("MDD_DEV_MOUNTS", "") == "1")
-            hub.reset_health(iid)
+            hub.reset_health(iid, "configuration_restart")
             log.info("restarted instance %s to apply IMS line identity", iid)
         await hub.broadcast({"type": "engine", "instance": iid, "event": "msisdn", "args": [msisdn]})
     except Exception as e:  # noqa
@@ -1536,6 +1551,10 @@ async def sms_segment_reaper():
         except Exception as exc:  # noqa
             log.debug("SMS segment sweep failed: %r", exc)
             continue
+        try:
+            await asyncio.to_thread(store.prune_late_sms_groups)
+        except Exception as exc:  # noqa
+            log.debug("late SMS group prune failed: %r", exc)
         for group in stale:
             iid = str(group["instance"])
             body = _join_sms_parts(group["bodies"], group["seqs"], group["total"])
@@ -1544,6 +1563,12 @@ async def sms_segment_reaper():
                      ",".join(str(n) for n in group["seqs"]), group["total"])
             rec = await asyncio.to_thread(store.add_message, iid, "in", group["peer"], body,
                                           ts=group["first_ts"])
+            # Keep the group addressable so the parts still in flight complete THIS message
+            # rather than being published as a second fragment of the same text.
+            if len(group["seqs"]) < group["total"]:
+                await asyncio.to_thread(
+                    store.remember_partial_sms_group, iid, group["peer"], group["concat_ref"],
+                    group["total"], rec["id"], group["seqs"], group["bodies"])
             await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
             await asyncio.to_thread(_harvest_allowance_reply, iid, group["peer"])
             _dispatch_push(notify_push.EV_INCOMING_SMS, iid, group["peer"], body)
@@ -1881,7 +1906,7 @@ async def _poll_instance_status(inst: dict) -> None:
                 if runtime["running"]:
                     await asyncio.to_thread(engine.stop, iid)
                     await hub.drop_ami(iid)
-                hub.reset_health(iid)
+                hub.reset_health(iid, "line_disabled")
                 stopped = _with_status_activity(iid, {
                     "state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
                     "reason_code": "stopped", "reason": "Stopped.", "detail": {},
@@ -2019,6 +2044,35 @@ def _frozen(h, st, rmax):
             "frozen": True, "automatic_retry_in": remaining or None}
 
 
+_lifecycle_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mdd-lifecycle")
+
+
+def _record_lifecycle(iid: str, event: str, reason_code: str = "", **facts) -> None:
+    """Best-effort bounded recovery audit; it must never affect line operation."""
+    try:
+        future = _lifecycle_writer.submit(
+            engine.record_lifecycle, str(iid), event, reason_code=reason_code, **facts)
+        future.add_done_callback(
+            lambda done: log.debug(
+                "lifecycle record failed instance=%s event=%s: %s",
+                iid, event, type(done.exception()).__name__) if done.exception() else None)
+    except Exception as exc:  # noqa - diagnostic persistence cannot break recovery
+        log.debug("lifecycle record failed instance=%s event=%s: %s",
+                  iid, event, type(exc).__name__)
+
+
+def _recovery_failure_code(exc: Exception) -> str:
+    """Reduce arbitrary start errors to a support-safe closed reason code."""
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        code = str(detail.get("code") or "")
+        if engine.valid_lifecycle_reason(code):
+            return code
+    if isinstance(exc, egress.EgressError):
+        return "egress_unavailable"
+    return "engine_start_failed"
+
+
 async def _auto_recover_instance(iid: str, inst: dict, delay: int):
     h = hub.health_for(iid)
     try:
@@ -2037,10 +2091,18 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
                 h["next_retry_at"] = time.monotonic() + delay
                 h["frozen_reason"] = (
                     "The SIM card is temporarily unavailable; automatic recovery will retry.")
+                if h.get("last_blocked_reason") != "no_card":
+                    _record_lifecycle(
+                        iid, "recovery_blocked", "no_card", retry_count=h.get("retry_count"),
+                        delay_seconds=delay, card_present=False)
+                h["last_blocked_reason"] = "no_card"
             else:
                 # A disabled line or VoWiFi switch is durable user intent, unlike a transient
                 # card-cache miss. It must cancel a pending automatic start.
-                hub.reset_health(iid)
+                _record_lifecycle(
+                    iid, "recovery_cancelled", blocked_reason,
+                    retry_count=h.get("retry_count"), card_present=True)
+                hub.reset_health(iid, None)
             stopped = _with_status_activity(iid, {
                 "state": "NO_CARD" if no_card else "STOPPED",
                 "label": "No SIM card" if no_card else status_mod.LABELS["STOPPED"],
@@ -2055,6 +2117,10 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
             hub.status_sampled_at[str(iid)] = time.monotonic()
             await hub.broadcast({"type": "status", "instance": str(iid), **stopped})
             return
+        h["last_blocked_reason"] = None
+        _record_lifecycle(
+            iid, "recovery_started", h.get("frozen_code") or "unhealthy",
+            retry_count=h.get("retry_count"), card_present=True)
         recovering = _with_status_activity(iid, {
             "state": "REGISTERING", "label": status_mod.LABELS["REGISTERING"],
             "reason_code": h.get("frozen_code") or "registering",
@@ -2069,7 +2135,9 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
             # Records why the health policy gave up on the previous container, so the captured
             # snapshot explains itself without cross-referencing the journal.
             f"auto-recover:{h.get('frozen_code') or 'unhealthy'}")
-        hub.reset_health(iid)
+        recovered_reason = h.get("frozen_code") or "unhealthy"
+        hub.reset_health(iid, None)
+        _record_lifecycle(iid, "recovery_succeeded", recovered_reason, card_present=True)
         starting = _with_status_activity(iid, {
             "state": "REGISTERING", "label": status_mod.LABELS["REGISTERING"],
             "reason_code": "registering", "reason": "The line was rebuilt successfully.",
@@ -2081,6 +2149,20 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
         h["auto_retrying"] = False
         h["next_retry_at"] = time.monotonic() + delay
         h["frozen_reason"] = str(getattr(exc, "detail", exc))
+        code = _recovery_failure_code(exc)
+        detail = getattr(exc, "detail", None)
+        source_matches = None
+        if code == "hardware_imei_required" and isinstance(detail, dict):
+            saved_source = str(inst.get("imei_source_device_id") or "")
+            failed_source = str(detail.get("device_id") or "")
+            source_matches = bool(saved_source and failed_source
+                                  and saved_source == failed_source)
+        h["last_blocked_reason"] = None
+        _record_lifecycle(
+            iid, "recovery_failed", code, retry_count=h.get("retry_count"),
+            delay_seconds=delay, card_present=True, imei_valid=False
+            if code == "hardware_imei_required" else None,
+            imei_source_matches=source_matches)
 
 
 def apply_health(iid, inst, st, container_id: str | None = None):
@@ -2095,7 +2177,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
     now = time.monotonic()
 
     if not inst.get("enabled", True):
-        hub.reset_health(iid)
+        hub.reset_health(iid, "line_disabled")
         return {"state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
                 "reason_code": "stopped", "reason": "Stopped.", "detail": {},
                 "retry": {"count": 0, "max": rmax}}
@@ -2108,7 +2190,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
         # still stands. Clearing here is also what lets a reported line report again later.
         if hub.exit_ledgers.pop(str(iid), None) is not None:
             _save_exit_ledgers()
-        hub.reset_health(iid)
+        hub.reset_health(iid, "line_recovered")
         st["retry"] = {"count": 0, "max": rmax}
         return st
     if h.get("frozen_code"):
@@ -2134,6 +2216,9 @@ def apply_health(iid, inst, st, container_id: str | None = None):
         h["frozen_code"] = st["reason_code"]
         h["frozen_reason"] = st["reason"]
         h["next_retry_at"] = None
+        _record_lifecycle(
+            iid, "recovery_cancelled", st["reason_code"],
+            retry_count=h.get("retry_count"), card_present=True)
         return _frozen(h, st, rmax)
 
     # Asterisk has already spent a complete SIP transaction proving that this established
@@ -2193,8 +2278,9 @@ def apply_health(iid, inst, st, container_id: str | None = None):
         except Exception as exc:  # noqa
             log.warning("exit failover judgement failed for line %s: %s", iid, exc)
             action = failover.HOLD
-        if (action == failover.GIVE_UP
-                or bool((hub.exit_ledgers.get(str(iid)) or {}).get("given_up"))):
+        exit_gave_up = (action == failover.GIVE_UP
+                        or bool((hub.exit_ledgers.get(str(iid)) or {}).get("given_up")))
+        if exit_gave_up:
             # Stop the automatic rebuild the same way a PIN problem does: the operator pinned
             # this exit and it has had its chances, so rebuilding again is pure churn. A
             # person (or a successful start) clears this.
@@ -2205,6 +2291,22 @@ def apply_health(iid, inst, st, container_id: str | None = None):
             # every few minutes) the line re-tests its exit on a slow cadence and registers
             # by itself when the outside world comes back.
             h["next_retry_at"] = now + failover.EXHAUSTED_RETRY_SECONDS
+        # The SIP code that condemned a reg_rejected line (403 vs 5xx points at completely
+        # different fixes) is only in the status detail at this moment; issue #33 shipped a
+        # bundle where it had already rotated out of every log, so persist it with the record.
+        frozen_sip_status = (st.get("detail") or {}).get("sip_status")
+        if h.get("next_retry_at") is not None:
+            _record_lifecycle(
+                iid, "recovery_scheduled", h.get("frozen_code") or "unhealthy",
+                retry_count=h.get("retry_count"),
+                delay_seconds=max(0, int(h["next_retry_at"] - now)),
+                sip_status=frozen_sip_status)
+        else:
+            _record_lifecycle(
+                iid, "recovery_cancelled", "exit_give_up" if exit_gave_up else
+                (h.get("frozen_code") or "unhealthy"),
+                retry_count=h.get("retry_count"),
+                sip_status=frozen_sip_status)
         asyncio.create_task(hub.drop_ami(str(iid)))
         return _frozen(h, st, rmax)
     st["retry"] = {"count": count, "max": rmax}
@@ -2759,7 +2861,7 @@ async def _esim_prepare_profile_switch(hardware_id: str) -> dict[str, dict]:
         previous[iid] = {"enabled": bool(inst.get("enabled", True)), "running": running}
         if inst.get("enabled", True):
             await asyncio.to_thread(cfg.upsert_instance, {"id": iid, "enabled": False})
-        hub.reset_health(iid)
+        hub.reset_health(iid, "esim_profile_switch")
         if running:
             await asyncio.to_thread(engine.stop, iid)
             await hub.drop_ami(iid)
@@ -2789,7 +2891,7 @@ async def _esim_prepare_reader_profile_switch(name: str) -> dict[str, dict]:
     previous = {iid: {"enabled": bool(inst.get("enabled", True)), "running": False}}
     if inst.get("enabled", True):
         await asyncio.to_thread(cfg.upsert_instance, {"id": iid, "enabled": False})
-        hub.reset_health(iid)
+        hub.reset_health(iid, "esim_profile_switch")
         egress.publish()
     return previous
 
@@ -3272,7 +3374,7 @@ async def api_provision(body: dict):
         raise HTTPException(409, {
             "code": "line_limit", "message": str(exc)}) from exc
     hub._msisdn_tries.pop(str(inst["id"]), None)
-    hub.reset_health(inst["id"])
+    hub.reset_health(inst["id"], "user_requested")
     # engine.start force-removes any existing container; retire AMI first so a cached
     # client can't keep Login'ing the old (or IP-reused) engine with a stale secret.
     await hub.drop_ami(str(inst["id"]))
@@ -3359,7 +3461,13 @@ def _hardware_imei_for_card(card_info: dict, cards: list[dict] | None = None,
     if device_type == "modem":
         identity = _device_identities().get(device_id) or {}
         imei = cfg.normalize_imei(identity.get("imei", ""))
-        return imei if len(imei) == 15 else "", device_id, device_type
+        if len(imei) == 15:
+            return imei, device_id, device_type
+        # A modem without a USB serial uses its port path as device_id.  A different module
+        # plugged into that same port therefore has the same id, so a per-line snapshot is not
+        # proof of physical identity and must never be borrowed.  The bridge itself retains a
+        # verified IMEI across transient refresh failures while it owns the same open device.
+        return "", device_id, device_type
     if device_type == "reader":
         record = device_state.hardware().get(device_id) or {}
         imei = cfg.normalize_imei(record.get("imei", ""))
@@ -3369,6 +3477,13 @@ def _hardware_imei_for_card(card_info: dict, cards: list[dict] | None = None,
         # whichever SIM line was inserted. Move it to the physical reader record.
         inst = _match_instance_by_iccid(card_info.get("iccid"))
         legacy = cfg.normalize_imei((inst or {}).get("imei", ""))
+        # The per-line source marker was written only after this reader's IMEI had been
+        # verified.  If the hardware document is briefly unreadable during recovery, the
+        # matching marker is safer than stopping a present card forever; a marker naming a
+        # different reader remains unusable so moving the SIM still adopts the new device.
+        if (len(legacy) == 15
+                and str((inst or {}).get("imei_source_device_id") or "") == device_id):
+            return legacy, device_id, device_type
         if migrate_legacy and len(legacy) == 15 and not (inst or {}).get("imei_source_device_id"):
             device_state.set_hardware(device_id, {
                 "device_type": "reader", "name": card_info.get("name") or "Smart-card reader",
@@ -3651,7 +3766,9 @@ async def _unified_devices() -> list[dict]:
             "vowifi": {"epdg": (line_status or {}).get("detail") or "",
                        "ims": (line_status or {}).get("label") or "",
                        "rekey_minutes": (inst or {}).get("rekey_minutes",
-                           (cfg.get_settings().get("rekey") or {}).get("minutes", 30))},
+                           (cfg.get_settings().get("rekey") or {}).get("minutes", 30)),
+                       "ike_rekey_minutes": (inst or {}).get("ike_rekey_minutes",
+                           (cfg.get_settings().get("rekey") or {}).get("ike_minutes", 150))},
             "egress": {"node": (egress.status().get("lines") or {}).get(
                 str(inst["id"]) if inst else "", {}).get("node") or "",
                 # The picker lives on the settings page, so without these the device page shows
@@ -3729,7 +3846,7 @@ async def api_device_hardware(device_id: str, body: dict):
             await hub.drop_ami(iid)
             await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
                                     dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
-            hub.reset_health(iid)
+            hub.reset_health(iid, "configuration_restart")
             applied = True
     await hub.broadcast({"type": "hardware", "device": device_id})
     return {"ok": True, "imei_masked": _masked_identifier(record.get("imei")),
@@ -3876,7 +3993,8 @@ async def api_device_capabilities(device_id: str, body: dict):
                 await api_instance_start(iid)
             else:
                 cfg.upsert_instance({"id": iid, "enabled": False})
-                await api_instance_stop(iid)
+                _record_lifecycle(iid, "vowifi_disabled", "user_requested")
+                await _stop_instance(iid, "device_vowifi_disabled")
             refreshed = await _unified_devices()
             return next(item for item in refreshed if item["id"] == device_id)
 
@@ -3909,6 +4027,9 @@ async def api_device_capabilities(device_id: str, body: dict):
             devices = await _unified_devices()
             return next(item for item in devices if item["id"] == device_id)
         vowifi_action = vowifi_changed or vowifi_retry
+        if vowifi_action and target_iid and not wanted["vowifi_enabled"]:
+            _record_lifecycle(target_iid, "vowifi_disabled", "user_requested")
+            hub.reset_health(target_iid, "device_vowifi_disabled")
         # Data bearer and flight-mode changes are reconciled underneath the existing line.
         # Only a VoWiFi toggle intentionally stops/starts that line.
         affected_instances = [target_instance] if vowifi_action and target_instance else []
@@ -4022,13 +4143,47 @@ def api_put_settings(body: dict):
             raise HTTPException(400, f"invalid webhook configuration: {exc}")
     # Telegram is notification-only. Ignore stale clients that
     # still submit a remote command configuration.
-    (body.get("telegram") or {}).pop("commands", None)
+    telegram = body.get("telegram") or {}
+    telegram.pop("commands", None)
+    telegram_mode = str(telegram.get("proxy_mode") or "direct").lower()
+    if telegram_mode not in {"direct", "library", "country", "manual"}:
+        raise HTTPException(400, "invalid Telegram proxy mode")
+    effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
+                       else cfg.get_settings().get("proxy")) or {}
+    if telegram_mode == "library":
+        telegram_profile = (effective_proxy.get("profiles") or {}).get(
+            str(telegram.get("proxy_profile_id") or "")) or {}
+        if not telegram_profile:
+            raise HTTPException(400, "Telegram proxy references an unknown proxy library entry")
+        if telegram_profile.get("type") == "subscription":
+            raise HTTPException(400, "Telegram cannot select a subscription; use a country exit")
+    if telegram_mode == "country" and egress.normalize_country(telegram.get("proxy_country")) \
+            not in (effective_proxy.get("exits") or {}):
+        raise HTTPException(400, "Telegram proxy references an unknown country exit")
     pushplus = body.get("pushplus") or {}
     if pushplus.get("enabled"):
         if not str(pushplus.get("token") or "").strip():
             raise HTTPException(400, "PushPlus token is required")
         if str(pushplus.get("template") or "html") not in {"html", "txt", "markdown", "json"}:
             raise HTTPException(400, "unsupported PushPlus template")
+    feishu = body.get("feishu") or {}
+    try:
+        channels = notify_push.validate_feishu_channels(feishu)
+    except ValueError as exc:
+        raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
+    for channel in channels:
+        try:
+            if not channel.get("enabled"):
+                continue
+            sample = notify_push.build_payload(
+                notify_push.EV_INCOMING_SMS,
+                {"id": "preview", "name": "SIM", "iccid": "", "msisdn": ""},
+                "+10000000000", "123456")
+            # Validation happens before the HTTP request inside send_feishu. Use a local copy
+            # of the same checks here so saving settings never sends a notification.
+            notify_push.build_notification_message(sample, channel)
+        except ValueError as exc:
+            raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
     if "updates" in body:
         try:
             body["updates"] = update_check.validate_update_settings(body.get("updates"))
@@ -4037,8 +4192,17 @@ def api_put_settings(body: dict):
         if body["updates"]["proxy_mode"] == "library":
             effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
                                else cfg.get_settings().get("proxy")) or {}
-            if body["updates"]["proxy_profile_id"] not in (effective_proxy.get("profiles") or {}):
+            update_profile = (effective_proxy.get("profiles") or {}).get(
+                body["updates"]["proxy_profile_id"]) or {}
+            if not update_profile:
                 raise HTTPException(400, "update proxy references an unknown proxy library entry")
+            if update_profile.get("type") == "subscription":
+                raise HTTPException(400, "updates cannot select a subscription; use a country exit")
+        elif body["updates"]["proxy_mode"] == "country":
+            effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
+                               else cfg.get_settings().get("proxy")) or {}
+            if body["updates"]["proxy_country"] not in (effective_proxy.get("exits") or {}):
+                raise HTTPException(400, "update proxy references an unknown country exit")
     hardware = body.get("hardware")
     if hardware is not None:
         if not isinstance(hardware, dict):
@@ -4203,6 +4367,17 @@ async def api_pushplus_test(body: dict):
         raise HTTPException(502, str(exc)) from exc
 
 
+@app.post("/api/notifications/feishu/test")
+async def api_feishu_test(body: dict):
+    try:
+        event = _notification_test_event(body)
+        return await asyncio.to_thread(notify_push.send_feishu, body, _test_push_payload(event))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
 @app.get("/api/notifications/deliveries")
 def api_notification_deliveries(limit: int = 100):
     return notify_push.delivery_status(limit)
@@ -4271,6 +4446,12 @@ async def api_system_update_check(force: bool = False):
     return await asyncio.to_thread(update_check.check, force)
 
 
+@app.get("/api/system/update/releases")
+async def api_system_update_releases(force: bool = False):
+    """Published stable/test versions available for an explicit manual channel switch."""
+    return await asyncio.to_thread(update_check.releases, force)
+
+
 @app.get("/api/system/repository/stars")
 async def api_system_repository_stars(force: bool = False):
     """Repository metadata is retried independently of the slower release poll."""
@@ -4278,10 +4459,11 @@ async def api_system_repository_stars(force: bool = False):
 
 
 @app.post("/api/system/update/apply")
-async def api_system_update_apply():
+async def api_system_update_apply(body: dict):
     """One-click update: publish a request for the host orchestrator, which runs the detached
     updater (host/mdd_update.py). Responds immediately; progress is polled separately."""
-    return await asyncio.to_thread(update_check.request_apply)
+    version = body.get("version")
+    return await asyncio.to_thread(update_check.request_apply, version=version)
 
 
 @app.get("/api/system/update/progress")
@@ -4479,7 +4661,7 @@ async def api_instance_upsert(body: dict):
     if was_running:
         try:
             hub._msisdn_tries.pop(iid, None)
-            hub.reset_health(iid)
+            hub.reset_health(iid, "configuration_restart")
             await hub.drop_ami(iid)
             await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
                                     dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
@@ -4629,7 +4811,7 @@ async def api_instance_start(iid: str, body: dict | None = None):
     if updates:
         inst = cfg.upsert_instance({"id": str(iid), **updates})
     hub._msisdn_tries.pop(str(iid), None)
-    hub.reset_health(iid)
+    hub.reset_health(iid, "user_requested")
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
     cid = await asyncio.to_thread(_start_engine_checked, inst, settings, dev_mounts=dev)
     asyncio.create_task(push_status(str(iid)))
@@ -4655,7 +4837,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
             cfg.clear_pin(str(iid))
         raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
     hub._msisdn_tries.pop(str(iid), None)
-    hub.reset_health(iid)
+    hub.reset_health(iid, "user_requested")
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
     dev = os.environ.get("MDD_DEV_MOUNTS", "") == "1"
     cid = await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(), dev_mounts=dev)
@@ -4671,6 +4853,7 @@ async def api_clear_pin(iid: str):
     if not inst:
         raise HTTPException(404, "no such instance")
     had = cfg.clear_pin(str(iid))
+    hub.reset_health(str(iid), "pin_cleared")
     if await asyncio.to_thread(engine.is_running, str(iid)):
         await asyncio.to_thread(engine.stop, str(iid))
         await hub.drop_ami(str(iid))
@@ -4680,9 +4863,14 @@ async def api_clear_pin(iid: str):
 
 @app.post("/api/instances/{iid}/stop")
 async def api_instance_stop(iid: str):
+    return await _stop_instance(iid, "user_requested")
+
+
+async def _stop_instance(iid: str, cancel_reason: str) -> dict:
+    """Stop one engine without pretending every internal stop disabled VoWiFi."""
     # Cancel frozen cooldown intent before stopping. Otherwise a pending health recovery can
-    # recreate the line after the user explicitly stopped it.
-    hub.reset_health(iid)
+    # recreate the line after the explicit/manual operation.
+    hub.reset_health(iid, cancel_reason)
     await asyncio.to_thread(engine.stop, iid)
     # Tear down the AMI client too — otherwise its Manager keeps auto-reconnecting to the
     # now-removed container (and floods a container that later reuses the docker IP).
@@ -5852,6 +6040,27 @@ async def api_engine_event(payload: dict):
         # a part that decoded to nothing would leave the whole message forever incomplete.
         if segment:
             ref, total, seq = segment
+            # A part can arrive long after its group was flushed incomplete (ten minutes
+            # measured between segment 1 and segment 2 of one text crossing two networks).
+            # Buffering it again would publish a second fragment of a message the thread
+            # already shows, so it is folded back into that message first.
+            late = await asyncio.to_thread(store.merge_late_sms_segment, iid, sender, ref,
+                                           total, seq, text)
+            if late is not None:
+                if late["duplicate"]:
+                    log.info("ignoring a repeat of part %d/%d from %s (ref %d) already in "
+                             "message %d", seq, total, sender, ref, late["message_id"])
+                    return {"ok": True, "merged": "duplicate"}
+                merged = _join_sms_parts(late["bodies"], late["seqs"], total)
+                rec = await asyncio.to_thread(store.set_message_body, late["message_id"],
+                                              merged)
+                log.info("late part %d/%d from %s (ref %d) merged into message %d — %s",
+                         seq, total, sender, ref, late["message_id"],
+                         "now complete" if late["complete"]
+                         else f"{len(late['seqs'])}/{total} parts")
+                if rec:
+                    await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+                return {"ok": True, "merged": f"{len(late['seqs'])}/{total}"}
             parts = await asyncio.to_thread(store.add_sms_segment, iid, sender, ref, total,
                                             seq, text)
             if parts is None:
@@ -6113,7 +6322,7 @@ def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):
     wh = settings.get("webhook") or {}
     tg = settings.get("telegram") or {}
     pp = settings.get("pushplus") or {}
-    if not (wh.get("enabled") or tg.get("enabled") or pp.get("enabled")):
+    if not notify_push.has_enabled_channel(settings, event):
         return
     asyncio.create_task(
         asyncio.to_thread(notify_push.dispatch, settings, event, inst, source, text))

@@ -198,8 +198,10 @@ def validated_download_routes(proxy_url: str = "", *, route: str = "direct",
             continue
         candidate_url = str(item.get("proxy_url") or "")
         network_environment(candidate_url)
+        route = str(item.get("route") or "")
         clean.append({"proxy_url": candidate_url,
-                      "route": "library" if candidate_url else "direct",
+                      "route": route if candidate_url and route in {"library", "country"}
+                      else "library" if candidate_url else "direct",
                       "route_name": str(item.get("route_name") or "")[:120]})
     if not clean:
         raise UpdateError("no usable update download route")

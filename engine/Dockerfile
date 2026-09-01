@@ -55,6 +55,19 @@ RUN cd /tmp && \
 
 # sysmocom pjproject + Asterisk (VoLTE/VoWiFi/IMS-AKA/SMS-over-IMS fork), identical to reference build
 COPY patches/asterisk/ /home/asterisk-build/patches/asterisk/
+# NOTE on the `menuselect --enable codec_opus` below: on aarch64 it is a no-op and always has
+# been. codec_opus has no source in the Asterisk tree — codecs/codecs.xml declares it
+# support_level=external, meaning `make install` shells out to build_tools/download_externals to
+# fetch a prebuilt binary from downloads.digium.com. That script gates on HOST_CPU and bails with
+# "External module downloading is not available for the ${HOST_CPU} platform. Only x86 based
+# platforms are currently supported." for anything that is not x86_64/i386/i686. The failure is
+# swallowed by the install loop in Makefile.moddir_rules, so the build stays green and simply
+# produces no codec_opus.so — confirmed empirically: `core show translation` has no opus column.
+# The flag is kept verbatim only to stay byte-identical to the upstream reference build command
+# (and it would start working for free on an x86_64 image). Since there is no opus transcoder,
+# opus has been removed from the endpoint allow lists in templates/pjsip.conf.j2; WebRTC calls
+# ride ulaw/alaw and transcode to AMR for the IMS leg. res_format_attr_opus.so is still kept in
+# asterisk-keep-modules.txt purely to parse opus fmtp lines in inbound SDP.
 RUN set -eu; \
     checkout_with_retry() { \
         url="$1"; destination="$2"; revision="$3"; attempt=1; \
@@ -108,6 +121,45 @@ RUN python3 -m pip install --no-cache-dir panoramisk==1.4
 RUN python3 -m pip install --no-cache-dir pyserial==3.5 pycryptodome==3.23.0 cryptography==50.0.0 \
     "git+https://github.com/mitshell/card.git@790a8fb0b8fbc0b06f568feba51aeef28352145e"
 
+# Ship only the modules this gateway can actually load. ORDER MATTERS: this layer must stay
+# ABOVE the closure derivation, which is the opposite of the strip/staging layer further down.
+# The closure is computed by running ldd over every modules/*.so, so a module that is never
+# loaded still drags its whole library closure into the runtime image — libicu (37 MB) rode in
+# on res_calendar_icalendar, lpcnetfreedv (15 MB) on codec_codec2, perl-libs + net-snmp (17 MB)
+# on res_snmp. modules.conf.j2 already noloads all three; noload just does not reach the disk.
+# Deleting here instead of disabling them in menuselect keeps the compile byte-identical to the
+# sysmocom reference build (we only choose what to ship, so a bug report is reproduced by not
+# deleting) and leaves the expensive compile layer above cached — only this layer, the closure
+# derivation and the strip layer rebuild. See asterisk-keep-modules.txt for the per-module
+# rationale; modules.conf.j2 keeps its noload list unchanged as defence in depth.
+# Fail fast in both directions: a keep-list entry that this Asterisk did not build is an error
+# (a renamed or silently unbuilt module must not become a missing module at runtime), and the
+# surviving file count must equal the keep-list length.
+COPY asterisk-keep-modules.txt /home/asterisk-build/asterisk-keep-modules.txt
+RUN set -eu; \
+    cd /usr/lib/asterisk/modules; \
+    sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' \
+      /home/asterisk-build/asterisk-keep-modules.txt | sort -u > /tmp/keep.list; \
+    expected=$(wc -l < /tmp/keep.list | tr -d ' '); \
+    missing=''; \
+    while IFS= read -r module; do \
+      [ -f "$module" ] || missing="$missing $module"; \
+    done < /tmp/keep.list; \
+    if [ -n "$missing" ]; then \
+      echo "keep-list names modules this Asterisk did not build:$missing" >&2; \
+      exit 1; \
+    fi; \
+    for module in *.so; do \
+      grep -qxF "$module" /tmp/keep.list || rm -f "$module"; \
+    done; \
+    remaining=$(ls -1 *.so | wc -l | tr -d ' '); \
+    if [ "$remaining" -ne "$expected" ]; then \
+      echo "expected $expected modules after pruning, found $remaining" >&2; \
+      exit 1; \
+    fi; \
+    rm -f /tmp/keep.list; \
+    echo "asterisk modules kept: $remaining"
+
 # Derive the Fedora runtime package closure from the binary we just built and every Asterisk
 # module we ship. This keeps all codecs and optional modules loadable without carrying compilers,
 # headers or source trees into the final image. Packages needed by the Python tunnel and its shell
@@ -133,6 +185,36 @@ RUN set -eu; \
         done; \
     } | sort -u > /runtime-packages.txt
 
+# Shrink what the runtime stage copies. Three independent reductions, kept in one layer at the
+# very end of the build stage so they cannot invalidate the expensive compile layers above, and
+# placed after the closure derivation because none of them changes an ldd dependency:
+#   1. Strip debug symbols. The shipped image is not a debugging target — a crash is reproduced
+#      by rebuilding the same pinned commits with symbols intact. --strip-unneeded keeps .dynsym,
+#      so dlopened modules still resolve against each other and against the main binary.
+#   2. Stage the individually copied libraries under /stage. A per-file
+#      `COPY --from=build /usr/lib/libasteriskpj.so` dereferences the symlink and stores a second
+#      full copy of the library; copying a *directory* preserves the link as a link. cp -a decides
+#      which name is the real file, so the final layout is whatever the build produced.
+#   3. Delete make-install trees this gateway never reads: no template renders musiconhold.conf
+#      (pjsip.conf.j2 sets moh_passthrough=yes, which hands MOH to the peer) and http.conf.j2 never
+#      enables the static server. documentation/ MUST stay: core-en_US.xml is not just CLI help —
+#      Stasis registers its ACO config types against it at startup and hard-exits without it
+#      ("Cannot update type ... no existing documentation! ... ASTERISK EXITING!").
+#      Bundled prompts live in /var/lib/asterisk/mdd-sounds (render.py), so sounds/ stays.
+RUN set -eu; \
+    strip /usr/sbin/asterisk; \
+    find /usr/lib/asterisk/modules -type f -name '*.so' -exec strip --strip-unneeded {} +; \
+    for library in /usr/lib/libasteriskpj.so* /usr/lib/libasteriskssl.so*; do \
+      if [ -f "$library" ] && [ ! -L "$library" ]; then strip --strip-unneeded "$library"; fi; \
+    done; \
+    rm -rf /var/lib/asterisk/moh /var/lib/asterisk/static-http; \
+    mkdir -p /stage/usr/lib /stage/usr/lib64; \
+    cp -a /usr/lib/libasteriskpj.so /usr/lib/libasteriskpj.so.2 \
+          /usr/lib/libasteriskssl.so /usr/lib/libasteriskssl.so.1 /stage/usr/lib/; \
+    cp -a /usr/lib64/libpcsclite.so /usr/lib64/libpcsclite.so.1 \
+          /usr/lib64/libpcsclite_real.so /usr/lib64/libpcsclite_real.so.1 /stage/usr/lib64/; \
+    ls -la /stage/usr/lib /stage/usr/lib64
+
 FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898 AS runtime
 
 COPY --from=build /runtime-packages.txt /tmp/runtime-packages.txt
@@ -148,15 +230,9 @@ RUN dnf -y --refresh --setopt=fastestmirror=True --setopt=max_parallel_downloads
 # continues to match the host pcscd protocol exactly.
 COPY --from=build /usr/sbin/asterisk /usr/sbin/asterisk
 COPY --from=build /usr/lib/asterisk/ /usr/lib/asterisk/
-COPY --from=build /usr/lib/libasteriskpj.so /usr/lib/libasteriskpj.so
-COPY --from=build /usr/lib/libasteriskpj.so.2 /usr/lib/libasteriskpj.so.2
-COPY --from=build /usr/lib/libasteriskssl.so /usr/lib/libasteriskssl.so
-COPY --from=build /usr/lib/libasteriskssl.so.1 /usr/lib/libasteriskssl.so.1
+COPY --from=build /stage/usr/lib/ /usr/lib/
 COPY --from=build /var/lib/asterisk/ /var/lib/asterisk/
-COPY --from=build /usr/lib64/libpcsclite.so /usr/lib64/libpcsclite.so
-COPY --from=build /usr/lib64/libpcsclite.so.1 /usr/lib64/libpcsclite.so.1
-COPY --from=build /usr/lib64/libpcsclite_real.so /usr/lib64/libpcsclite_real.so
-COPY --from=build /usr/lib64/libpcsclite_real.so.1 /usr/lib64/libpcsclite_real.so.1
+COPY --from=build /stage/usr/lib64/ /usr/lib64/
 COPY --from=build /usr/local/ /usr/local/
 RUN mkdir -p /var/cache/asterisk /var/log/asterisk /var/spool/asterisk && ldconfig && \
     missing=0; \

@@ -75,6 +75,24 @@ class RequestApplyTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(os.path.exists(self.request_path))
 
+    def test_selected_test_version_is_resolved_before_request_is_published(self):
+        selected = {**_AVAILABLE, "latest": "9.9.9-rc1", "prerelease": True,
+                    "network": {"proxy_mode": "direct", "proxy_profile_id": ""}}
+        with patch.object(update_check, "check_release", return_value=selected) as lookup:
+            result = update_check.request_apply(version="9.9.9-rc1")
+        self.assertTrue(result["ok"])
+        lookup.assert_called_once_with("9.9.9-rc1", allow_prerelease=True,
+                                       allow_older=True)
+        with open(self.request_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["version"], "9.9.9-rc1")
+
+    def test_invalid_selected_version_is_rejected_without_lookup(self):
+        with patch.object(update_check, "check_release") as lookup:
+            result = update_check.request_apply(version="../../main")
+        self.assertEqual(result["error_code"], "update.error.invalid_version")
+        lookup.assert_not_called()
+        self.assertFalse(os.path.exists(self.request_path))
+
     def test_running_update_is_not_requested_twice(self):
         os.makedirs(os.path.dirname(self.status_path))
         with open(self.status_path, "w", encoding="utf-8") as handle:
@@ -642,6 +660,33 @@ class UpdaterTests(unittest.TestCase):
 
 
 class OrchestratorUpdateTests(unittest.TestCase):
+    def test_country_exit_is_resolved_as_a_named_update_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            root = data / "orchestrator"
+            root.mkdir()
+            (root / "update-request.json").write_text(json.dumps({
+                "version": "9.9.9", "repository": "MddIdd/mdd-sim-gateway",
+                "network": {"proxy_mode": "country", "proxy_country": "us"},
+            }), encoding="utf-8")
+            (root / "desired.json").write_text(json.dumps({"proxy": {
+                "profiles": {"primary": {"name": "Primary", "type": "node"}},
+                "exits": {"us": {"enabled": True, "profile_id": "primary"}},
+            }}), encoding="utf-8")
+            (root / "proxy-status.json").write_text(json.dumps({"exits": {"us": {
+                "ready": True, "proxy_host": mdd_orchestrator.COUNTRY_PROXY_LISTEN,
+                "proxy_port": 22538,
+            }}}), encoding="utf-8")
+            app = mdd_orchestrator.Orchestrator(data, Path(__file__).resolve().parent.parent)
+            completed = type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            with patch.object(app, "service_active", return_value=False), \
+                    patch.object(mdd_orchestrator, "run", return_value=completed):
+                app.process_update_request()
+            route = json.loads((data / "update/network.json").read_text())
+        self.assertEqual(route["proxy_url"],
+                         f"socks5h://{mdd_orchestrator.COUNTRY_PROXY_LISTEN}:22538")
+        self.assertEqual((route["route"], route["route_name"]), ("country", "US"))
+
     def test_library_proxy_is_resolved_into_private_file_not_command_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)

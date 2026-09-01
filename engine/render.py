@@ -321,6 +321,12 @@ def main():
         # before it silently ages out (3GPP TS 24.302 7.2.2C). Set by the manager from
         # settings.rekey.minutes (default 30); hand-authored configs may omit it.
         put("SWU_CHILD_REKEY_MINUTES", cfg.get("rekey_minutes", 30))
+        # Proactive IKE-SA rekey period (minutes; 0 = disabled). The engine only supports the
+        # initiator role for an IKE rekey, so this clock must beat the carrier's own session
+        # lifetime (giffgaff/O2 UK ages a SWu session out silently at ~2h50m; EE at ~12h).
+        # Set by the manager from settings.rekey.ike_minutes / inst.ike_rekey_minutes; the
+        # engine's own fallback for hand-authored configs stays at 600.
+        put("SWU_IKE_REKEY_MINUTES", cfg.get("ike_rekey_minutes", 150))
         # Accept an ePDG-initiated ESP rekey in place instead of refusing it and letting the
         # tunnel be re-established. Off by default: the key-direction inversion it depends on
         # (RFC 7296 2.17, responder side) cannot be verified without a carrier that initiates
