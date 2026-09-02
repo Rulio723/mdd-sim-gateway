@@ -9,6 +9,7 @@ import AllowancePanel from './AllowancePanel.jsx'
 // lives on the device page and is deliberately not repeated here.
 
 const DAY = 86400
+const KEEPALIVE_MAX_INTERVAL_DAYS = 365
 
 const fmtDate = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString() : '—')
 const fmtDateTime = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : '—')
@@ -95,7 +96,7 @@ function KeepaliveForm({ line, onSaved, showToast }) {
     <div className="u-form-grid" style={{ marginTop: 10 }}>
       <div>
         <label>{t('Then every (days)')}</label>
-        <input type="number" min="1" max="90" value={draft.interval_days}
+        <input type="number" min="1" max={KEEPALIVE_MAX_INTERVAL_DAYS} value={draft.interval_days}
           onChange={e => set({ interval_days: Number(e.target.value) })} />
       </div>
       <div />

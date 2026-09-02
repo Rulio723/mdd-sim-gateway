@@ -11,11 +11,42 @@
 # lower than the cost of a miss (a subscriber identifier published irrevocably).
 #
 # Usage: tools/check-subscriber-identifiers.sh [path...]   (default: git-tracked source files)
+#        tools/check-subscriber-identifiers.sh --commits <git rev-list arguments...>
+#
+# The --commits form scans every blob those commits introduce, which is what hooks/pre-push
+# uses. Scanning the working tree is not enough before a push: a value that was committed and
+# then removed is still in the history being published, and a push cannot be taken back.
 set -eu
 
 cd "$(dirname "$0")/.."
 
-if [ "$#" -gt 0 ]; then
+scanned_extensions() {
+    case "$1" in
+        *.py|*.js|*.jsx|*.sh|*.md|*.yml|*.yaml|*.json) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+tmp=""
+if [ "${1:-}" = "--commits" ]; then
+    shift
+    [ "$#" -gt 0 ] || { echo "--commits needs at least one revision" >&2; exit 2; }
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT INT TERM
+    # rev-list --objects lists trees as well as blobs, and the same path can appear at several
+    # blobs across the range -- each is a separate published version and each gets scanned.
+    git rev-list --objects "$@" | while read -r object path; do
+        [ -n "$path" ] || continue
+        scanned_extensions "$path" || continue
+        [ "$path" = "webui/package-lock.json" ] && continue
+        [ "$(git cat-file -t "$object" 2>/dev/null)" = blob ] || continue
+        destination="$tmp/$object/$path"
+        mkdir -p "$(dirname "$destination")"
+        git cat-file blob "$object" > "$destination"
+        printf '%s\n' "$destination"
+    done > "$tmp/.files"
+    files=$(cat "$tmp/.files")
+elif [ "$#" -gt 0 ]; then
     files=$(printf '%s\n' "$@")
 else
     files=$(git ls-files '*.py' '*.js' '*.jsx' '*.sh' '*.md' '*.yml' '*.yaml' '*.json' \
@@ -45,6 +76,20 @@ report() {
 #   ^447785016005    Vodafone UK's published SMSC -- carrier infrastructure, not a subscriber
 fictional='0{6,}|123456789|^123456|^00101|^35000000|^490154203237518|^44770090|^1([0-9]{3})?555|^447785016005'
 
+display() {
+    # A blob extracted for --commits lives at $tmp/<object>/<path>; report it as the path it
+    # has in the tree, with the object it came from, so the offending commit can be found.
+    case "${tmp:-}" in
+        "") printf '%s' "$1"; return ;;
+    esac
+    case "$1" in
+        "$tmp"/*)
+            rest=${1#"$tmp"/}
+            printf '%s (blob %s)' "${rest#*/}" "$(printf '%s' "${rest%%/*}" | cut -c1-7)" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 scan() {
     # $1 = regex for the identifier, $2 = label
     matches=""
@@ -58,7 +103,7 @@ scan() {
             # Compare on digits alone: the allow-list anchors with '^', which a leading
             # '+' would otherwise defeat.
             printf '%s' "$value" | tr -d '+' | grep -qE "$fictional" && continue
-            matches="$matches  $f:$line: $value
+            matches="$matches  $(display "$f"):$line: $value
 "
         done
     done

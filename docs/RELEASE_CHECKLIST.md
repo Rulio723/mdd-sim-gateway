@@ -9,7 +9,7 @@
   `SHA256SUMS` 同时覆盖源码包和四个镜像。发布前分别用 `docker load` 验证架构、版本 label
   与 `VERSION` 一致；不得只发源码包或漏发一个架构。
 - Release 工作流必须分别在原生 `ubuntu-24.04-arm` 与 `ubuntu-latest` runner 无缓存构建
-  Engine，通过架构、各自的精确模块数（ARM64 334、amd64 336）、Python 依赖和 Asterisk
+  Engine，通过架构、各自的精确模块数（ARM64、amd64 均为 126）、Python 依赖和 Asterisk
   版本检查，并把架构标签合成为
   `ghcr.io/mddidd/mdd-sim-gateway-engine:vX.Y.Z` 多架构清单；package job 必须等待两种
   Engine 与两种 Control 资产均成功。

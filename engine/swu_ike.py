@@ -492,6 +492,16 @@ def requests_permanent_eap_identity(attributes):
     )
 
 
+def build_eap_identity_response(identifier, identity):
+    """EAP-Response/Identity (RFC 3748 §5.1): the Type-Data is the bare NAI,
+    with none of EAP-AKA's attribute framing."""
+    identity_bytes = identity.encode()
+    return (bytes([EAP_RESPONSE, identifier])
+            + struct.pack('!H', 5 + len(identity_bytes))
+            + bytes([EAP_IDENTITY])
+            + identity_bytes)
+
+
 #states
 OK =                            0
 TIMEOUT =                       1
@@ -806,6 +816,7 @@ EAP_SUCCESS  = 3
 EAP_FAILURE  = 4
 
 #IANA EAP Type
+EAP_IDENTITY = 1
 EAP_AKA = 23
 
 #EAP-AKA/EAP-SIM Subtypes:
@@ -4238,6 +4249,7 @@ class swu():
             return TIMEOUT,'TIMEOUT'
 
         eap_received = False
+        eap_summary = None
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
             print('received IKE_AUTH (1)')             
             for i in self.decoded_payload[0][1]:
@@ -4265,7 +4277,23 @@ class swu():
                         return OTHER_ERROR,str(code)
 
                 elif i[0] == EAP:
-                    if i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
+                    eap_summary = 'code=%s type=%s' % (i[1][0], i[1][2] if len(i[1]) > 2 else '-')
+                    if i[1][0] in (EAP_REQUEST,) and i[1][2] == EAP_IDENTITY:
+                        # Lebara UK's ePDG (234-87) opens with a bare RFC 3748
+                        # EAP-Request/Identity before starting EAP-AKA (issue #43);
+                        # answer with the NAI and resend, like the AKA-Identity path.
+                        self.eap_identifier = i[1][1]
+                        identity = (
+                                '0'
+                                + self.imsi
+                                + '@nai.epc.mnc' + self.mnc
+                                + '.mcc' + self.mcc
+                                + '.3gppnetwork.org'
+                        )
+                        self.eap_payload_response = build_eap_identity_response(self.eap_identifier, identity)
+                        return REPEAT_STATE,'EAP IDENTITY REQUESTED'
+
+                    elif i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
                         if i[1][3] in (AKA_Challenge, AKA_Reauthentication):
                             
                             eap_received = True
@@ -4402,6 +4430,9 @@ class swu():
 
             if eap_received == True:
                 return OK,''               
+            elif eap_summary is not None:
+                # An EAP payload WAS present — we just don't handle this method.
+                return MANDATORY_INFORMATION_MISSING,'UNHANDLED EAP PAYLOAD (%s)' % eap_summary
             else:
                 return MANDATORY_INFORMATION_MISSING,'NO EAP PAYLOAD RECEIVED'              
             

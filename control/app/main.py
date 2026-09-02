@@ -5289,6 +5289,7 @@ async def api_allowance_query(iid: str, body: dict):
 
 # ----------------------------- Number keeping -----------------------------
 KEEPALIVE_ACTIONS = {"sms", "balance_watch"}
+KEEPALIVE_MAX_INTERVAL_DAYS = 365
 
 
 def _local_tz() -> ZoneInfo:
@@ -5341,8 +5342,9 @@ def _clean_keepalive(body: dict) -> dict:
         interval = 30 if raw_interval in (None, "") else int(raw_interval)
     except (TypeError, ValueError):
         raise HTTPException(422, "interval_days must be a number") from None
-    if not 1 <= interval <= 90:
-        raise HTTPException(422, "interval_days must be between 1 and 90")
+    if not 1 <= interval <= KEEPALIVE_MAX_INTERVAL_DAYS:
+        raise HTTPException(
+            422, f"interval_days must be between 1 and {KEEPALIVE_MAX_INTERVAL_DAYS}")
     enabled = 1 if body.get("enabled") else 0
     sms_to = str(body.get("sms_to") or "").strip()
     sms_body = str(body.get("sms_body") or "").strip()

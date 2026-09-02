@@ -125,6 +125,18 @@ class KeepaliveConfigApiTests(unittest.TestCase):
         self.assertEqual(
             self._save({"enabled": True, "action": "balance_watch"})["interval_days"], 30)
 
+    def test_long_carrier_keepalive_intervals_are_accepted_and_bounded(self):
+        # Some carriers keep a prepaid number alive for 180 days. Leave room for annual
+        # policies as well, while retaining a finite API guard against nonsensical values.
+        for value in (180, main.KEEPALIVE_MAX_INTERVAL_DAYS):
+            record = self._save({"enabled": True, "action": "balance_watch",
+                                 "interval_days": value})
+            self.assertEqual(record["interval_days"], value)
+        with self.assertRaises(Exception) as caught:
+            self._save({"enabled": True, "action": "balance_watch",
+                        "interval_days": main.KEEPALIVE_MAX_INTERVAL_DAYS + 1})
+        self.assertEqual(getattr(caught.exception, "status_code", None), 422)
+
     def test_watching_a_balance_needs_no_recipient(self):
         record = self._save({"enabled": True, "action": "balance_watch", "threshold": "10"})
         self.assertEqual(record["action"], "balance_watch")

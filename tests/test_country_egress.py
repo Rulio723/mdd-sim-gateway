@@ -152,6 +152,36 @@ class PastedNodeTests(unittest.TestCase):
         self.assertEqual(outbound["settings"]["vnext"][0]["users"][0]["packetEncoding"],
                          "xudp")
 
+    def _packet_encoding(self, node):
+        return xray_outbound(node, "out-one")["settings"]["vnext"][0]["users"][0][
+            "packetEncoding"]
+
+    def test_a_node_that_declares_a_packet_encoding_keeps_it(self):
+        """packetEncoding decides how UDP rides the VLESS connection, so the node decides.
+
+        The tunnel these exits carry is IKEv2/ESP on UDP 500 and 4500. A server that speaks
+        packetaddr and is handed xudp does not fail loudly — UDP simply stops arriving, the
+        tunnel never comes up, and the failover logic goes looking for a reason on the SIM
+        side. Defaulting to xudp is right; overwriting a declared value with it is not, and
+        nothing else in the suite would notice if the default were hardcoded.
+        """
+        node = parse_share_link(
+            "vless://uuid-3@r.example.net:443?security=reality&type=tcp"
+            "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=0123")
+        node["packet-encoding"] = "packetaddr"
+        self.assertEqual(self._packet_encoding(node), "packetaddr")
+
+    def test_a_node_with_no_packet_encoding_falls_back_to_xudp(self):
+        # Both the parser (no packetEncoding in the link) and the builder (an empty value on
+        # the node) have to land on the same default, or a link and a hand-edited profile
+        # would behave differently for the same node.
+        node = parse_share_link(
+            "vless://uuid-4@r.example.net:443?security=reality&type=tcp"
+            "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=0123")
+        self.assertEqual(self._packet_encoding(node), "xudp")
+        node["packet-encoding"] = ""
+        self.assertEqual(self._packet_encoding(node), "xudp")
+
     def test_xhttp_profile_is_bridged_through_loopback_socks(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)

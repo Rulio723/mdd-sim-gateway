@@ -1,0 +1,73 @@
+#!/bin/sh
+# Refuse to publish a real subscriber identifier.
+#
+# CI runs the same check, but by the time it reports, the value is already public: a push
+# cannot be taken back, and rewriting the branch afterwards still leaves the object reachable
+# by its SHA for a while. This hook is the last point where the check is free.
+#
+# It scans the commits being pushed, not the working tree. That distinction is the whole
+# reason this exists: a value that was committed and then removed no longer appears in any
+# file, yet the push still publishes the blob that holds it -- which is exactly how a real
+# MSISDN once reached an open pull request with a clean-looking tree behind it.
+#
+# Enable with:  git config core.hooksPath hooks
+set -eu
+
+# Hooks run from the repository root, but say so explicitly: a worktree or a future caller
+# should not decide whether the checker is found.
+cd "$(git rev-parse --show-toplevel)"
+
+# Invoked through sh on purpose. Scripts in tools/ are tracked without the executable bit --
+# the same reason ci.yml calls this one that way -- so executing it directly fails with
+# "Permission denied" everywhere the filesystem does not invent a mode for it.
+checker="sh tools/check-subscriber-identifiers.sh"
+
+remote=${1:-origin}
+empty=0000000000000000000000000000000000000000
+status=0
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    # A deletion publishes nothing.
+    [ "$local_sha" = "$empty" ] && continue
+
+    if [ "$remote_sha" = "$empty" ]; then
+        # A new branch: everything it carries that the remote does not already have. Using
+        # --remotes rather than the default branch keeps the scan to what is genuinely new,
+        # so pushing a long-lived branch does not re-scan the whole history every time.
+        set -- "$local_sha" --not --remotes="$remote/*"
+    else
+        set -- "$remote_sha..$local_sha"
+    fi
+
+    if $checker --commits "$@" >/dev/null 2>&1; then
+        continue
+    fi
+
+    # Re-run without swallowing the output so the operator sees which value and which blob.
+    # A refusal belongs on stderr; the checker reports on stdout, so redirect it there.
+    $checker --commits "$@" >&2 && code=0 || code=$?
+    if [ "$code" = 1 ]; then
+        status=1                # the checker ran and found something
+    else
+        # Anything else means the check could not run. Refuse anyway -- an unverified push is
+        # the thing this hook exists to prevent -- but do not claim to have found a value.
+        echo "pre-push: the subscriber-identifier check could not run (exit $code)" >&2
+        status=2
+    fi
+done
+
+if [ "$status" = 1 ]; then
+    cat >&2 <<'MESSAGE'
+
+push refused: the commits above carry a subscriber identifier this check cannot recognise as
+fictional. Fixing the working tree is not enough -- the value is in the history being pushed,
+so amend or rebase the commits that introduce it, then push again.
+
+If the value is genuinely fictional, add it to the allow-list in
+tools/check-subscriber-identifiers.sh with the reason it is safe.
+MESSAGE
+    exit 1
+elif [ "$status" -ne 0 ]; then
+    echo "push refused: nothing was verified, so nothing is known to be safe to publish." >&2
+    exit 1
+fi

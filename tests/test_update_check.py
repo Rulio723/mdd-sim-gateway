@@ -226,11 +226,18 @@ class UpdateCheckTests(unittest.TestCase):
         policy = __import__("json").loads(
             (Path(__file__).resolve().parents[1] / "update-policy.json").read_text())
         self.assertEqual(policy["auto_update"], policy["channels"]["all"])
+        all_version = policy["channels"]["all"]["version"]
         self.assertEqual(
             update_check._policy_target(
-                policy, "all", policy["release"]["version"]),
-            policy["channels"]["all"]["version"],
+                policy, "all", all_version),
+            all_version,
         )
+        if policy["release"]["version"] != all_version:
+            self.assertEqual(
+                update_check._policy_target(
+                    policy, "all", policy["release"]["version"]),
+                "",
+            )
         self.assertEqual(
             update_check._policy_target(
                 policy, "main", policy["release"]["version"]),
