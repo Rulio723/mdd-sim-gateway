@@ -137,38 +137,45 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   // re-enumerates two identical readers in a different order.
   const portForIdx = (i) => (cards.find((c) => c.index === i) || {}).reader_port || ''
 
+  const applyCard = (c) => {
+    setCard(c)
+    if (!c.present) {
+      setPinMsg(t('No SIM card in this reader.'))
+      return
+    }
+    const patch = { imsi: c.imsi || form.imsi, mcc: c.mcc || form.mcc, mnc: c.mnc || form.mnc }
+    if (c.smsc && smscMode === 'auto') patch.smsc = c.smsc   // SMSC from the SIM (EF_SMSP)
+    if (c.imsi) patch.reader = `imsi:${c.imsi}`
+    // Bind the line to the reader's stable physical USB port (from the detected card, else the
+    // live monitor). Persisted so start-time re-resolves the correct index for this socket.
+    const port = c.reader_port || portForIdx(readerIdx())
+    if (port) patch.reader_port = port
+    if (!form.id) patch.id = nextInstanceId(instances)
+    upd(patch)
+    if (c.imsi) setPinMsg(t('Card read.'))
+    else if (c.error) setPinMsg(t('Card error: {error}', { error: c.error }))
+    else setPinMsg(t('Card present; enter PIN to read IMSI. ICCID {iccid}, {tries} tries left.', { iccid: c.iccid || '?', tries: c.pin_tries ?? '?' }))
+  }
+
   const detect = async () => {
     setPinMsg(t('Detecting…'))
     try {
-      const c = await api.detect(readerIdx())
-      setCard(c)
-      if (!c.present) {
-        setPinMsg(t('No SIM card in this reader.'))
-        return
-      }
-      const patch = { imsi: c.imsi || form.imsi, mcc: c.mcc || form.mcc, mnc: c.mnc || form.mnc }
-      if (c.smsc && smscMode === 'auto') patch.smsc = c.smsc   // SMSC from the SIM (EF_SMSP)
-      if (c.imsi) patch.reader = `imsi:${c.imsi}`
-      // Bind the line to the reader's stable physical USB port (from the detected card, else the
-      // live monitor). Persisted so start-time re-resolves the correct index for this socket.
-      const port = c.reader_port || portForIdx(readerIdx())
-      if (port) patch.reader_port = port
-      if (!form.id) patch.id = nextInstanceId(instances)
-      upd(patch)
-      setPinMsg(c.imsi ? t('Card read.') : t('Card present; enter PIN to read IMSI. ICCID {iccid}, {tries} tries left.', { iccid: c.iccid || '?', tries: c.pin_tries ?? '?' }))
+      applyCard(await api.detect(readerIdx()))
     } catch (e) { setPinMsg(`${t('Error')}: ${e.message}`) }
   }
 
   const verifyPin = async () => {
     setPinMsg(t('Verifying…'))
     try {
-      const r = await api.verifyPin(pin, readerIdx())
-      setPinMsg(r.ok ? t('PIN OK ✓') : t('PIN failed: {error} ({tries} tries left)', { error: r.error, tries: r.tries }))
+      const r = await api.verifyPin(pin, readerIdx(), readers[readerIdx()], portForIdx(readerIdx()))
       if (r.ok) {
-        const p = { pin }
-        if (r.card?.smsc && smscMode === 'auto') p.smsc = r.card.smsc   // now-readable SMSC from SIM
-        upd(p)
-        await detect()
+        upd({ pin })
+        // The backend already re-read the card with the PIN in the same request (r.card).
+        // Re-detecting here would open a fresh no-PIN connection and lock the card again.
+        if (r.card) applyCard(r.card)
+        setPinMsg(t('PIN OK ✓'))
+      } else {
+        setPinMsg(t('PIN failed: {error} ({tries} tries left)', { error: r.error, tries: r.tries }))
       }
     } catch (e) { setPinMsg(`${t('Error')}: ${e.message}`) }
   }
@@ -196,8 +203,8 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         setCreating(false)
         setSelected(String(res.instance.id))
       }
-      // A running line is restarted server-side to apply the new config (pjsip accounts,
-      // IMEI, SMSC, User-Agent…); a stopped line just saves.
+      // Runtime configuration changes restart a running line server-side so Asterisk/IKE can
+      // apply them. A display-name-only edit is metadata and saves without interrupting it.
       setPinMsg(t(creating ? 'Line created and starting…' : res?.applied ? 'Saved — restarting the line to apply changes…' : 'Saved.'))
     } catch (e) { alert(e.message) }
     setSaving(false)

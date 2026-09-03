@@ -172,12 +172,16 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["update_available"])
 
-    def test_manual_release_list_exposes_latest_stable_and_published_tests(self):
+    def test_manual_release_list_exposes_five_latest_stable_and_published_tests(self):
         payload = [
             {"tag_name": "v1.7.0-rc2", "prerelease": True, "body": "test two"},
             {"tag_name": "v1.7.0-rc1", "prerelease": True, "body": "test one"},
-            {"tag_name": "v1.6.0", "prerelease": False, "body": "stable"},
-            {"tag_name": "v1.5.0", "prerelease": False, "body": "old stable"},
+            {"tag_name": "v1.6.4", "prerelease": False, "body": "stable five"},
+            {"tag_name": "v1.6.3", "prerelease": False, "body": "stable four"},
+            {"tag_name": "v1.6.2", "prerelease": False, "body": "stable three"},
+            {"tag_name": "v1.6.1", "prerelease": False, "body": "stable two"},
+            {"tag_name": "v1.6.0", "prerelease": False, "body": "stable one"},
+            {"tag_name": "v1.5.0", "prerelease": False, "body": "too old"},
             {"tag_name": "v1.8.0-dev", "prerelease": True, "draft": True},
         ]
         with patch("control.app.update_check.requests.Session.get",
@@ -185,7 +189,8 @@ class UpdateCheckTests(unittest.TestCase):
             result = update_check.releases(True)
         self.assertTrue(result["ok"])
         self.assertEqual([item["latest"] for item in result["releases"]],
-                         ["1.7.0-rc2", "1.7.0-rc1", "1.6.0"])
+                         ["1.7.0-rc2", "1.7.0-rc1", "1.6.4", "1.6.3", "1.6.2",
+                          "1.6.1", "1.6.0"])
         self.assertTrue(result["releases"][0]["prerelease"])
         self.assertFalse(result["releases"][-1]["prerelease"])
 

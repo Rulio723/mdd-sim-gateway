@@ -97,6 +97,28 @@ class UniquenessTests(unittest.TestCase):
 
 @unittest.skipIf(main is None, "manager runtime dependencies are unavailable")
 class RenameApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_running_line_rename_does_not_restart_its_engine(self):
+        with TempConfig() as cfg_temp:
+            before = cfg_temp.add("1", "Old name", mcc="234", mnc="010")
+            with patch.object(main.engine, "is_running", return_value=True), \
+                    patch.object(main, "_start_engine_checked") as restart, \
+                    patch.object(main.egress, "publish") as publish:
+                # The WebUI submits the complete form, not a special rename request. The server
+                # must identify the effective persisted diff rather than trusting payload shape.
+                renamed = await main.api_instance_upsert({**before, "name": "New name"})
+
+        self.assertEqual(renamed["name"], "New name")
+        self.assertFalse(renamed["applied"])
+        restart.assert_not_called()
+        publish.assert_called_once_with()
+        self.assertTrue(main._only_instance_name_changed(
+            before, {**before, "name": "New name"}))
+
+    def test_an_operational_edit_is_not_treated_as_a_rename(self):
+        before = {"id": "1", "name": "Old name", "proxy_country": "gb"}
+        self.assertFalse(main._only_instance_name_changed(
+            before, {**before, "name": "New name", "proxy_country": "us"}))
+
     async def test_renaming_onto_another_lines_name_is_refused(self):
         from fastapi import HTTPException
         with TempConfig() as cfg_temp:

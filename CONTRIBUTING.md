@@ -4,13 +4,31 @@ Open an issue before a large behavior or hardware change. Keep device operations
 
 ## Branches
 
-Open pull requests against `develop`. It is the integration branch: changes collect there, get
-reviewed and are released together, so `main` always describes what has actually been published
-and a released version can be read straight off it.
+`develop` is the integration branch. Create a focused `feat/*` or `fix/*` branch from its latest
+commit and open the pull request back to `develop`. Changes collect there, get reviewed and are
+released together; do not merge each completed feature separately to `main`.
 
-`main` takes only release merges, which are then tagged `vX.Y.Z` — the tag is what builds and
-publishes the images. A fix that has to reach users before the next release still goes through
-`develop` first; releasing is a merge and a tag, not a separate route.
+`main` describes what has actually been published and takes only release merges. Prepare a release
+on `release/vX.Y.Z` from `develop`, merge the latest `main` into that branch, and update `VERSION`,
+the WebUI package versions, `CHANGELOG.md`, the bilingual release notes, and the release
+classification in `update-policy.json`. Keep the installation channels on their last accepted
+version until the new release passes the real-device checks in `docs/RELEASE_CHECKLIST.md`.
+
+Open the release pull request against `main`. After its CI passes and it is merged, add a signed
+`vX.Y.Z` tag to the merge commit; that tag builds and publishes the release images. Verify the
+Release assets, checksums, and multi-architecture manifest, then merge `main` back into `develop`
+so the next change starts from the exact published history. Promote the update channels separately
+after ARM64 and amd64 acceptance.
+
+An urgent production fix may branch from `main` only when unreleased work on `develop` must not ship
+with it. Treat that hotfix as a release: test it in a pull request to `main`, version and tag it, and
+immediately merge the published result back into `develop`. Ordinary fixes still go through
+`develop`.
+
+CI runs for pull requests targeting `develop` or `main`, and once more after a merge lands on either
+protected branch. A branch push does not run the same matrix before its pull request, and a tag push
+does not start ordinary CI; `v*` tags use the dedicated Release workflow. Superseded runs for the
+same pull request are cancelled automatically.
 
 Enable the hooks once per clone:
 

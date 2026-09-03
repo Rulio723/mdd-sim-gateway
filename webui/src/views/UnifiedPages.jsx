@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { api } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 import SimConfig from './SimConfig.jsx'
@@ -348,6 +348,95 @@ function countryKeywords(code) {
   return [...new Set(values.filter(Boolean))]
 }
 
+function normalizeCountrySearch(value) {
+  return String(value || '').normalize('NFKD').replace(/\p{Diacritic}/gu, '').toLowerCase()
+}
+
+function countryMatchesSearch(code, query) {
+  const tokens = normalizeCountrySearch(query).trim().split(/\s+/).filter(Boolean)
+  if (!tokens.length) return true
+  // Search both languages regardless of the current UI locale. Operators often know a country
+  // by its English node name even while using the Chinese UI; the ISO code is the quickest path
+  // when they know neither localized spelling.
+  const haystack = normalizeCountrySearch([
+    code,
+    countryName(code, 'zh'),
+    countryName(code, 'en'),
+  ].join(' '))
+  return tokens.every(token => haystack.includes(token))
+}
+
+function SearchableCountrySelect({ countries, value, onChange, language, placeholder, noResults }) {
+  const [query, setQuery] = useState('')
+  const [open, setOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const rootRef = useRef(null)
+  const listId = useId()
+  const matching = useMemo(
+    () => countries.filter(code => countryMatchesSearch(code, query)),
+    [countries, query])
+
+  useEffect(() => { setActiveIndex(0) }, [query])
+  useEffect(() => {
+    if (!open || !matching.length) return
+    document.getElementById(`${listId}-${matching[activeIndex]}`)?.scrollIntoView({ block: 'nearest' })
+  }, [activeIndex, listId, matching, open])
+  useEffect(() => {
+    if (!open) return undefined
+    const close = event => {
+      if (!rootRef.current?.contains(event.target)) { setOpen(false); setQuery('') }
+    }
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [open])
+
+  const choose = code => {
+    onChange(code)
+    setQuery('')
+    setOpen(false)
+  }
+  const keyDown = event => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setOpen(true)
+      setActiveIndex(index => Math.min(index + (open ? 1 : 0), matching.length - 1))
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setOpen(true)
+      setActiveIndex(index => Math.max(index - 1, 0))
+    } else if (event.key === 'Home' && open) {
+      event.preventDefault(); setActiveIndex(0)
+    } else if (event.key === 'End' && open) {
+      event.preventDefault(); setActiveIndex(Math.max(0, matching.length - 1))
+    } else if (event.key === 'Enter' && open && matching[activeIndex]) {
+      event.preventDefault(); choose(matching[activeIndex])
+    } else if (event.key === 'Escape' && open) {
+      event.preventDefault(); setOpen(false); setQuery('')
+    }
+  }
+  const displayed = open ? query : (value ? countryLabel(value, language) : '')
+  return <div className="u-country-picker" ref={rootRef}>
+    <input role="combobox" aria-label={placeholder} aria-autocomplete="list" aria-expanded={open}
+      aria-controls={listId} aria-activedescendant={open && matching[activeIndex] ? `${listId}-${matching[activeIndex]}` : undefined}
+      value={displayed} placeholder={placeholder} autoComplete="off" spellCheck={false}
+      onFocus={() => { setQuery(''); setOpen(true); setActiveIndex(0) }}
+      onClick={() => { if (!open) { setQuery(''); setOpen(true); setActiveIndex(0) } }}
+      onChange={event => { setQuery(event.target.value); onChange(''); setOpen(true) }}
+      onKeyDown={keyDown} />
+    <span className="u-country-picker-arrow" aria-hidden="true">⌄</span>
+    {open && <div className="u-country-picker-list" id={listId} role="listbox">
+      {matching.map((code, index) => <button type="button" role="option"
+        id={`${listId}-${code}`} aria-selected={index === activeIndex} key={code}
+        className={index === activeIndex ? 'active' : ''}
+        onMouseEnter={() => setActiveIndex(index)}
+        onMouseDown={event => event.preventDefault()} onClick={() => choose(code)}>
+        {countryLabel(code, language)}
+      </button>)}
+      {!matching.length && <div className="u-country-picker-empty" role="status">{noResults}</div>}
+    </div>}
+  </div>
+}
+
 function formatBytes(value) {
   const n = Number(value || 0)
   if (n < 1024) return `${n} B`
@@ -525,7 +614,7 @@ export function EgressPage({ showToast }) {
           </div>}
       </div>
     })}</div>}
-    <div className="u-section-title"><div><h2>{t('Country exits')}</h2><p>{t('If no healthy UDP exit exists, only that SIM’s VoWiFi stops; 4G remains available.')}</p></div><div className="u-inline u-add-exit"><select value={newCountry} onChange={e => setNewCountry(e.target.value)}><option value="">{t('Select a country/region…')}</option>{available.map(code => <option key={code} value={code}>{countryLabel(code, language)}</option>)}</select><button className="btn btn-primary" disabled={!newCountry} onClick={addExit}>{t('+ Add')}</button></div></div>
+    <div className="u-section-title"><div><h2>{t('Country exits')}</h2><p>{t('If no healthy UDP exit exists, only that SIM’s VoWiFi stops; 4G remains available.')}</p></div><div className="u-inline u-add-exit"><SearchableCountrySelect countries={available} value={newCountry} onChange={setNewCountry} language={language} placeholder={t('Search countries/regions…')} noResults={t('No matching countries/regions')} /><button className="btn btn-primary" disabled={!newCountry} onClick={addExit}>{t('+ Add')}</button></div></div>
     {!Object.keys(proxy.exits || {}).length ? <Empty title={t('No country exits configured')} detail={t('Choose a country above, then configure its node source and keywords.')} /> : <div className="u-device-grid">{Object.entries(proxy.exits).map(([country, ex]) => {
       const st = live?.exits?.[country]
       const selected = profiles[ex.profile_id]

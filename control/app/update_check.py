@@ -25,6 +25,7 @@ _stars_cache: int | None = None
 _stars_checked_at = 0.0
 _STARS_CACHE_SECONDS = 15 * 60
 _MAX_RELEASE_NOTES_CHARS = 16_000
+_MANUAL_STABLE_RELEASE_LIMIT = 5
 # How long a "running" progress document may go unrefreshed before it stops counting as proof
 # that an update is alive. The orchestrator retires abandoned runs within a minute by asking
 # systemd whether the updater unit still exists; these are the control plane's own fallback for
@@ -310,9 +311,9 @@ def _release_result(payload: dict, selection: dict, repository_name: str,
 def releases(force: bool = False) -> dict:
     """List manually selectable Releases.
 
-    The latest stable Release is the normal channel target. Published GitHub prereleases are
-    exposed as test versions; drafts are never returned. Older stable releases are deliberately
-    omitted so this remains a channel switch rather than a general-purpose downgrade browser.
+    The five latest stable Releases are normal-version choices. Published GitHub prereleases are
+    exposed as test versions; drafts are never returned. Limiting the stable history keeps this
+    useful for recent rollback without turning it into a general-purpose downgrade browser.
     """
     global _releases_cache
     now = time.time()
@@ -335,7 +336,7 @@ def releases(force: bool = False) -> dict:
             payload = response.json()
             if not isinstance(payload, list):
                 raise ValueError("GitHub Releases response is not a list")
-            stable_seen = False
+            stable_count = 0
             choices = []
             for release in payload:
                 if not isinstance(release, dict) or release.get("draft"):
@@ -344,9 +345,9 @@ def releases(force: bool = False) -> dict:
                 if not re.fullmatch(r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?", version):
                     continue
                 prerelease = bool(release.get("prerelease"))
-                if not prerelease and stable_seen:
+                if not prerelease and stable_count >= _MANUAL_STABLE_RELEASE_LIMIT:
                     continue
-                stable_seen = stable_seen or not prerelease
+                stable_count += int(not prerelease)
                 item = _release_result(release, selection, repository_name)
                 # Manual channel switching may move to an older stable version, so equality —
                 # not semantic ordering — decides whether there is something to install.

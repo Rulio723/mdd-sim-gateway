@@ -93,15 +93,51 @@ def _hx(s: str):
     return [int(s[i:i + 2], 16) for i in range(0, len(s), 2)]
 
 
+def _xfr(conn, apdu: list[int]):
+    """Transmit one APDU, normalizing reader/protocol variance (issue #51). TPDU-level
+    T=0 readers answer case-4 commands with 61xx and expect an explicit GET RESPONSE;
+    APDU-level readers and T=1 hand back the data with 9000 directly. 6Cxx means
+    "wrong Le, retry with mine". Callers see one shape: (data, 0x90, 0x00) on success."""
+    data, sw1, sw2 = conn.transmit(apdu)
+    data = list(data)
+    while sw1 == 0x61:
+        more, sw1, sw2 = conn.transmit([0x00, 0xC0, 0x00, 0x00, sw2])
+        data += list(more)
+    if sw1 == 0x6C and sw2:
+        data, sw1, sw2 = conn.transmit(list(apdu[:4]) + [sw2])
+        data = list(data)
+    return data, sw1, sw2
+
+
+def _pin_body(pin: str) -> Optional[list[int]]:
+    """CHV1 is 4-8 digits, FF-padded to 8 bytes. None for anything else — an over-long
+    PIN would otherwise produce a negative pad and a corrupt VERIFY body."""
+    if not isinstance(pin, str) or not (4 <= len(pin) <= 8) or not pin.isdigit():
+        return None
+    return [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
+
+
 def swap_nibbles(s: str) -> str:
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
 
 def dec_imsi(ef_hex: str) -> Optional[str]:
+    """Decode EF_IMSI (TS 31.102 4.2.2): [len][parity nibble | BCD digits...]. Returns
+    None for anything that is not a plausible IMSI so a garbled read surfaces as a
+    failure instead of a bogus identity."""
     if len(ef_hex) < 4:
         return None
+    try:
+        length = int(ef_hex[0:2], 16)
+    except ValueError:
+        return None
+    if not (1 <= length <= 8):
+        return None
     swapped = swap_nibbles(ef_hex[2:]).rstrip("f")
-    return swapped[1:] if swapped else None
+    imsi = swapped[1:length * 2] if swapped else ""
+    if not (5 <= len(imsi) <= 15) or not imsi.isdigit():
+        return None
+    return imsi
 
 
 def dec_iccid(ef_hex: str) -> str:
@@ -117,16 +153,13 @@ USIM_AID_PREFIX = "A0000000871002"
 def _usim_aid_from_dir(conn) -> Optional[tuple[int, str]]:
     """Scan EF_DIR records for the USIM application's AID. Prefers the 3GPP USIM AID;
     falls back to the first application found. Returns (aid_len, aid_hex) or None."""
-    d, s1, s2 = conn.transmit(_hx("00a40004022f0000"))
-    if s1 != 0x61:
-        return None
-    fcp, s1, s2 = conn.transmit(_hx("00C00000") + [s2])
+    fcp, s1, s2 = _xfr(conn, _hx("00a40004022f0000"))
     if s1 != 0x90 or len(fcp) < 8:
         return None
     rec_len = fcp[7]
     first = None
     for rec in range(1, 11):
-        d, s1, s2 = conn.transmit(_hx("00b2") + [rec, 0x04, rec_len])
+        d, s1, s2 = _xfr(conn, _hx("00b2") + [rec, 0x04, rec_len])
         # record template: 61 <len> 4F <aidlen> <AID...> [50 <len> label]
         if s1 != 0x90 or len(d) < 5 or d[0] != 0x61 or d[2] != 0x4F:
             break
@@ -147,14 +180,13 @@ def _select_adf_usim(conn) -> bool:
     if not got:
         return False
     aid_len, aid = got
-    d, s1, s2 = conn.transmit(_hx("00a40404") + [aid_len] + _hx(aid))
-    return s1 == 0x61
+    d, s1, s2 = _xfr(conn, _hx("00a40404") + [aid_len] + _hx(aid))
+    return s1 == 0x90
 
 
 def _read_binary(conn, fid: str, length: int):
-    conn.transmit(_hx(f"00a4000402{fid}00"))
-    d, s1, s2 = conn.transmit(_hx(f"00b00000{length:02x}"))
-    return d, s1, s2
+    _xfr(conn, _hx(f"00a4000402{fid}00"))
+    return _xfr(conn, _hx(f"00b00000{length:02x}"))
 
 
 def _tlvs(data):
@@ -179,9 +211,7 @@ def _tlvs(data):
 
 def _read_transparent(conn, fid: str, max_length: int = 255) -> Optional[list[int]]:
     """Read one optional transparent EF under the selected ADF.USIM."""
-    selected, s1, s2 = conn.transmit(_hx(f"00a4000402{fid}00"))
-    if s1 == 0x61:
-        selected, s1, s2 = conn.transmit(_hx("00c00000") + [s2])
+    selected, s1, s2 = _xfr(conn, _hx(f"00a4000402{fid}00"))
     if s1 != 0x90:
         return None
     body = selected
@@ -195,9 +225,7 @@ def _read_transparent(conn, fid: str, max_length: int = 255) -> Optional[list[in
     if not size:
         return None
     size = min(size, max_length)
-    data, s1, s2 = conn.transmit(_hx("00b00000") + [size])
-    if s1 == 0x6C and s2:
-        data, s1, s2 = conn.transmit(_hx("00b00000") + [min(s2, max_length)])
+    data, s1, s2 = _xfr(conn, _hx("00b00000") + [size])
     return list(data) if s1 == 0x90 else None
 
 
@@ -278,10 +306,9 @@ def _read_smsc(conn) -> Optional[str]:
     and CHV1 verified (same as IMSI). Record layout (3GPP TS 31.102 4.2.27):
     [alpha(Y)][PI(1)][TP-DA(12)][TP-SC/SMSC(12)][PID][DCS][VP], Y = rec_len - 28.
     SMSC field = [len, TON/NPI, BCD digits...]."""
-    d, s1, s2 = conn.transmit(_hx("00a40004026f4200"))
-    if s1 != 0x61:
+    fcp, s1, s2 = _xfr(conn, _hx("00a40004026f4200"))
+    if s1 != 0x90:
         return None
-    fcp, s1, s2 = conn.transmit(_hx("00c00000") + [s2])
     # FCP is an outer template: 0x62 <len> <nested TLVs>. Descend into it, then find the
     # File-Descriptor tag 0x82 whose bytes 3-4 hold the record length.
     body = fcp
@@ -297,7 +324,7 @@ def _read_smsc(conn) -> Optional[str]:
     if rec_len < 28:
         return None
     y = rec_len - 28
-    d, s1, s2 = conn.transmit(_hx("00b20104") + [rec_len])  # READ RECORD 1
+    d, s1, s2 = _xfr(conn, _hx("00b20104") + [rec_len])  # READ RECORD 1
     if s1 != 0x90 or len(d) < rec_len:
         return None
     return _decode_ton_bcd(d[y + 13:y + 25])
@@ -373,18 +400,23 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
             info.pin_enabled = tries is not None
             # Optionally verify PIN in this same connection so IMSI becomes readable.
             if pin and tries is not None and tries >= MIN_TRIES:
-                body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
-                d, s1, s2 = conn.transmit(_hx("00200001") + [0x08] + body)
-                if (s1, s2) != (0x90, 0x00):
-                    info.error = "wrong PIN" if s1 == 0x63 else f"pin sw={s1:02x}{s2:02x}"
+                body = _pin_body(pin)
+                if body is None:
+                    info.error = "invalid PIN format (4-8 digits)"
+                else:
+                    d, s1, s2 = conn.transmit(_hx("00200001") + [0x08] + body)
+                    if (s1, s2) != (0x90, 0x00):
+                        info.error = "wrong PIN" if s1 == 0x63 else f"pin sw={s1:02x}{s2:02x}"
             # IMSI (needs PIN normally; may fail if not verified)
-            conn.transmit(_hx("00a40004026f0700"))
-            d, s1, s2 = conn.transmit(_hx("00b0000009"))
+            _xfr(conn, _hx("00a40004026f0700"))
+            d, s1, s2 = _xfr(conn, _hx("00b0000009"))
             if s1 == 0x90:
                 imsi = dec_imsi("".join(f"{b:02x}" for b in d))
                 if imsi:
                     info.imsi = imsi
                     info.mcc = imsi[:3]
+                else:
+                    info.error = info.error or "EF_IMSI returned undecodable data"
                 if not pin:
                     # Readable WITHOUT our VERIFY -> the PIN is not required right now
                     # (disabled, or already satisfied by another holder). The 63Cx status
@@ -393,9 +425,11 @@ def read_card(reader_index: int = 0, pin: str | None = None) -> CardInfo:
                     info.pin_enabled = False
             elif (s1, s2) == (0x69, 0x82):
                 info.pin_enabled = True     # security status not satisfied = PIN required
+            else:
+                info.error = info.error or f"IMSI read failed sw={s1:02x}{s2:02x}"
             # EF_AD (6FAD) for MNC length
-            conn.transmit(_hx("00a40004026fad00"))
-            d, s1, s2 = conn.transmit(_hx("00b0000004"))
+            _xfr(conn, _hx("00a40004026fad00"))
+            d, s1, s2 = _xfr(conn, _hx("00b0000004"))
             if s1 == 0x90 and len(d) >= 4:
                 info.mnc_len = d[3]
                 if info.imsi:
@@ -453,6 +487,9 @@ def _open_conn(reader_index: int):
 
 
 def verify_pin(pin: str, reader_index: int = 0) -> dict:
+    body = _pin_body(pin)
+    if body is None:
+        return {"ok": False, "error": "invalid PIN format (4-8 digits)"}
     conn, err = _open_conn(reader_index)
     if err:
         return err
@@ -465,7 +502,6 @@ def verify_pin(pin: str, reader_index: int = 0) -> dict:
                 return {"ok": False, "error": "PIN blocked", "tries": 0}
             if tries is not None and tries < MIN_TRIES:
                 return {"ok": False, "error": f"refusing: only {tries} tries left", "tries": tries}
-            body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
             d, s1, s2 = conn.transmit(_hx("00200001") + [0x08] + body)
             if (s1, s2) == (0x90, 0x00):
                 return {"ok": True, "tries": 3}
@@ -482,6 +518,9 @@ def verify_pin(pin: str, reader_index: int = 0) -> dict:
 
 
 def change_pin(old: str, new: str, reader_index: int = 0) -> dict:
+    ob, nb = _pin_body(old), _pin_body(new)
+    if ob is None or nb is None:
+        return {"ok": False, "error": "invalid PIN format (4-8 digits)"}
     conn, err = _open_conn(reader_index)
     if err:
         return err
@@ -492,8 +531,6 @@ def change_pin(old: str, new: str, reader_index: int = 0) -> dict:
             tries = _pin_tries(conn)
             if tries is not None and tries < MIN_TRIES:
                 return {"ok": False, "error": f"refusing: only {tries} tries left"}
-            ob = [ord(c) for c in old] + [0xFF] * (8 - len(old))
-            nb = [ord(c) for c in new] + [0xFF] * (8 - len(new))
             d, s1, s2 = conn.transmit(_hx("00240001") + [0x10] + ob + nb)  # CHANGE CHV1
             if (s1, s2) == (0x90, 0x00):
                 return {"ok": True}
@@ -509,6 +546,9 @@ def change_pin(old: str, new: str, reader_index: int = 0) -> dict:
 
 def set_pin_enabled(pin: str, enabled: bool, reader_index: int = 0) -> dict:
     """Enable (0x28) or disable (0x26) CHV1."""
+    body = _pin_body(pin)
+    if body is None:
+        return {"ok": False, "error": "invalid PIN format (4-8 digits)"}
     conn, err = _open_conn(reader_index)
     if err:
         return err
@@ -520,7 +560,6 @@ def set_pin_enabled(pin: str, enabled: bool, reader_index: int = 0) -> dict:
             tries = _pin_tries(conn)
             if tries is not None and tries < MIN_TRIES:
                 return {"ok": False, "error": f"refusing: only {tries} tries left"}
-            body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
             # ENABLE (0x28) / DISABLE (0x26) CHV1: 00 26/28 00 01 08 <pin padded FF>
             d, s1, s2 = conn.transmit(_hx(f"00{ins}0001") + [0x08] + body)
             if (s1, s2) == (0x90, 0x00):

@@ -2635,7 +2635,8 @@ async def api_verify_pin(body: dict):
                 card_entry.update(present=True, iccid=c.iccid, imsi=c.imsi, mcc=c.mcc,
                                   mnc=c.mnc, mnc_len=getattr(c, "mnc_len", None),
                                   pin_enabled=c.pin_enabled, pin_tries=c.pin_tries,
-                                  smsc=c.smsc, carrier_identity=_carrier_identity(c))
+                                  smsc=c.smsc, reader_port=c.reader_port,
+                                  carrier_identity=_carrier_identity(c))
                 inst = _match_instance_by_iccid(c.iccid)
                 if inst and _carrier_identity_update(c):
                     await asyncio.to_thread(cfg.upsert_instance, {
@@ -4637,6 +4638,22 @@ async def api_instances():
     return {"instances": out}
 
 
+def _only_instance_name_changed(before: dict | None, after: dict) -> bool:
+    """Whether a saved edit changed display metadata and no engine configuration.
+
+    A line name is resolved by the manager whenever it builds UI, notification or diagnostic
+    output. It is never consumed by the running IKE/Asterisk engine, so replacing that engine
+    for a rename only interrupts working calls and tunnels without applying anything useful.
+    Compare the persisted documents rather than trusting a client-side flag: a request that also
+    changes any operational field must continue through the normal fail-closed rebuild.
+    """
+    if before is None or before == after:
+        return False
+    before_runtime = {key: value for key, value in before.items() if key != "name"}
+    after_runtime = {key: value for key, value in after.items() if key != "name"}
+    return before_runtime == after_runtime
+
+
 @app.post("/api/instances")
 async def api_instance_upsert(body: dict):
     if "id" not in body:
@@ -4648,17 +4665,19 @@ async def api_instance_upsert(body: dict):
     # handle in the UI and audit history.
     if "name" in body and cfg.instance_name_taken(body.get("name"), exclude_iid=iid):
         raise HTTPException(409, "another line already uses that name")
+    previous = cfg.get_instance(iid)
     was_running = await asyncio.to_thread(engine.is_running, iid)
     try:
         inst = cfg.upsert_instance(body)
     except cfg.LineLimitError as exc:
         raise HTTPException(409, {
             "code": "line_limit", "message": str(exc)}) from exc
+    name_only_change = _only_instance_name_changed(previous, inst)
     applied = False
     # A running line holds its config in the engine container (rendered instance.json:
     # WebRTC credentials, IMEI, SMSC, User-Agent, …). Editing the config alone doesn't reach
     # the running Asterisk — so restart the container to re-render + reload the new config.
-    if was_running:
+    if was_running and not name_only_change:
         try:
             hub._msisdn_tries.pop(iid, None)
             hub.reset_health(iid, "configuration_restart")
@@ -4669,6 +4688,11 @@ async def api_instance_upsert(body: dict):
             asyncio.create_task(push_status(iid))
         except Exception as e:  # noqa
             log.warning("apply-on-save restart failed for %s: %r", iid, e)
+    elif name_only_change:
+        # The host-side desired document carries the label for observability. Its proxy
+        # fingerprint excludes line names, so publishing this metadata does not reload sing-box
+        # or disturb the line either.
+        egress.publish()
     safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity")}
     safe["applied"] = applied      # true => config was re-applied to the running engine
     return safe

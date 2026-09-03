@@ -6205,19 +6205,32 @@ def read_res_ck_ik_2(reader_index,rand,autn):
 _USIM_AID_PREFIX = "A0000000871002"
 
 
+def _swu_xfr(conn, apdu):
+    """Transmit one APDU, normalizing reader/protocol variance (issue #51). TPDU-level
+    T=0 readers answer case-4 commands with 61xx and expect an explicit GET RESPONSE;
+    APDU-level readers and T=1 hand back the data with 9000 directly. 6Cxx means
+    "wrong Le, retry with mine". Callers see one shape: (data, 0x90, 0x00) on success."""
+    data, s1, s2 = conn.transmit(apdu)
+    data = list(data)
+    while s1 == 0x61:
+        more, s1, s2 = conn.transmit([0x00, 0xC0, 0x00, 0x00, s2])
+        data += list(more)
+    if s1 == 0x6C and s2:
+        data, s1, s2 = conn.transmit(list(apdu[:4]) + [s2])
+        data = list(data)
+    return data, s1, s2
+
+
 def _swu_select_adf_usim(conn):
     conn.transmit(toBytes("00a40004023f0000"))               # SELECT MF
-    d, s1, s2 = conn.transmit(toBytes("00a40004022f0000"))   # SELECT EF.DIR
-    if s1 != 0x61:
-        return False
-    fcp, s1, s2 = conn.transmit(toBytes("00C00000") + [s2])
+    fcp, s1, s2 = _swu_xfr(conn, toBytes("00a40004022f0000"))  # SELECT EF.DIR
     if s1 != 0x90 or len(fcp) < 8:
         return False
     rec_len = fcp[7]
     aid = None
     first = None
     for rec in range(1, 11):
-        d, s1, s2 = conn.transmit(toBytes("00b2") + [rec, 0x04, rec_len])
+        d, s1, s2 = _swu_xfr(conn, toBytes("00b2") + [rec, 0x04, rec_len])
         if s1 != 0x90 or len(d) < 5 or d[0] != 0x61 or d[2] != 0x4F:
             break
         aid_len = d[3]
@@ -6234,8 +6247,8 @@ def _swu_select_adf_usim(conn):
     if aid is None:
         return False
     aid_len, a = aid
-    d, s1, s2 = conn.transmit(toBytes("00a40404") + [aid_len] + toBytes(a))
-    return s1 == 0x61
+    d, s1, s2 = _swu_xfr(conn, toBytes("00a40404") + [aid_len] + toBytes(a))
+    return s1 == 0x90
 
 
 def _swu_verify_chv1(conn, pin):
@@ -6249,6 +6262,9 @@ def _swu_verify_chv1(conn, pin):
             return False
     elif (s1, s2) == (0x69, 0x83):
         print("VoWiFi: CHV1 blocked")
+        return False
+    if not (4 <= len(pin) <= 8) or not pin.isdigit():
+        print("VoWiFi: refusing PIN VERIFY, malformed PIN (want 4-8 digits)")
         return False
     body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
     d, s1, s2 = conn.transmit(toBytes("00200001") + [0x08] + body)

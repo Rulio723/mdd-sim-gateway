@@ -4,6 +4,27 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-03
+
+### Added
+
+- The country-exit picker can now be searched by Chinese or English country name and by two-letter
+  country code, with keyboard navigation for selecting a result
+  ([#53](https://github.com/MddIdd/mdd-sim-gateway/issues/53)).
+- Renaming a running SIM line now updates its display metadata without rebuilding the line's
+  IKE and Asterisk engine; edits to operational settings continue to restart the line so they are
+  actually applied ([#53](https://github.com/MddIdd/mdd-sim-gateway/issues/53)).
+- The manual update selector now offers the five most recent stable releases instead of only the
+  latest one, making recent rollback or version switching available from System Settings.
+
+### Fixed
+
+- SIM access now supports readers that expose APDU-level responses and T=1 cards across SELECT and
+  READ operations, including direct data responses, `61xx` chaining and `6Cxx` length correction.
+  Reader errors are surfaced instead of being mistaken for card data, and verified card bindings
+  remain stable across subsequent operations
+  ([#51](https://github.com/MddIdd/mdd-sim-gateway/issues/51)).
+
 ## [1.8.1] - 2026-09-02
 
 ### Fixed
