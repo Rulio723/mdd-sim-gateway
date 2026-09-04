@@ -49,40 +49,50 @@ class FakeUsim:
                    reader or T=1 card, the shape issue #51's reader produces.
     """
 
-    def __init__(self, mode, pin_enabled=False):
+    def __init__(self, mode, pin_enabled=False, broken_get_response=()):
         assert mode in ("tpdu", "direct")
         self.mode = mode
         self.pin_enabled = pin_enabled
+        # Files whose 61xx the card raises but whose GET RESPONSE it then refuses. Issue #60:
+        # 61xx already means "command accepted", so a refused body fetch must not be read as
+        # a failed SELECT.
+        self.broken_get_response = set(broken_get_response)
         self.verified = False
         self.selected = None
         self.pending = None
+        self.pending_from = None
         self.log = []
 
     # -- response shaping ------------------------------------------------------
-    def _case4(self, data):
+    def _case4(self, data, origin=None):
         if self.mode == "direct":
             return list(data), 0x90, 0x00
         self.pending = list(data)
+        self.pending_from = origin
         return [], 0x61, len(data)
 
     def transmit(self, apdu):
         self.log.append(bytes(apdu).hex())
         ins, p1 = apdu[1], apdu[2]
         if ins == 0xC0:  # GET RESPONSE
+            origin, self.pending_from = self.pending_from, None
+            if origin in self.broken_get_response:
+                self.pending = None
+                return [], 0x6F, 0x00
             data, self.pending = self.pending or [], None
             return data, 0x90, 0x00
         if ins == 0xA4:  # SELECT
             body = bytes(apdu[5:5 + apdu[4]]).hex().upper() if len(apdu) > 5 else ""
             if p1 == 0x04 and body == USIM_AID:
                 self.selected = "adf"
-                return self._case4(sim._hx("62058A0105FFFF"))
+                return self._case4(sim._hx("62058A0105FFFF"), "adf")
             if body == "2F00":
                 self.selected = "dir"
                 # FCP: 62 06 82 04 42 21 00 26 -> record length fcp[7] = 0x26
-                return self._case4(sim._hx("6206820442210026"))
+                return self._case4(sim._hx("6206820442210026"), "dir")
             if body in ("3F00", "6F07"):
                 self.selected = body
-                return self._case4(sim._hx("62058A0105FFFF"))
+                return self._case4(sim._hx("62058A0105FFFF"), body)
             self.selected = None
             return [], 0x6A, 0x82  # file not found (EF_AD/SPN/GID/SMSP not scripted)
         if ins == 0xB2 and self.selected == "dir":  # READ RECORD in EF_DIR
@@ -126,8 +136,9 @@ class FakeReader:
 
 
 class ReaderShapeTests(unittest.TestCase):
-    def _read(self, mode, pin_enabled=False, pin=None):
-        card = FakeUsim(mode, pin_enabled=pin_enabled)
+    def _read(self, mode, pin_enabled=False, pin=None, broken_get_response=()):
+        card = FakeUsim(mode, pin_enabled=pin_enabled,
+                        broken_get_response=broken_get_response)
         old = sim.readers
         sim.readers = lambda: [FakeReader(card)]
         try:
@@ -159,6 +170,16 @@ class ReaderShapeTests(unittest.TestCase):
         info, card = self._read("direct", pin_enabled=True, pin=PIN)
         self.assertTrue(card.verified)
         self.assertEqual(info.imsi, IMSI)
+
+    def test_select_survives_a_refused_get_response(self):
+        """Issue #60 regression: v1.9.0 read SELECT ADF.USIM's success off the GET RESPONSE
+        that follows it, so a card that raises 61xx (accepted) but refuses to hand the FCP
+        back read as "ADF.USIM select failed" — read_card returned with every PIN field
+        unset and the start preflight asked for a PIN the card does not even use."""
+        info, _ = self._read("tpdu", broken_get_response={"adf"})
+        self.assertEqual(info.imsi, IMSI)
+        self.assertIs(info.pin_enabled, False)
+        self.assertIsNone(info.error)
 
     def test_verify_pin_on_direct_reader(self):
         card = FakeUsim("direct", pin_enabled=True)
@@ -202,6 +223,46 @@ class XfrTests(unittest.TestCase):
         data, s1, s2 = sim._xfr(Conn(), sim._hx("00b0000009"))
         self.assertEqual(seen[1], [0x00, 0xB0, 0x00, 0x00, 0x0A])
         self.assertEqual((len(data), s1), (10, 0x90))
+
+    def test_6c_retry_keeps_the_command_body(self):
+        """A case-4 SELECT retried on 6Cxx must keep Lc and the file id. Truncating to
+        CLA/INS/P1/P2 re-sent "00A40004 <Le>", a malformed command the card can only
+        reject, which surfaced as an unselectable file (issue #60)."""
+        seen = []
+
+        class Conn:
+            def transmit(self, apdu):
+                seen.append(list(apdu))
+                if len(seen) == 1:
+                    return [], 0x6C, 0x07
+                return list(range(7)), 0x90, 0x00
+
+        data, s1, s2 = sim._xfr(Conn(), sim._hx("00a40004022f0000"))
+        self.assertEqual(seen[1], sim._hx("00a40004022f00") + [0x07])
+        self.assertEqual((len(data), s1, s2), (7, 0x90, 0x00))
+
+    def test_61_is_success_even_when_get_response_is_refused(self):
+        """61xx is the card accepting the command; the GET RESPONSE only fetches the body.
+        Callers that need the body validate it, so a refused fetch must not be reported as
+        a failed command (issue #60)."""
+        class Conn:
+            def __init__(self):
+                self.calls = 0
+
+            def transmit(self, apdu):
+                self.calls += 1
+                return ([], 0x61, 0x1F) if self.calls == 1 else ([], 0x6F, 0x00)
+
+        data, s1, s2 = sim._xfr(Conn(), sim._hx("00a40404") + [4] + sim._hx("A0000000"))
+        self.assertEqual((data, s1, s2), ([], 0x90, 0x00))
+
+    def test_apdu_with_le_shapes(self):
+        self.assertEqual(sim._apdu_with_le(sim._hx("00b0000009"), 0x0A),
+                         sim._hx("00b000000a"))                       # case 2: replace Le
+        self.assertEqual(sim._apdu_with_le(sim._hx("00a40004022f0000"), 0x07),
+                         sim._hx("00a40004022f0007"))                 # case 4: keep Lc+data
+        self.assertEqual(sim._apdu_with_le(sim._hx("00a4040402ff01"), 0x12),
+                         sim._hx("00a4040402ff0112"))                 # case 3: append Le
 
 
 class ValidationTests(unittest.TestCase):

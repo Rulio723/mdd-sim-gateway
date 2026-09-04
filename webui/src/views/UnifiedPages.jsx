@@ -133,6 +133,30 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
       showToast?.(t('Request accepted; waiting for device state'))
       await onChanged?.()
     } catch (e) {
+      // The start path refuses with a structured 409 when the SIM PIN preflight fails.
+      // pin_required / pin_invalid are recoverable right here: ask for the PIN and retry
+      // the start with it (the device-level "enabled" intent was already persisted).
+      const code = e.data?.detail?.code
+      if ((code === 'pin_required' || code === 'pin_invalid') && next && device.instance_id) {
+        const tries = e.data.detail.tries ?? '?'
+        const pin = window.prompt(code === 'pin_invalid'
+          ? t('The saved SIM PIN was rejected ({tries} tries left). Enter the SIM PIN:', { tries })
+          : t('This SIM requires a PIN ({tries} tries left). Enter the SIM PIN:', { tries }))
+        if (pin) {
+          try {
+            await api.start(device.instance_id, { pin })
+            showToast?.(t('Request accepted; waiting for device state'))
+            await onChanged?.()
+          } catch (e2) {
+            showToast?.(`${t('Capability change failed')}: ${e2.message}`)
+          }
+          return
+        }
+      }
+      if (code === 'no_card') {
+        showToast?.(`${t('Capability change failed')}: ${t('No readable SIM for this line — the reader is empty or holds another card/eSIM profile. For an eSIM, switch the active profile to this line first.')}`)
+        return
+      }
       showToast?.(`${t('Capability change failed')}: ${e.status === 404 ? t('Unified device control is not available on this backend') : e.message}`)
     } finally { setSubmitting(false); setPendingTarget(null) }
   }

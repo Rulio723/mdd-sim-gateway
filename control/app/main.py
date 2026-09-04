@@ -3216,8 +3216,26 @@ def _preflight_pin_locked(inst: dict, idx: int) -> dict:
     except Exception as e:  # noqa
         log.debug("preflight probe failed: %r", e)
         return {"ok": True, "need_pin": bool(inst.get("pin"))}
+    want = (inst.get("iccid") or "").strip()
     if not probe.present:
-        return {"ok": False, "code": "no_card"}
+        # Nothing readable at the reader index this line binds to. Carry the expected ICCID
+        # so the operator-facing error can say which SIM we were looking for (support bundles
+        # get only the closed reason code, never the identifier).
+        return {"ok": False, "code": "no_card", "line_iccid": want}
+    # Real-time identity check. _card_identity_mismatch runs first but off the (sampled) card
+    # monitor cache; inside an eSIM REFRESH/profile-switch window that cache lags, so a live
+    # read here is what actually catches "the reader now holds a different profile" instead of
+    # letting it fall through to a misleading no_card.
+    got = (probe.iccid or "").strip()
+    if want and got and got != want:
+        return {"ok": False, "code": "card_mismatch", "card_iccid": got, "line_iccid": want}
+    if probe.pin_enabled is None:
+        # The card answered, but read_card never got far enough to learn its PIN state (an
+        # ADF.USIM select that failed leaves every PIN field unset). Falling through would
+        # report 'pin_required' with an unknown retry counter, and the UI would ask for a PIN
+        # that cannot help — the dead end issues #51 and #60 both ended in. Report the read
+        # failure itself so the operator sees a fixable fact.
+        return {"ok": False, "code": "card_unreadable", "error": probe.error or ""}
     if probe.pin_enabled is False:
         return {"ok": True, "need_pin": False}
     saved = inst.get("pin")
@@ -3237,6 +3255,7 @@ async def _preflight_pin(inst: dict) -> dict:
     """Actively check the SIM's PIN state BEFORE starting the engine (so we never spin up
     the SWu tunnel/IMS against a locked card). Reads the physical card:
       - card absent                         -> {ok:False, code:'no_card'}
+      - card present but unreadable         -> {ok:False, code:'card_unreadable'}
       - PIN not required (disabled)          -> {ok:True,  need_pin:False}
       - PIN required, no saved PIN           -> {ok:False, code:'pin_required'}
       - PIN required, saved PIN verifies     -> {ok:True,  need_pin:True}
@@ -3264,6 +3283,55 @@ async def _preflight_pin(inst: dict) -> dict:
         return await asyncio.to_thread(_preflight_pin_locked, inst, idx)
     finally:
         lock.release()
+
+
+def _pin_preflight_http(pf: dict) -> HTTPException:
+    """Structured 409 for a failed PIN preflight. Always carries a human-readable
+    `message` — the generic error path in the UI renders detail.message, and without
+    it the toast degrades to the bare HTTP status text ("Conflict")."""
+    tries = pf.get("tries")
+    left = f" ({tries} tries left)" if tries is not None else ""
+    want = (pf.get("line_iccid") or "").strip()
+    expect = f" (this line expects ICCID {want})" if want else ""
+    detail = str(pf.get("error") or "").strip()
+    because = f" ({detail})" if detail else ""
+    messages = {
+        "no_card": ("no readable SIM at this line's reader — it is empty or the card is "
+                    "not ready yet (an eSIM resets briefly while switching profiles); if "
+                    f"you switched the eSIM, activate this line's profile first{expect}"),
+        "pin_required": ("the SIM asks for a PIN and none is saved — enter the "
+                         f"SIM PIN to start this line{left}"),
+        "pin_invalid": f"the saved SIM PIN was rejected{left} — re-enter the PIN",
+        "card_unreadable": ("the SIM was detected but could not be read"
+                            f"{because} — this is not a PIN problem, so entering one will "
+                            "not help; reseat the card and report this error if it persists"),
+    }
+    return HTTPException(409, {
+        "code": pf["code"], "tries": tries,
+        "message": messages.get(pf["code"], f"SIM preflight failed: {pf['code']}"),
+    })
+
+
+def _raise_preflight_block(iid: str, pf: dict):
+    """Record a closed-schema lifecycle event for the refused start (so support bundles
+    show the preflight decision without any identifier) and raise the operator-facing 409.
+
+    A live ICCID conflict is reported as the existing card_mismatch error — same shape the
+    cache-based guard produces — so the UI's message is identical however it was detected."""
+    code = pf.get("code") or ""
+    facts: dict = {}
+    if code in {"pin_required", "pin_invalid", "card_mismatch", "card_unreadable"}:
+        facts["card_present"] = True
+    elif code == "no_card":
+        facts["card_present"] = False
+    if code == "card_mismatch":
+        facts["iccid_matches"] = False
+    _record_lifecycle(str(iid), "preflight_blocked", reason_code=code, **facts)
+    if code == "card_mismatch":
+        _raise_card_mismatch({"iccid": pf.get("line_iccid") or ""},
+                             {"reader": pf.get("reader") or "the reader",
+                              "iccid": pf.get("card_iccid") or ""})
+    raise _pin_preflight_http(pf)
 
 
 @app.post("/api/provision")
@@ -4806,7 +4874,7 @@ async def api_instance_start(iid: str, body: dict | None = None):
     if not pf["ok"]:
         if pf.get("clear"):
             cfg.clear_pin(str(iid))     # stale saved PIN — force re-entry next time
-        raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
+        _raise_preflight_block(str(iid), pf)
 
     settings = cfg.get_settings()
     dev = os.environ.get("MDD_DEV_MOUNTS", "") == "1"
@@ -4859,7 +4927,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
     if not pf["ok"]:
         if pf.get("clear"):
             cfg.clear_pin(str(iid))
-        raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
+        _raise_preflight_block(str(iid), pf)
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid, "user_requested")
     await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client

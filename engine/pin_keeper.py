@@ -95,19 +95,46 @@ def swap_nibbles(s):
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
 
+def _apdu_with_le(apdu, le):
+    """Rebuild an APDU carrying the Le the card asked for in a 6Cxx status. Case 2 replaces
+    the trailing Le byte; case 3/4 keeps Lc and the command data and re-stamps only Le.
+    Truncating to CLA/INS/P1/P2 (what the first version did) turned a case-4 SELECT into a
+    malformed command, so the retry failed and a healthy file read as unselectable."""
+    head = list(apdu[:4])
+    if len(apdu) <= 5:
+        return head + [le]
+    lc = apdu[4]
+    return head + [lc] + list(apdu[5:5 + lc]) + [le]
+
+
 def _xfr(conn, apdu):
     """Transmit one APDU, normalizing reader/protocol variance (issue #51). TPDU-level
     T=0 readers answer case-4 commands with 61xx and expect an explicit GET RESPONSE;
     APDU-level readers and T=1 hand back the data with 9000 directly. 6Cxx means
-    "wrong Le, retry with mine". Callers see one shape: (data, 0x90, 0x00) on success."""
+    "wrong Le, retry with mine". Callers see one shape: (data, 0x90, 0x00) on success.
+
+    61xx already means the card ACCEPTED the command -- the GET RESPONSE that follows only
+    fetches the body. Reporting that fetch's status as the command's status made a good
+    SELECT ADF.USIM read as a card fault on cards whose GET RESPONSE answers anything but
+    9000, which is issue #60: read_card bailed out with no PIN state at all and the start
+    preflight then asked for a PIN the card never wanted. Callers that need the body check
+    the body they got, so answering "accepted, here is what we could fetch" is safe."""
     data, s1, s2 = conn.transmit(apdu)
     data = list(data)
-    while s1 == 0x61:
-        more, s1, s2 = conn.transmit([0x00, 0xC0, 0x00, 0x00, s2])
-        data += list(more)
-    if s1 == 0x6C and s2:
-        data, s1, s2 = conn.transmit(list(apdu[:4]) + [s2])
-        data = list(data)
+    accepted = False
+    for _ in range(8):      # bound: a card that keeps re-asking cannot spin us forever
+        if s1 == 0x61:
+            accepted = True
+            more, s1, s2 = conn.transmit([0x00, 0xC0, 0x00, 0x00, s2])
+            data += list(more)
+            continue
+        if s1 == 0x6C and s2 and not accepted:
+            data, s1, s2 = conn.transmit(_apdu_with_le(apdu, s2))
+            data = list(data)
+            continue
+        break
+    if accepted and s1 != 0x90:
+        return data, 0x90, 0x00
     return data, s1, s2
 
 
