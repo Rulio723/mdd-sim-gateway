@@ -158,9 +158,13 @@ def _modem_identity_for_reader(reader_name: str | None) -> dict | None:
             with open(path, encoding="utf-8") as handle:
                 identity = json.load(handle)
             if str(identity.get("hardware_id") or "") == hardware_id:
+                # A modem that never reports a 15-digit AT IMEI is a supported state -- the
+                # bridge publishes the identity with an empty IMEI on purpose. Discarding the
+                # whole record over it dropped the bridge's ICCID (so the card never matched a
+                # line and the reader binding never migrated) and collapsed the modem to the
+                # one-slot fallback below, putting PIN/SWu/IMS on a single VPCD reader.
                 imei = cfg.normalize_imei(identity.get("imei", ""))
-                if len(imei) == 15:
-                    return {**identity, "imei": imei}
+                return {**identity, "imei": imei if len(imei) == 15 else ""}
         except (OSError, ValueError, TypeError):
             continue
     # The generated reader can outlive bridge metadata across an unplug/restart.
@@ -1779,24 +1783,43 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
         return failover.HOLD
     country = egress.line_country(inst)
     exits = (egress.status().get("exits") or {}).get(country) or {}
+    if (not cfg.get_settings().get("proxy", {}).get("enabled", False)
+            or exits.get("mode") != "subscription"):
+        # Direct, single-node and disabled routes have no pool to walk, so a ledger for them
+        # is stale by definition.
+        if hub.exit_ledgers.pop(iid, None) is not None:
+            _save_exit_ledgers()
+        return failover.HOLD
+    if not exits.get("node"):
+        # A subscription exit whose node is momentarily unknown: the host blanks it on every
+        # status cycle until the Clash API answers, so a slow query or a sing-box restart
+        # leaves it empty for one cycle. That says nothing about the exit — keep the walk
+        # (tried, exhausted, given_up) intact and judge again on the next freeze.
+        return failover.HOLD
     node = str(exits.get("node") or "")
     candidates = [str(name) for name in (exits.get("candidates") or [])]
     pinned = exits.get("selection") == "manual"
     peer_registered = _peer_line_registered(iid, country)
+    swu, retransmits = "", None
     try:
         swu = (engine.read_run_json(iid, "swu_status.json") or {}).get("state") or ""
-        retransmits = int((engine.ike_evidence(iid) or {}).get("retransmits") or 0)
     except Exception as exc:  # noqa
         log.debug("cannot read tunnel evidence for line %s: %r", iid, exc)
-        swu, retransmits = "", 0
+    try:
+        evidence = engine.ike_evidence(iid) or {}
+        if evidence.get("available", True) and evidence.get("retransmits") is not None:
+            retransmits = int(evidence["retransmits"])
+    except Exception as exc:
+        log.debug("cannot read IKE evidence for line %s: %r", iid, exc)
     verdict = failover.classify(swu, retransmits, stable_for,
-                                egress.RESELECT_MIN_STABLE_SECONDS)
+                                egress.RESELECT_MIN_STABLE_SECONDS,
+                                reason_code=st.get("reason_code") or "unknown")
     was_backing_off = bool((hub.exit_ledgers.get(iid) or {}).get("exhausted"))
     action, ledger = failover.record(hub.exit_ledgers.get(iid), verdict, node,
                                      pinned, candidates, peer_registered=peer_registered)
     hub.exit_ledgers[iid] = ledger
     _save_exit_ledgers()
-    log.info("line %s froze (%s) after %.0fs healthy; tunnel=%s ike_retransmits=%d "
+    log.info("line %s froze (%s) after %.0fs healthy; tunnel=%s ike_retransmits=%s "
              "-> blames %s, action %s (node=%s strikes=%d tried=%d/%d peer=%s)",
              iid, st.get("reason_code"), stable_for, swu or "unknown", retransmits,
              verdict, action, node or "unknown", ledger.get("strikes") or 0,
