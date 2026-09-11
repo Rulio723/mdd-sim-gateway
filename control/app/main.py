@@ -2983,12 +2983,33 @@ async def _esim_restart_modem_bridge(
         503, f"timed out waiting for VPCD bridge rebuild (last stage: {last_state})")
 
 
+def _modem_active_slot_capacity(hardware_id: str, sibling_count: int) -> int:
+    """How many VPCD readers must carry the active profile for this modem.
+
+    Bridges may enumerate more pcscd reader names than logical channels they
+    allocated (ML307X exposes 00..03 while only 3 channels are ready).  Empty
+    trailing slots must not fail profile-switch recovery.
+    """
+    identity = (_device_identities().get(hardware_id)
+                or _modem_identity_for_reader(f"VoWiFi Modem {hardware_id} 00 00")
+                or {})
+    raw = (identity.get("channel_allocated")
+           or identity.get("channel_capacity")
+           or identity.get("slots")
+           or sibling_count)
+    try:
+        capacity = int(raw)
+    except (TypeError, ValueError):
+        capacity = sibling_count
+    return max(1, min(sibling_count, capacity))
+
+
 async def _esim_refresh_modem_readers(
     name: str,
     hardware_id: str,
     iccid: str,
 ) -> tuple[dict, list[str]]:
-    """Prove that every exposed slot now belongs to the requested active profile."""
+    """Prove that every allocated slot now belongs to the requested active profile."""
     last_error = ""
     for _attempt in range(max(1, ESIM_CARD_REFRESH_ATTEMPTS)):
         try:
@@ -2997,9 +3018,10 @@ async def _esim_refresh_modem_readers(
                         if device_state.vpcd_modem_hardware_id(reader) == hardware_id]
             if not siblings:
                 raise RuntimeError("replacement VPCD readers are not enumerated")
+            active = siblings[:_modem_active_slot_capacity(hardware_id, len(siblings))]
             refreshed = []
             primary = None
-            for sibling in siblings:
+            for sibling in active:
                 idx = readers.index(sibling)
                 card_data = await asyncio.to_thread(sim.read_card, idx)
                 actual = str(card_data.iccid or "")
@@ -3595,6 +3617,14 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
         return inst
     imei, _device_id, _device_type = _hardware_imei_for_card(card_info, cards)
     if len(imei) != 15:
+        existing = cfg.normalize_imei(inst.get("imei", ""))
+        # Some USB modems (CORIG ML307X) never expose a 15-digit AT IMEI. Keep a
+        # previously configured line IMEI so hotplug/profile-switch auto-start can
+        # proceed; still fail closed when nothing usable is configured.
+        if _device_type == "modem" and len(existing) == 15:
+            log.warning("modem %s has no live IMEI; keeping configured line IMEI for %s",
+                        _device_id, inst.get("id"))
+            return inst
         raise HTTPException(409, {
             "code": "hardware_imei_required",
             "message": "configure a 15-digit IMEI in Device > Hardware before starting VoWiFi",

@@ -120,7 +120,14 @@ def _content_hash(recipient: str, text: str) -> str:
 
 def _normalize_iccid(value) -> str:
     """Return the canonical comparison/storage form for a modem or configured ICCID."""
-    return str(value or "").strip().casefold()
+    text = str(value or "").strip().casefold()
+    # mmcli renders an unreadable property as the literal placeholder "--".
+    return "" if text == "--" else text
+
+
+def _normalize_imsi(value) -> str:
+    """Return the digits-only comparison form of an IMSI, or empty when absent."""
+    return re.sub(r"\D", "", str(value or ""))
 
 
 def _boot_id() -> str:
@@ -192,7 +199,16 @@ def _instance_iccid(instances: list[dict], instance_id) -> str:
     return ""
 
 
-def _find_modem(iccid: str, runner, timeout: float) -> tuple[str | None, str | None]:
+def _instance_imsi(instances: list[dict], instance_id) -> str:
+    iid = str(instance_id)
+    for item in instances or []:
+        if isinstance(item, dict) and str(item.get("id")) == iid:
+            return _normalize_imsi(item.get("imsi"))
+    return ""
+
+
+def _find_modem(iccid: str, runner, timeout: float, *,
+                imsi: str = "") -> tuple[str | None, str | None]:
     """Return (modem_path, problem); a problem is a stable, user-safe description."""
     listing, problem = _invoke(["-L"], runner, timeout)
     if problem == "timeout":
@@ -224,14 +240,25 @@ def _find_modem(iccid: str, runner, timeout: float) -> tuple[str | None, str | N
             continue
         sim_doc = _decode_json(sim_detail)
         sim = sim_doc.get("sim") or {}
-        modem_iccid = _normalize_iccid((sim.get("properties") or {}).get("iccid")
+        properties = sim.get("properties") or {}
+        modem_iccid = _normalize_iccid(properties.get("iccid")
                                        or sim_doc.get("sim.properties.iccid"))
-        if modem_iccid == _normalize_iccid(iccid):
+        if modem_iccid:
+            if modem_iccid == _normalize_iccid(iccid):
+                return modem_path, None
+            continue
+        # Some modules (observed: CMIOT ML307X) reject the EF_ICCID read ModemManager
+        # relies on, so the SIM exposes no ICCID at all. Those modules do report the
+        # IMSI, which the line also stores; matching on it keeps the SIM's identity
+        # authoritative instead of guessing by modem model or port.
+        modem_imsi = _normalize_imsi(properties.get("imsi")
+                                     or sim_doc.get("sim.properties.imsi"))
+        if imsi and modem_imsi and modem_imsi == imsi:
             return modem_path, None
 
     if inspection_failed:
         return None, "Could not find the line's SIM among the readable cellular modems."
-    return None, "No cellular modem matches this line's ICCID."
+    return None, "No cellular modem matches this line's ICCID or IMSI."
 
 
 def _created_sms_path(result) -> str:
@@ -280,7 +307,8 @@ def send(instances: list[dict], instance_id, recipient: str, text: str,
     if not iccid:
         return _response(instance_id, ok=False, status="unavailable",
                          error="The line has no configured ICCID.", stage="lookup")
-    modem_path, problem = _find_modem(iccid, runner, timeout)
+    modem_path, problem = _find_modem(iccid, runner, timeout,
+                                      imsi=_instance_imsi(instances, instance_id))
     if not modem_path:
         return _response(instance_id, ok=False, status="unavailable",
                          error=problem or "No cellular modem is available.", stage="lookup")
@@ -448,9 +476,11 @@ class Scanner:
             if not sim_path:
                 continue
             sim_doc = _run_json(["-i", sim_path], self.runner).get("sim") or {}
-            iccid = _normalize_iccid((sim_doc.get("properties") or {}).get("iccid"))
-            if iccid:
-                topology.append((modem_path, iccid))
+            properties = sim_doc.get("properties") or {}
+            iccid = _normalize_iccid(properties.get("iccid"))
+            imsi = _normalize_imsi(properties.get("imsi"))
+            if iccid or imsi:
+                topology.append((modem_path, iccid, imsi))
         if topology != self._topology:
             self._details.clear()
             self._local_sms_keys.clear()
@@ -471,13 +501,24 @@ class Scanner:
             self._refresh_topology(now)
         by_iccid = {_normalize_iccid(item.get("iccid")): str(item.get("id")) for item in instances
                     if item.get("iccid") and item.get("id") is not None}
+        # Modules that expose no ICCID through ModemManager are matched on IMSI instead.
+        # The instance's configured ICCID stays the durable tracking key either way, so a
+        # locally sent SMS is classified identically by the sender and this scanner.
+        by_imsi = {_normalize_imsi(item.get("imsi")): str(item.get("id")) for item in instances
+                   if item.get("imsi") and item.get("iccid") and item.get("id") is not None}
+        instance_iccids = {str(item.get("id")): _normalize_iccid(item.get("iccid"))
+                           for item in instances if item.get("id") is not None}
         found = []
         live_keys = set()
         live_local_keys = set()
-        for modem_path, iccid in self._topology:
-            iid = by_iccid.get(iccid)
+        for modem_path, modem_iccid, modem_imsi in self._topology:
+            if modem_iccid:
+                iid = by_iccid.get(modem_iccid)
+            else:
+                iid = by_imsi.get(modem_imsi) if modem_imsi else None
             if not iid:
                 continue
+            iccid = instance_iccids.get(iid) or modem_iccid
             # Serialize the path snapshot with local object creation; otherwise the poller could
             # import a newly-created submit object before send() has learned its D-Bus path.
             with _local_sms_lock:

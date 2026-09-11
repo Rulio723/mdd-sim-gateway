@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from control.app.ami import AmiClient
 from control.app import status
@@ -148,6 +149,46 @@ class AmiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await client.active_channel_count(), 2)
         client._action.assert_awaited_once_with(
             {"Action": "Command", "Command": "core show channels count"}, timeout=3.0)
+
+    async def test_a_refused_connect_closes_its_manager(self):
+        """panoramisk schedules a pinger and a reconnect timer as soon as a Manager is
+        created, and the event loop keeps the object alive through them. A Manager left
+        open by a failed connect pings a transport that never opened, once per interval,
+        for as long as the control plane lives -- observed for hours after an upgrade
+        restarted the control plane while the engine containers were still starting."""
+        manager = MagicMock()
+        manager.connect = AsyncMock(side_effect=ConnectionRefusedError(111, "Connection refused"))
+        client = AmiClient("1", "172.17.0.2", 5038, "user", "secret", "realm")
+        with patch("control.app.ami.Manager", return_value=manager):
+            await client.connect()
+
+        manager.close.assert_called_once()
+        self.assertFalse(client.connected)
+
+    async def test_a_timed_out_connect_also_closes_its_manager(self):
+        manager = MagicMock()
+
+        async def _never(*_a, **_k):
+            await asyncio.sleep(3600)
+
+        manager.connect = _never
+        client = AmiClient("1", "172.17.0.2", 5038, "user", "secret", "realm")
+        with patch("control.app.ami.Manager", return_value=manager), \
+                patch.object(AmiClient, "CONNECT_TIMEOUT", 0.01):
+            await client.connect()
+
+        manager.close.assert_called_once()
+        self.assertFalse(client.connected)
+
+    async def test_a_successful_connect_keeps_its_manager_open(self):
+        manager = MagicMock()
+        manager.connect = AsyncMock(return_value=None)
+        client = AmiClient("1", "172.17.0.2", 5038, "user", "secret", "realm")
+        with patch("control.app.ami.Manager", return_value=manager):
+            await client.connect()
+
+        manager.close.assert_not_called()
+        self.assertTrue(client.connected)
 
     async def test_unreadable_active_channel_count_fails_closed(self):
         client = AmiClient("1", "172.17.0.2", 5038, "user", "secret", "realm")

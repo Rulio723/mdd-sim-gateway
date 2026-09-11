@@ -196,7 +196,7 @@ def select_adf_usim(conn):
     if not got:
         return False
     aid_len, aid = got
-    d, s1, s2 = _xfr(conn, toBytes("00a40404") + [aid_len] + toBytes(aid))
+    d, s1, s2 = _xfr(conn, toBytes("00a40404%02X%s" % (aid_len, aid)))
     return s1 == 0x90
 
 

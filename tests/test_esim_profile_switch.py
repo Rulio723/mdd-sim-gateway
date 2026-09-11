@@ -121,6 +121,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.sim, "read_card", return_value=target), \
                 patch.object(main, "_match_instance_by_iccid", return_value=instance), \
                 patch.object(main, "_carrier_identity_update", return_value={}), \
+                patch.object(main, "_modem_active_slot_capacity", return_value=3), \
                 patch.object(main.hub, "cards", cards), \
                 patch.object(main.hub, "broadcast", new=AsyncMock()):
             info, refreshed = await main._esim_refresh_modem_readers(
@@ -129,6 +130,43 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["iccid"], "profile-target")
         self.assertEqual(refreshed, readers)
         self.assertEqual({card["iccid"] for card in cards.values()}, {"profile-target"})
+
+    async def test_refresh_ignores_extra_empty_enumerated_slot(self):
+        """ML307X enumerates 00..03 while only three logical channels are allocated."""
+        readers = [
+            "VoWiFi Modem modem-1 00 00",
+            "VoWiFi Modem modem-1 00 01",
+            "VoWiFi Modem modem-1 00 02",
+            "VoWiFi Modem modem-1 00 03",
+        ]
+        target = SimpleNamespace(
+            iccid="profile-target", imsi="imsi-target", mcc="515", mnc="66",
+            mnc_len=2, pin_enabled=False, pin_tries=3, smsc="",
+            carrier_identity={})
+        empty = SimpleNamespace(
+            iccid="", imsi="", mcc="", mnc="", mnc_len=None, pin_enabled=False,
+            pin_tries=3, smsc="", carrier_identity={})
+
+        def read_card(idx):
+            return empty if idx == 3 else target
+
+        cards = {reader: {"name": reader, "index": index, "present": index < 3,
+                          "iccid": "profile-old"}
+                 for index, reader in enumerate(readers)}
+        instance = {"id": "2", "iccid": "profile-target"}
+        with patch.object(main.sim, "list_readers", return_value=readers), \
+                patch.object(main.sim, "read_card", side_effect=read_card), \
+                patch.object(main, "_match_instance_by_iccid", return_value=instance), \
+                patch.object(main, "_carrier_identity_update", return_value={}), \
+                patch.object(main, "_modem_active_slot_capacity", return_value=3), \
+                patch.object(main.hub, "cards", cards), \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            info, refreshed = await main._esim_refresh_modem_readers(
+                readers[0], "modem-1", "profile-target")
+
+        self.assertEqual(info["iccid"], "profile-target")
+        self.assertEqual(refreshed, readers[:3])
+        self.assertEqual(cards[readers[3]]["iccid"], "profile-old")
 
     async def test_prepare_and_restore_preserve_the_exact_running_snapshot(self):
         lines = {

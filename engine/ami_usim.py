@@ -267,7 +267,8 @@ def make_connection_index(reader_index):
         return None
     aid_length, aid = got
     print(f"Using aid={aid}")
-    data, sw1, sw2 = _xfr(connection, toBytes("00a40404") + [aid_length] + toBytes(aid))
+    data, sw1, sw2 = _xfr(
+        connection, toBytes("00a40404%02X%s" % (aid_length, aid)))
     if sw1 != 0x90:
         print("Failed to select AID")
         return None
@@ -433,7 +434,7 @@ def make_reselect_adf(connection):
     if got is None:
         return
     aid_length, aid = got
-    connection.transmit(toBytes("00a40404") + [aid_length] + toBytes(aid))
+    _xfr(connection, toBytes("00a40404%02X%s" % (aid_length, aid)))
 
 
 def select_adf_usim(connection):
@@ -443,7 +444,8 @@ def select_adf_usim(connection):
     if got is None:
         return False
     aid_length, aid = got
-    data, sw1, sw2 = _xfr(connection, toBytes("00a40404") + [aid_length] + toBytes(aid))
+    data, sw1, sw2 = _xfr(
+        connection, toBytes("00a40404%02X%s" % (aid_length, aid)))
     return sw1 == 0x90
 
 

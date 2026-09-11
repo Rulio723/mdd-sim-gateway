@@ -36,7 +36,9 @@ def _modem_for_line(instances, instance_id, runner, timeout):
     iccid = cellular_sms._instance_iccid(instances, instance_id)
     if not iccid:
         return None, "The line has no configured ICCID."
-    return cellular_sms._find_modem(iccid, runner, timeout)
+    return cellular_sms._find_modem(
+        iccid, runner, timeout,
+        imsi=cellular_sms._instance_imsi(instances, instance_id))
 
 
 def _check_ready(modem_path: str, runner, timeout: float) -> str | None:

@@ -63,6 +63,24 @@ class AmiClient:
             self._connected = True
             log.info("AMI connected instance=%s %s:%s", self.instance_id, self.host, self.port)
         except Exception as e:  # noqa  (asyncio.TimeoutError included)
+            # A Manager whose connect failed is not inert. panoramisk has already scheduled
+            # its pinger and its reconnect timer on the event loop, and those callbacks keep
+            # the object reachable, so nothing collects it. ami_for() caches this client and
+            # drops it on its next pass -- but until some caller asks for this instance again
+            # the Manager keeps sending Ping on a transport that never opened, once per ping
+            # interval, for as long as the control plane lives. Observed after an upgrade
+            # restarted the control plane while the engine containers were still starting:
+            # one refused connect left ~5 log lines a minute for hours.
+            #
+            # The failure path owns its own cleanup instead. Closing here cannot lose a
+            # connection that would otherwise have recovered: _connected is only ever set by
+            # a successful connect(), so a Manager that reconnects behind our back still
+            # leaves this client unusable and ami_for() rebuilds it either way.
+            self._closed = True
+            try:
+                self._mgr.close()
+            except Exception:
+                pass
             self._connected = False
             log.warning("AMI connect failed instance=%s: %r", self.instance_id, e)
 

@@ -4,6 +4,34 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-09-11
+
+### Fixed
+
+- An AMI connection that was refused no longer leaves its manager pinging a transport that
+  never opened. panoramisk schedules a pinger and a reconnect timer as soon as a manager is
+  created and the event loop keeps the object alive through them, so a failed connect logged
+  a send failure once per ping interval for as long as the control plane ran. Restarting the
+  control plane while the engine containers are still starting -- what an upgrade does --
+  was enough to trigger it.
+- Cellular SMS and calls can match a line by IMSI when ModemManager cannot read that SIM's
+  ICCID. A readable but different ICCID still fails closed instead of falling back to IMSI.
+- ML307X VoWiFi lines keep their allocated PIN, SWu and IMS reader slots across profile
+  switches, ignore extra unallocated VPCD readers, and retain a configured line IMEI when
+  the modem does not expose one live. Reselecting ADF.USIM after an IMSI-bound reader match
+  no longer calls an undefined helper, and now goes through the shared APDU exchange, so a
+  TPDU-level reader's `61xx` response is fetched rather than left pending for the next
+  command ([#74](https://github.com/MddIdd/mdd-sim-gateway/pull/74)).
+- `SWU_TUN_MTU` set on the control plane now reaches the engine containers it starts. The
+  engine has always read that variable to fix the `ipsec0` MTU, but a managed container was
+  given only its instance id and liveness period, so lowering the MTU for a carrier that
+  fragments changed nothing on any line the control plane started
+  ([#79](https://github.com/MddIdd/mdd-sim-gateway/pull/79)).
+- Installation now pulls in `mobile-broadband-provider-info`. A modem profile falls back to
+  `gsm.auto-config yes` when no bearer APN is visible, and that lookup reads the provider
+  database; without the package NetworkManager had no APN to dial, so cellular data could
+  not come up on a fresh install ([#80](https://github.com/MddIdd/mdd-sim-gateway/pull/80)).
+
 ## [1.9.2] - 2026-09-08
 
 ### Fixed

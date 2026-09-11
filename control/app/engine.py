@@ -467,6 +467,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         environment={
             "MDD_ID": iid,
             "SWU_LIVENESS_PERIOD": str(inst.get("liveness_period", 0)),
+            "SWU_TUN_MTU": os.environ.get("SWU_TUN_MTU", "1400"),
         },
         sysctls={
             "net.ipv6.conf.all.accept_ra": "0",

@@ -6286,7 +6286,7 @@ def _swu_select_adf_usim(conn):
     if aid is None:
         return False
     aid_len, a = aid
-    d, s1, s2 = _swu_xfr(conn, toBytes("00a40404") + [aid_len] + toBytes(a))
+    d, s1, s2 = _swu_xfr(conn, toBytes("00a40404%02X%s" % (aid_len, a)))
     return s1 == 0x90
 
 
@@ -6636,7 +6636,6 @@ def main():
     sa_list = ike_proposals_for_plmn(options.mcc, options.mnc)
     if (str(options.mcc).zfill(3), str(options.mnc).zfill(3)) == ("515", "066"):
         print("[swu_ike] DITO 515-66: using AES-CBC-128/SHA1/MODP-1024 IKE proposal")
-    
     try:
         destination_addr = socket.gethostbyname(options.destination_addr)
     except:

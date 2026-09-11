@@ -163,6 +163,122 @@ class EngineReaderBindingTests(unittest.TestCase):
         self.assertIsNone(connection)
 
 
+class UsimSelectFailClosedTests(unittest.TestCase):
+    """EF.DIR is the only proof of which application is the USIM. When the scan yields no AID,
+    the engine selectors must fail closed (origin/develop behavior), NOT blindly SELECT the
+    standard 3GPP USIM AID: the maintainer requires raw card evidence before that fallback, and
+    live node2 shows EF.DIR is readable, so the fallback is unproven. An AID that IS present
+    still selects normally."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pin_keeper = _load_engine_module("pin_keeper.py", "select_pin_keeper")
+        cls.ami_usim = _load_engine_module("ami_usim.py", "select_ami_usim")
+
+    class Connection:
+        """SELECT EF.DIR answers 9000 with an empty FCP, so the real _usim_aid_from_dir scan
+        finds no application and returns None. Records every APDU; a direct ADF.USIM SELECT
+        (00A40404 ...) appears only if the code blindly falls back to the standard USIM AID."""
+
+        def __init__(self, select_status=0x90):
+            self.select_status = select_status
+            self.commands = []
+
+        def transmit(self, command):
+            self.commands.append(command)
+            if str(command).lower().startswith("00a40404"):
+                return [], self.select_status, 0x00
+            return [], 0x90, 0x00
+
+    def _selected_aid(self, connection):
+        return any(str(c).lower().startswith("00a40404") for c in connection.commands)
+
+    def test_pin_keeper_fails_closed_when_ef_dir_names_no_aid(self):
+        connection = self.Connection()
+
+        self.assertFalse(self.pin_keeper.select_adf_usim(connection))
+        self.assertFalse(
+            self._selected_aid(connection),
+            "no AID from EF.DIR must not blindly SELECT the standard USIM AID")
+
+    def test_ami_usim_fails_closed_when_ef_dir_names_no_aid(self):
+        connection = self.Connection()
+
+        self.assertFalse(self.ami_usim.select_adf_usim(connection))
+        self.assertFalse(
+            self._selected_aid(connection),
+            "no AID from EF.DIR must not blindly SELECT the standard USIM AID")
+
+    def test_pin_keeper_selects_an_available_aid(self):
+        connection = self.Connection(select_status=0x90)
+
+        with patch.object(self.pin_keeper, "_usim_aid_from_dir",
+                          return_value=(7, "A0000000871002")):
+            self.assertTrue(self.pin_keeper.select_adf_usim(connection))
+        self.assertTrue(self._selected_aid(connection))
+
+    def test_ami_usim_selects_an_available_aid(self):
+        connection = self.Connection(select_status=0x90)
+
+        with patch.object(self.ami_usim, "_usim_aid_from_dir",
+                          return_value=(7, "A0000000871002")):
+            self.assertTrue(self.ami_usim.select_adf_usim(connection))
+        self.assertTrue(self._selected_aid(connection))
+
+    def test_pin_keeper_rejects_a_failed_direct_select_of_a_present_aid(self):
+        connection = self.Connection(select_status=0x6A)
+
+        with patch.object(self.pin_keeper, "_usim_aid_from_dir",
+                          return_value=(7, "A0000000871002")):
+            self.assertFalse(self.pin_keeper.select_adf_usim(connection))
+
+    def test_ami_usim_rejects_a_failed_direct_select_of_a_present_aid(self):
+        connection = self.Connection(select_status=0x6A)
+
+        with patch.object(self.ami_usim, "_usim_aid_from_dir",
+                          return_value=(7, "A0000000871002")):
+            self.assertFalse(self.ami_usim.select_adf_usim(connection))
+
+
+class AmiAuthenticateCompatibilityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ami_usim = _load_engine_module("ami_usim.py", "auth_ami_usim")
+
+    class Connection:
+        def disconnect(self):
+            return None
+
+        def transmit(self, command):
+            text = str(command).lower()
+            if text.startswith("00880081"):
+                data = [0xDB, 0x04, 1, 2, 3, 4, 0x10]
+                data += list(range(16))
+                data += [0x10] + list(range(16, 32))
+                return data, 0x90, 0x00
+            return [], 0x90, 0x00
+
+    def test_aka_accepts_inline_data_with_9000_status(self):
+        connection = self.Connection()
+        written = {}
+        with patch.object(self.ami_usim, "open_usim", return_value=connection), \
+                patch.object(self.ami_usim, "select_adf_usim", return_value=True), \
+                patch.object(self.ami_usim, "verify_pin", return_value=True), \
+                patch.object(self.ami_usim, "toHexString",
+                             side_effect=lambda value: " ".join(
+                                 f"{byte:02X}" for byte in value)), \
+                patch.object(self.ami_usim, "write_status",
+                             side_effect=lambda **value: written.update(value)):
+            res, ck, ik, auts = self.ami_usim.read_res_ck_ik(
+                "reader", "00" * 16, "11" * 16)
+
+        self.assertEqual(res, "01020304")
+        self.assertEqual(len(ck), 32)
+        self.assertEqual(len(ik), 32)
+        self.assertIsNone(auts)
+        self.assertEqual(written.get("state"), "AUTH_OK")
+
+
 class ForeignCardRefusalTests(unittest.TestCase):
     """A binding names a SLOT; only EF.ICCID says which CARD is in it.
 
@@ -296,6 +412,76 @@ class ForeignCardRefusalTests(unittest.TestCase):
         connection = _Connection("Reader A", iccid=None)
         with patch.dict(self.ami_usim.os.environ, {"USIM_ICCID": self.OURS}):
             self.assertIsNone(self.ami_usim.foreign_iccid(connection))
+
+
+class ReselectAdfAfterImsiReadTests(unittest.TestCase):
+    """make_reselect_adf re-selects ADF.USIM after the imsi: scan reads EF_IMSI (that read
+    leaves EF_IMSI current, not ADF.USIM). It must use the same inline SELECT ADF.USIM by AID
+    the sibling selectors (make_connection_index, select_adf_usim) use; a call to an undefined
+    _select_usim_aid once raised NameError the moment an imsi:-bound reader matched its card, so
+    the reselect must stay a plain inline SELECT. When EF.DIR names no AID it fails closed
+    rather than blindly selecting the standard USIM AID."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ami_usim = _load_engine_module("ami_usim.py", "reselect_ami_usim")
+
+    class Connection:
+        """Records every APDU. Answers the EF_IMSI READ BINARY (00B0000009) with encoded IMSI
+        bytes so the imsi: scan finds its target; every other command (including SELECT EF.DIR)
+        returns a bare 9000 with no FCP, so the real _usim_aid_from_dir scan yields no AID."""
+
+        def __init__(self, imsi_bytes=None):
+            self.commands = []
+            self.imsi_bytes = imsi_bytes
+
+        def transmit(self, command):
+            self.commands.append(command)
+            if str(command).lower() == "00b0000009" and self.imsi_bytes is not None:
+                return list(self.imsi_bytes), 0x90, 0x00
+            return [], 0x90, 0x00
+
+    def _selected_adf_usim(self, connection):
+        return any(str(c).lower().startswith("00a40404") for c in connection.commands)
+
+    def test_make_reselect_adf_selects_an_available_adf_usim_by_aid(self):
+        connection = self.Connection()
+
+        with patch.object(self.ami_usim, "_usim_aid_from_dir",
+                          return_value=(7, "A0000000871002")):
+            self.ami_usim.make_reselect_adf(connection)
+
+        self.assertTrue(
+            self._selected_adf_usim(connection),
+            "make_reselect_adf must SELECT ADF.USIM by AID (00A40404 ...) when EF.DIR names one")
+
+    def test_make_reselect_adf_fails_closed_when_ef_dir_names_no_aid(self):
+        connection = self.Connection()
+
+        self.ami_usim.make_reselect_adf(connection)
+
+        self.assertFalse(
+            self._selected_adf_usim(connection),
+            "no AID from EF.DIR must not blindly SELECT the standard USIM AID")
+
+    def test_imsi_binding_reselects_adf_usim_after_matching_the_target(self):
+        target = "234100000000000"
+        # EF_IMSI as the card returns it: length byte 08, then nibble-swapped BCD carrying a
+        # parity nibble ahead of the 15 IMSI digits. dec_imsi(...) decodes this back to target.
+        imsi_bytes = bytes.fromhex("082943010000000000")
+        connection = self.Connection(imsi_bytes=imsi_bytes)
+        reader = _Reader("Alcor Link AK9563 00 00")
+        with patch.object(self.ami_usim, "readers", return_value=[reader]), \
+                patch.object(self.ami_usim, "make_connection_index",
+                             return_value=connection), \
+                patch.object(self.ami_usim, "_usim_aid_from_dir",
+                             return_value=(7, "A0000000871002")):
+            result = self.ami_usim.make_connection_name("imsi:" + target)
+
+        self.assertIs(result, connection)
+        self.assertTrue(
+            self._selected_adf_usim(connection),
+            "the imsi: match must reselect ADF.USIM before handing back the connection")
 
 
 if __name__ == "__main__":

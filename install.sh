@@ -213,9 +213,9 @@ ensure_xray() {
 }
 
 ensure_cellular_tools() {
-  if have apt-get; then pkg_install modemmanager network-manager dbus
-  elif have dnf || have yum; then pkg_install ModemManager NetworkManager dbus
-  elif have pacman; then pkg_install modemmanager networkmanager dbus
+  if have apt-get; then pkg_install modemmanager network-manager mobile-broadband-provider-info dbus
+  elif have dnf || have yum; then pkg_install ModemManager NetworkManager mobile-broadband-provider-info dbus
+  elif have pacman; then pkg_install modemmanager networkmanager mobile-broadband-provider-info dbus
   fi
   have mmcli || die "ModemManager command mmcli is unavailable"
   have nmcli || die "NetworkManager command nmcli is unavailable"
