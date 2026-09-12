@@ -125,6 +125,57 @@ def _normalize_iccid(value) -> str:
     return "" if text == "--" else text
 
 
+def _sms_text(value) -> str:
+    """Return the readable body of an SMS, or empty when ModemManager has none yet.
+
+    mmcli renders an unreadable property as the literal placeholder "--", and the text of a
+    multi-part SMS stays unreadable until every part has arrived. Storing that placeholder
+    would both show "--" as a message and, once assembly completes, import the real text as a
+    second message, because the import fingerprint covers the body. A genuine one-character
+    body of "--" is indistinguishable here and is dropped with it; that is far rarer than an
+    incomplete multi-part SMS, which is a routine event on every long message.
+    """
+    text = str(value or "")
+    return "" if text.strip() == "--" else text
+
+
+# A carrier MMS notification is delivered over the SMS channel as a WAP Push with no readable
+# text and a binary WSP payload carrying this MIME type. The marker is the standard one from
+# WAP-209-MMSEncapsulation, so it identifies the notification for any carrier without keying
+# on a sender number, an SMSC or an MMSC host.
+_WAP_PUSH_MMS_MARKER = b"application/vnd.wap.mms-message"
+# Give up after a few failures so an object that can never be deleted (a read-only storage, a
+# revoked permission) does not put an mmcli call into every five-second poll forever.
+_WAP_PUSH_DELETE_ATTEMPTS = 3
+
+
+def _sms_data(value) -> bytes:
+    """Decode the mmcli rendering of an SMS binary payload; empty when absent or unparsable."""
+    if isinstance(value, (list, tuple)):
+        try:
+            return bytes(int(item) & 0xFF for item in value)
+        except (TypeError, ValueError):
+            return b""
+    text = str(value or "").strip()
+    if not text or text == "--":
+        return b""
+    # mmcli prints the payload as space-separated hex bytes; tolerate other byte separators.
+    compact = re.sub(r"[^0-9A-Fa-f]", "", text)
+    if not compact or len(compact) % 2:
+        return b""
+    try:
+        return bytes.fromhex(compact)
+    except ValueError:
+        return b""
+
+
+def _is_mms_wap_push(content: dict) -> bool:
+    """True for a binary MMS notification: no readable text plus the WAP Push MIME marker."""
+    if _sms_text(content.get("text")).strip():
+        return False
+    return _WAP_PUSH_MMS_MARKER in _sms_data(content.get("data"))
+
+
 def _normalize_imsi(value) -> str:
     """Return the digits-only comparison form of an IMSI, or empty when absent."""
     return re.sub(r"\D", "", str(value or ""))
@@ -455,18 +506,33 @@ class Scanner:
 
     def __init__(self, runner=subprocess.run, *, topology_ttl: float = 60.0,
                  detail_ttl: float = 60.0, clock=time.monotonic,
-                 local_sms_tracker=None, epoch_getter=_modemmanager_epoch):
+                 local_sms_tracker=None, epoch_getter=_modemmanager_epoch,
+                 drop_mms_wap_push: bool = True):
         self.runner = runner
         self.topology_ttl = topology_ttl
         self.detail_ttl = detail_ttl
         self.clock = clock
         self.local_sms_tracker = local_sms_tracker
         self.epoch_getter = epoch_getter
+        self.drop_mms_wap_push = drop_mms_wap_push
         self._daemon_epoch = ""
         self._topology_expires = 0.0
         self._topology: list[tuple[str, str]] = []
         self._details: dict[tuple[str, str], tuple[float, dict]] = {}
         self._local_sms_keys: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+        self._wap_push_attempts: dict[tuple[str, str], int] = {}
+
+    def _consume_mms_wap_push(self, key: tuple[str, str], modem_path: str,
+                              sms_path: str) -> None:
+        """Delete one recognised MMS notification so modem/SIM storage cannot fill up."""
+        attempts = self._wap_push_attempts.get(key, 0)
+        if attempts >= _WAP_PUSH_DELETE_ATTEMPTS:
+            return
+        self._wap_push_attempts[key] = attempts + 1
+        result, problem = _invoke(
+            ["-m", modem_path, f"--messaging-delete-sms={sms_path}"], self.runner, 10)
+        if problem is None and not result.returncode:
+            self._wap_push_attempts.pop(key, None)
 
     def _refresh_topology(self, now: float) -> None:
         topology = []
@@ -484,6 +550,7 @@ class Scanner:
         if topology != self._topology:
             self._details.clear()
             self._local_sms_keys.clear()
+            self._wap_push_attempts.clear()
         self._topology = topology
         # Empty topology is retried quickly so modem hot-plug discovery stays responsive.
         self._topology_expires = now + (self.topology_ttl if topology else min(5.0, self.topology_ttl))
@@ -496,6 +563,7 @@ class Scanner:
             # Object paths and their cached details belong to one ModemManager generation.
             self._details.clear()
             self._local_sms_keys.clear()
+            self._wap_push_attempts.clear()
             self._daemon_epoch = daemon_epoch
         if now >= self._topology_expires:
             self._refresh_topology(now)
@@ -558,9 +626,20 @@ class Scanner:
                 else:
                     sms = _run_json(["-s", sms_path], self.runner).get("sms") or {}
                     content, props = sms.get("content") or {}, sms.get("properties") or {}
-                    text, peer = str(content.get("text") or ""), str(content.get("number") or "")
+                    text, peer = _sms_text(content.get("text")), str(content.get("number") or "")
+                    if str(props.get("state") or "").lower() == "receiving":
+                        # ModemManager is still collecting the parts of a multi-part SMS.
+                        # Import once the assembled text is final; a partial body would be
+                        # stored now and the complete one imported again as a second message.
+                        self._details.pop(key, None)
+                        continue
                     if not text.strip():
                         self._details.pop(key, None)
+                        # A carrier MMS notification has no displayable form here and the
+                        # gateway never retrieves MMS, so nothing will ever consume it. Left
+                        # in place it occupies modem/SIM SMS storage indefinitely.
+                        if self.drop_mms_wap_push and _is_mms_wap_push(content):
+                            self._consume_mms_wap_push(key, modem_path, sms_path)
                         continue
                     pdu_type = str(props.get("pdu-type") or "").lower()
                     direction = "out" if pdu_type == "submit" else "in"
@@ -606,12 +685,18 @@ class Scanner:
                         pass
         # Bound memory when ModemManager deletes SMS objects or a SIM is no longer configured.
         self._details = {key: value for key, value in self._details.items() if key in live_keys}
+        self._wap_push_attempts = {key: value for key, value in self._wap_push_attempts.items()
+                                   if key in live_keys}
         for key in list(self._local_sms_keys):
             if key not in live_local_keys:
                 self._local_sms_keys.pop(key, None)
         return found
 
 
-def discover(instances: list[dict], runner=subprocess.run) -> list[dict]:
-    """One-shot compatibility wrapper used by diagnostics and callers outside the poller."""
-    return Scanner(runner).discover(instances)
+def discover(instances: list[dict], runner=subprocess.run, *,
+             drop_mms_wap_push: bool = False) -> list[dict]:
+    """One-shot compatibility wrapper used by diagnostics and callers outside the poller.
+
+    Deleting an SMS object is the poller's job: a diagnostic read stays free of side effects.
+    """
+    return Scanner(runner, drop_mms_wap_push=drop_mms_wap_push).discover(instances)

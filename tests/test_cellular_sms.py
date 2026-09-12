@@ -9,6 +9,10 @@ from unittest.mock import patch
 from control.app import cellular_sms, store
 
 TEST_EPOCH = "a" * 64
+MODEM = "/org/freedesktop/ModemManager1/Modem/0"
+SIM = "/org/freedesktop/ModemManager1/SIM/0"
+SMS = "/org/freedesktop/ModemManager1/SMS/7"
+LINE = [{"id": "3", "iccid": "card-a"}]
 
 
 class Result:
@@ -48,6 +52,38 @@ class MemoryTracker:
 
     def cancel_local_modem_sms(self, reservation_id):
         self.calls.append(("cancel", reservation_id))
+
+
+def wap_push_sms() -> dict:
+    """A carrier MMS notification as ModemManager reports it: no text, binary WSP payload."""
+    payload = b"\x23\x06\x24" + b"application/vnd.wap.mms-message" + b"\x00"
+    return {
+        "content": {"number": "+8526335500032116", "text": "--",
+                    "data": " ".join(f"{byte:02X}" for byte in payload)},
+        "properties": {"pdu-type": "deliver", "state": "received",
+                       "timestamp": "2026-09-12T09:00:00+08:00"},
+    }
+
+
+def sms_runner(detail: list, *, calls=None, delete_returncode: int = 0):
+    """One modem holding one SMS object whose detail JSON can be swapped between polls."""
+    def runner(args, **_kwargs):
+        if calls is not None:
+            calls.append(tuple(args))
+        if args == ["mmcli", "-L"]:
+            return Result(MODEM)
+        if args == ["mmcli", "-m", MODEM, "--output-json"]:
+            return Result(json.dumps({"modem": {"generic": {"sim": SIM}}}))
+        if args == ["mmcli", "-i", SIM, "--output-json"]:
+            return Result(json.dumps({"sim": {"properties": {"iccid": "card-a"}}}))
+        if args == ["mmcli", "-m", MODEM, "--messaging-list-sms", "--output-json"]:
+            return Result(json.dumps({"modem.messaging.sms": [SMS]}))
+        if args == ["mmcli", "-s", SMS, "--output-json"]:
+            return Result(json.dumps({"sms": detail[0]}))
+        if args == ["mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"]:
+            return Result(returncode=delete_returncode)
+        return Result(returncode=1)
+    return runner
 
 
 class CellularSmsTests(unittest.TestCase):
@@ -182,6 +218,84 @@ class CellularSmsTests(unittest.TestCase):
         listing[0] = {"modem.messaging.sms": ["not-an-object-path"]}
         scanner.discover([{"id": "3", "iccid": "card-a"}])
         self.assertEqual(tracker.prunes, [])
+
+    def test_incomplete_multipart_sms_is_never_imported_as_its_mmcli_placeholder(self):
+        detail = [{
+            "content": {"number": "+44123", "text": "--"},
+            "properties": {"pdu-type": "deliver", "state": "receiving",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        runner = sms_runner(detail)
+        now = [10.0]
+        scanner = cellular_sms.Scanner(runner, clock=lambda: now[0])
+
+        self.assertEqual(scanner.discover(LINE), [])
+        # A ModemManager build that reports no state must not import the placeholder either.
+        detail[0]["properties"].pop("state")
+        now[0] += 1
+        self.assertEqual(scanner.discover(LINE), [])
+
+        detail[0] = {
+            "content": {"number": "+44123", "text": "part one and part two"},
+            "properties": {"pdu-type": "deliver", "state": "received",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }
+        now[0] += 1
+        rows = scanner.discover(LINE)
+        self.assertEqual([row["body"] for row in rows], ["part one and part two"])
+
+    def test_mms_wap_push_notification_is_deleted_instead_of_imported(self):
+        calls = []
+        runner = sms_runner([wap_push_sms()], calls=calls)
+        scanner = cellular_sms.Scanner(runner)
+
+        self.assertEqual(scanner.discover(LINE), [])
+        self.assertIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_mms_wap_push_notification_is_kept_when_dropping_is_disabled(self):
+        calls = []
+        runner = sms_runner([wap_push_sms()], calls=calls)
+        scanner = cellular_sms.Scanner(runner, drop_mms_wap_push=False)
+
+        self.assertEqual(scanner.discover(LINE), [])
+        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_only_the_wap_push_mime_marker_authorizes_a_delete(self):
+        # An unreadable text alone is not enough: the object may still become importable.
+        detail = [{
+            "content": {"number": "+44123", "text": "--", "data": "01 02 03"},
+            "properties": {"pdu-type": "deliver", "state": "received",
+                           "timestamp": "2026-09-12T09:00:00+08:00"},
+        }]
+        calls = []
+        scanner = cellular_sms.Scanner(sms_runner(detail, calls=calls))
+        self.assertEqual(scanner.discover(LINE), [])
+
+        # Neither is a readable message that happens to carry the marker in its payload.
+        detail[0]["content"] = {"number": "+44123", "text": "hello",
+                                "data": wap_push_sms()["content"]["data"]}
+        rows = scanner.discover(LINE)
+
+        self.assertEqual([row["body"] for row in rows], ["hello"])
+        self.assertNotIn(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"), calls)
+
+    def test_undeletable_wap_push_stops_retrying_after_its_attempt_budget(self):
+        calls = []
+        runner = sms_runner([wap_push_sms()], calls=calls, delete_returncode=1)
+        scanner = cellular_sms.Scanner(runner)
+        for _ in range(6):
+            self.assertEqual(scanner.discover(LINE), [])
+
+        attempts = calls.count(("mmcli", "-m", MODEM, f"--messaging-delete-sms={SMS}"))
+        self.assertEqual(attempts, cellular_sms._WAP_PUSH_DELETE_ATTEMPTS)
+
+    def test_sms_binary_payload_decoding_tolerates_mmcli_renderings(self):
+        self.assertEqual(cellular_sms._sms_data("23 06 24"), b"\x23\x06\x24")
+        self.assertEqual(cellular_sms._sms_data("230624"), b"\x23\x06\x24")
+        self.assertEqual(cellular_sms._sms_data([35, 6, 36]), b"\x23\x06\x24")
+        self.assertEqual(cellular_sms._sms_data("--"), b"")
+        self.assertEqual(cellular_sms._sms_data(None), b"")
+        self.assertEqual(cellular_sms._sms_data("23 06 2"), b"")
 
     def test_send_matches_case_insensitive_iccid_and_passes_typed_dbus_text(self):
         modem = "/org/freedesktop/ModemManager1/Modem/2"

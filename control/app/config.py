@@ -29,6 +29,13 @@ _lock = threading.RLock()
 # deployment configuration.
 MAX_SIM_LINES = 5
 
+# SIP User-Agent a line presents to the IMS core. The product identifies itself honestly by
+# default; a line may override it because some carriers gate IMS registration on a User-Agent
+# whitelist and answer 403 to anything they do not recognise (issue #83). The cap keeps the
+# header inside what a P-CSCF will accept.
+DEFAULT_USER_AGENT = "MDD-Sim-Gateway"
+MAX_USER_AGENT_LEN = 64
+
 
 class LineLimitError(ValueError):
     pass
@@ -71,6 +78,12 @@ DEFAULTS = {
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
         "ring_timeout": 35,
+        # A carrier MMS notification reaches the SMS channel as a WAP Push: no readable text
+        # and a binary WSP payload. The gateway never retrieves MMS, so the object can neither
+        # be shown nor forwarded, and nothing else consumes it -- it holds modem/SIM SMS
+        # storage until that storage is full and no new SMS can be received. Delete it once
+        # recognised. Set false to keep the raw objects for troubleshooting.
+        "drop_mms_wap_push": True,
         # Voicemail defaults. Off unless asked for: recording a caller is the operator's
         # decision. Per-line overrides live in the line's sip.* block, like ring_timeout.
         "vm_enabled": False,
@@ -779,6 +792,12 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
     # Ignore stale clients and hand-written API requests that try to restore remote SIP
     # accounts. Only the authenticated browser softphone endpoint is rendered.
     sip["external"] = []
+    # Normalise the User-Agent on the way in so the saved line reads back exactly what it
+    # presents to the carrier; sanitising only at render time would show the operator text
+    # that pjsip.conf never receives. render_instance_json sanitises again for configs that
+    # were hand-edited rather than saved through here.
+    if "user_agent" in sip:
+        sip["user_agent"] = sanitize_user_agent(sip.get("user_agent"))
     wr = sip.setdefault("webrtc", {})
     wr.setdefault("username", "webrtc")
     if not wr.get("password"):
@@ -869,6 +888,21 @@ def card_auto_create_suppressed(iccid: str) -> bool:
 def normalize_imei(imei: str) -> str:
     """Strip any formatting (dashes/spaces) from an IMEI and return just the digits."""
     return "".join(ch for ch in (imei or "") if ch.isdigit())
+
+
+def sanitize_user_agent(value: str) -> str:
+    """Return a single-line SIP User-Agent, or '' meaning "use DEFAULT_USER_AGENT".
+
+    The value lands verbatim in pjsip.conf's ``[global] user_agent``, so a newline would let a
+    saved line append arbitrary Asterisk configuration. Everything outside printable ASCII
+    becomes a space and runs of whitespace collapse, which also disposes of CR/LF and tabs.
+    ';' goes the same way: Asterisk starts a comment there, so keeping it would silently
+    truncate the header at render time instead of at the point the operator typed it.
+    Mirrored by engine/render.py for hand-authored instance.json files.
+    """
+    cleaned = "".join(ch if " " <= ch <= "~" and ch != ";" else " "
+                      for ch in str(value or ""))
+    return " ".join(cleaned.split())[:MAX_USER_AGENT_LEN].strip()
 
 
 def imeisv_from_imei(imei: str, imeisv: str = "", svn: str = "00") -> str:
@@ -1108,9 +1142,10 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
                 sip.get("vm_ring_seconds") or settings.get("vm_ring_seconds", 25)))),
             "vm_max_seconds": max(30, min(300, int(
                 sip.get("vm_max_seconds") or settings.get("vm_max_seconds", 120)))),
-            # Public builds identify themselves honestly; stale/manual settings cannot make
-            # the gateway impersonate a handset model.
-            "user_agent": "MDD-Sim-Gateway",
+            # Honest product identity unless the line explicitly overrides it: carriers that
+            # gate IMS registration on a User-Agent whitelist reject the default with 403, and
+            # the operator running that SIM is the one who can tell. Blank = default.
+            "user_agent": sanitize_user_agent(sip.get("user_agent")) or DEFAULT_USER_AGENT,
             # Some IMS cores require telephone-number request URIs to carry ;user=phone before
             # they will route an originating voice INVITE. Keep this carrier-configurable because
             # other networks reject SMS MESSAGE request URIs when the parameter is present.

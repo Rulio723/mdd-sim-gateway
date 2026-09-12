@@ -112,6 +112,23 @@ def imeisv_from_imei(imei, imeisv="", svn="00"):
     return base14 + svn2
 
 
+DEFAULT_USER_AGENT = "MDD-Sim-Gateway"
+MAX_USER_AGENT_LEN = 64
+
+
+def sanitize_user_agent(value):
+    """Return a single-line SIP User-Agent, or '' meaning "use DEFAULT_USER_AGENT".
+
+    Mirrors control/app/config.sanitize_user_agent so a hand-authored instance.json cannot put
+    a newline (and with it arbitrary Asterisk configuration) into pjsip.conf's [global]
+    user_agent. ';' is dropped for the same reason it is there: Asterisk reads it as the start
+    of a comment.
+    """
+    cleaned = "".join(ch if " " <= ch <= "~" and ch != ";" else " "
+                      for ch in str(value or ""))
+    return " ".join(cleaned.split())[:MAX_USER_AGENT_LEN].strip()
+
+
 def build_context(cfg):
     mcc = str(cfg["mcc"])
     mnc = str(cfg["mnc"]).zfill(3)
@@ -171,8 +188,9 @@ def build_context(cfg):
         # carrier P-CSCF augments this; a bogus value can make some SMSCs reject MO SMS.
         "pani": (sip.get("pani") or r"IEEE-802.11\;i-wlan-node-id=ffffffffffff"),
         "access_type": (sip.get("access_type") or ""),
-        # Use a transparent product identity rather than impersonating a phone.
-        "user_agent": "MDD-Sim-Gateway",
+        # Transparent product identity unless the line overrides it (carrier User-Agent
+        # whitelists answer 403 to an unknown terminal). Blank/unset keeps the default.
+        "user_agent": sanitize_user_agent(sip.get("user_agent")) or DEFAULT_USER_AGENT,
         "user_eq_phone": bool(sip.get("user_eq_phone", False)),
         # SDP identity (s=/o= lines) — Asterisk defaults s=Asterisk which fingerprints it.
         "sdp_session": (sip.get("sdp_session") or "-"),

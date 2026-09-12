@@ -194,6 +194,7 @@ const zh = {
   'Two-letter ISO code. Leave blank to select the exit from the SIM MCC.': '两位 ISO 国家代码。留空时根据 SIM MCC 自动选择出口。',
   'IMEISV — optional': 'IMEISV（可选）', 'SMS centre (SMSC)': '短信中心（SMSC）', 'Auto (from SIM)': '自动（从 SIM 读取）', Manual: '手动',
   'Device User-Agent (how the line identifies to the carrier)': '设备 User-Agent（线路向运营商报告的设备身份）',
+  'Leave empty to identify as MDD-Sim-Gateway. Set this only when the carrier rejects registration from an unrecognised terminal.': '留空则以 MDD-Sim-Gateway 身份标识。仅当运营商拒绝未知终端注册时才需要填写。',
   'Advanced IMS identity': '高级 IMS 身份',
   'Carrier defaults are applied automatically. Change these fields only when required by the carrier.': '系统会自动应用运营商默认值；仅在运营商明确要求时修改这些字段。',
   'Automatic carrier default': '自动使用运营商默认值', 'IMS access type': 'IMS 接入类型',

@@ -410,6 +410,14 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
                 placeholder={t('Automatic carrier default')} />
             </Field>
           </div>
+          <Field label={t('Device User-Agent (how the line identifies to the carrier)')}>
+            <input className="mono" maxLength={64} value={form.sip.user_agent || ''}
+              onChange={(e) => updSip({ user_agent: e.target.value })}
+              placeholder="MDD-Sim-Gateway" />
+            <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 2 }}>
+              {t('Leave empty to identify as MDD-Sim-Gateway. Set this only when the carrier rejects registration from an unrecognised terminal.')}
+            </div>
+          </Field>
           <label style={{ marginTop: 8 }}>
             <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={!!form.sip.user_eq_phone}
               onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />

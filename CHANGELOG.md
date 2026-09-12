@@ -4,6 +4,34 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.9.4] - 2026-09-12
+
+### Added
+
+- A line can present its own SIP User-Agent, set under Advanced IMS identity. Carriers that
+  gate IMS registration on a terminal whitelist answer 403 to an unrecognised User-Agent, and
+  configuring the IMEI does not help -- that value only reaches the ePDG's DEVICE_IDENTITY.
+  Left empty a line still identifies as `MDD-Sim-Gateway`. The value is rendered into
+  `pjsip.conf`, so it is reduced to a single line of printable ASCII and capped at 64
+  characters ([#83](https://github.com/MddIdd/mdd-sim-gateway/issues/83)).
+
+### Fixed
+
+- A multi-part SMS is no longer imported twice, the first copy reading `--`. `mmcli` renders
+  the still-unassembled text of a multi-part message as its placeholder `--`, and the receive
+  scanner stored that as a body; when the remaining parts arrived the assembled text was
+  imported again as a separate message, because the import fingerprint covers the body. The
+  placeholder and ModemManager's `receiving` state now both count as "no readable text yet"
+  ([#84](https://github.com/MddIdd/mdd-sim-gateway/issues/84)).
+- A carrier MMS notification is deleted from ModemManager instead of holding modem/SIM SMS
+  storage indefinitely. It arrives on the SMS channel as a WAP Push carrying no readable text
+  and a binary WSP payload, so a gateway that never retrieves MMS can neither show nor forward
+  it and nothing else ever consumes it; on a SIM that receives them regularly the storage
+  eventually fills and no new SMS can arrive. Recognition requires both an unreadable text and
+  the standard `application/vnd.wap.mms-message` marker, so it keys on no carrier's sender
+  number, SMSC or MMSC host. Set `drop_mms_wap_push: false` under `settings` to keep the raw
+  objects ([#85](https://github.com/MddIdd/mdd-sim-gateway/issues/85)).
+
 ## [1.9.3] - 2026-09-11
 
 ### Fixed

@@ -1888,7 +1888,13 @@ async def cellular_sms_poller():
     scanner = cellular_sms.Scanner(local_sms_tracker=store)
     while True:
         try:
-            discovered = await asyncio.to_thread(scanner.discover, cfg.list_instances())
+            # One config read serves both the line list and the scanner's policy flag, so the
+            # operator's choice takes effect without restarting the control plane.
+            conf = await asyncio.to_thread(cfg.load)
+            scanner.drop_mms_wap_push = bool(
+                (conf.get("settings") or {}).get("drop_mms_wap_push", True))
+            discovered = await asyncio.to_thread(
+                scanner.discover, list((conf.get("instances") or {}).values()))
             for item in discovered:
                 rec = await asyncio.to_thread(
                     store.add_imported_message, item["fingerprint"], item["instance"],
