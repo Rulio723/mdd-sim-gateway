@@ -220,6 +220,55 @@ ensure_cellular_tools() {
   have mmcli || die "ModemManager command mmcli is unavailable"
   have nmcli || die "NetworkManager command nmcli is unavailable"
   ensure_modemmanager_command_interface
+  ensure_mms_at_port_rule
+}
+
+# Sending MMS through a modem's embedded TCP/IP stack needs an AT port the gateway owns:
+# through ModemManager's command channel the module's upload command never completes, so each
+# chunk waits out a timeout, and a run of them makes ModemManager drop the modem. This rule
+# releases only a port ModemManager itself classifies as a Quectel module's *secondary* AT
+# port; the primary AT port and QMI/MBIM stay with ModemManager, and a module with a single
+# AT port has no secondary one to match.
+MMS_AT_PORT_RULE="${MDD_UDEV_RULES_DIR:-/etc/udev/rules.d}/78-mdd-mms-at-port.rules"
+
+# Re-evaluate tty udev properties and let ModemManager re-probe with them. Both are needed: a
+# changed rules file only reaches the udev database on the next event for the device, and
+# ModemManager reads ID_MM_PORT_IGNORE when it probes a port.
+reapply_modem_port_rules() {
+  if have udevadm; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --action=change --subsystem-match=tty 2>/dev/null || true
+    udevadm settle --timeout=10 2>/dev/null || true
+  fi
+  if have systemctl && systemctl is-active ModemManager.service >/dev/null 2>&1; then
+    systemctl restart ModemManager.service
+  fi
+}
+
+ensure_mms_at_port_rule() {
+  [ -d "$(dirname "$MMS_AT_PORT_RULE")" ] || return 0
+  rule_file=$MMS_AT_PORT_RULE
+  temporary=$(mktemp /tmp/mdd-udev.XXXXXX)
+  cat >"$temporary" <<'RULE'
+# MDD Sim Gateway: let the gateway own a Quectel module's secondary AT port for MMS uploads.
+# ModemManager keeps the primary AT port and QMI; a module with a single AT port is unaffected.
+ACTION!="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="2c7c", ENV{ID_MM_PORT_TYPE_AT_SECONDARY}=="1", ENV{ID_MM_PORT_IGNORE}="1"
+RULE
+  if [ ! -f "$rule_file" ] || ! cmp -s "$temporary" "$rule_file"; then
+    install -m 0644 "$temporary" "$rule_file"
+    info "releasing the modem's secondary AT port for MMS (ModemManager restarts)…"
+    reapply_modem_port_rules
+  fi
+  rm -f "$temporary"
+}
+
+# Uninstall: give the port back. Removing the file alone would leave ID_MM_PORT_IGNORE in the
+# udev database, and the port ignored, until the next reboot.
+remove_mms_at_port_rule() {
+  [ -f "$MMS_AT_PORT_RULE" ] || return 0
+  rm -f "$MMS_AT_PORT_RULE"
+  info "returning the modem's secondary AT port to ModemManager (ModemManager restarts)…"
+  reapply_modem_port_rules
 }
 
 # The module SIM bridge sends APDUs through ModemManager's guarded AT command API.  Upstream
@@ -731,9 +780,9 @@ handoff_release_images() {
 prepare_release_images() {
   [ "${MDD_BUILD_IMAGES:-0}" != 1 ] || {
     info "building images from source (MDD_BUILD_IMAGES=1)"
-    return
+    return 0
   }
-  [ -f "$ENGINE_HANDOFF_MANIFEST" ] || return
+  [ -f "$ENGINE_HANDOFF_MANIFEST" ] || return 0
   have python3 || die "python3 is required to import Release image assets"
   MDD_REUSE_WEBUI=1
   MDD_PRUNE_BUILD_CACHE=1
@@ -741,13 +790,13 @@ prepare_release_images() {
   if engine_matches_checkout; then
     if [ "$MODE" = local ]; then
       info "installed Engine already matches the official release — reusing images"
-      return
+      return 0
     fi
     if control_image_matches_checkout; then
       MDD_REUSE_CONTROL_IMAGE=1
       export MDD_REUSE_CONTROL_IMAGE
       info "installed Engine and Control already match the official release — reusing images"
-      return
+      return 0
     fi
   fi
   version=$(tr -d '\n' < "$REPO_DIR/VERSION")
@@ -1402,6 +1451,7 @@ cmd_uninstall() {
   info "removing native control plane (if any)…"
   remove_control_local
   remove_orchestrator
+  remove_mms_at_port_rule
   if [ -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf ]; then
     rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
     systemctl daemon-reload >/dev/null 2>&1 || true

@@ -7,6 +7,9 @@ whose engine predated service-code support saw the feature fail and was told "th
 does not support this code", when the request had never left the gateway.
 """
 import re
+import shlex
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -121,13 +124,30 @@ class EngineImageRefreshTests(unittest.TestCase):
         self.assertLess(install_body.index("prepare_release_images"),
                         install_body.index("ensure_engine_image"))
         prepare = _body("prepare_release_images")
-        self.assertIn('[ -f "$ENGINE_HANDOFF_MANIFEST" ] || return', prepare)
+        self.assertIn('[ -f "$ENGINE_HANDOFF_MANIFEST" ] || return 0', prepare)
         self.assertIn('--install-images --install-mode "$MODE"', prepare)
         self.assertIn("MDD_BUILD_IMAGES=1", prepare)
         self.assertIn("MDD_REUSE_WEBUI=1", prepare)
         self.assertIn("MDD_REUSE_CONTROL_IMAGE=1", prepare)
         self.assertIn("engine_matches_checkout", prepare)
         self.assertIn("control_image_matches_checkout", prepare)
+
+    def test_development_checkout_without_release_manifest_continues_under_set_e(self):
+        prepare = _body("prepare_release_images") + "\n}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "release-image.SHA256SUMS"
+            script = "\n".join((
+                "set -eu",
+                f"ENGINE_HANDOFF_MANIFEST={shlex.quote(str(missing))}",
+                prepare,
+                "prepare_release_images",
+                "printf continued",
+            ))
+            result = subprocess.run(
+                ["/bin/sh"], input=script, text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "continued")
 
 
 if __name__ == "__main__":

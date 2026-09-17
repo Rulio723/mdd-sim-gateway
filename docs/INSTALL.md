@@ -33,6 +33,8 @@ sudo ./install.sh install --mode docker   # 控制面也运行在 Docker
 
 可用环境变量：`MDD_PORT`、`MDD_DATA_DIR`、`MDD_BIND`、`MDD_ADVERTISE_ADDR`、`MDD_SINGBOX_VERSION`、`MDD_XRAY_VERSION`、`MDD_LPAC_VERSION`。安装程序会校验 sing-box 与 Xray-core 归档的 SHA-256；Xray-core 仅用于 Reality/XHTTP 节点的本机回环兼容层。更换固定依赖版本时必须同步审核并更新 SHA-256。离线迁移或显式执行源码构建时，可设置 `MDD_ENGINE_BASE_IMAGE`，从本机已审核的兼容引擎镜像创建只覆盖 MDD 运行脚本与模板的镜像；已经在可信构建机完成 `npm ci && npm run build` 时，也可设置 `MDD_REUSE_WEBUI=1` 复用随源码传入的 `webui/dist`。正式源码包的全新在线安装不需要设置这两项，安装程序会默认使用经校验的预构建镜像。必须执行全量 Engine 构建、但安装网络无法访问默认 GitHub mirror 时，可将 `PJPROJECT_REPOSITORY` 和 `ASTERISK_REPOSITORY` 显式指向另一条经过审核且包含相同固定 commit 的 HTTPS Git 仓库；未设置时继续使用 Dockerfile 中的项目 mirror。不得关闭 TLS 验证或改用未经审核的源码。
 
+4G 模块收到的短信写入数据库后，新安装默认从 Modem/SIM 存储中删除，以免存储写满后无法再收短信；从旧版本升级的安装首次启动时会在配置中写入 `cellular_sms_storage: keep`，不自动清空模块，需要时手动改为 `delete`。可在控制服务的环境中设置 `MDD_CELLULAR_SMS_STORAGE`：`delete`（默认，入库后删除）、`when_full`（保留在模块中，仅在存储将满时删除最早的已入库短信）或 `keep`（始终保留）。`when_full` 通过 `AT+CPMS?` 读取容量，需要 ModemManager 以 `--debug` 运行；否则按 `MDD_CELLULAR_SMS_STORAGE_LIMIT`（默认 20 条）计算。配置文件 `settings.cellular_sms_storage` 若已设置，则优先于环境变量。
+
 `MDD_DATA_DIR` 在首次安装后会写入系统状态；后续执行 `status`、`reload` 和 `uninstall` 时不必再次填写，避免自定义数据目录被误判为新安装。
 
 如果系统 Docker 已经可以连接，安装脚本只复用它，不升级版本、不修改 daemon 配置，也不

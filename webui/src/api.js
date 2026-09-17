@@ -26,6 +26,24 @@ async function j(method, path, body) {
   return data
 }
 
+// Multipart form submit (file uploads). Mirrors j()'s CSRF/401/error handling, but must not
+// set a Content-Type header itself -- the browser needs to add the multipart boundary.
+async function form(method, path, formData) {
+  const opt = { method, headers: {}, body: formData }
+  if (csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(method)) opt.headers['X-MDD-CSRF-Token'] = csrfToken
+  const r = await fetch(base + path, opt)
+  const text = await r.text()
+  let data
+  try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text } }
+  if (r.status === 401 && csrfToken) {
+    csrfToken = ''
+    window.dispatchEvent(new CustomEvent('mdd-auth-expired'))
+  }
+  const detailMsg = data.detail && typeof data.detail === 'object' ? (data.detail.message || data.detail.code) : data.detail
+  if (!r.ok) throw Object.assign(new Error(detailMsg || data.error || r.statusText), { status: r.status, data })
+  return data
+}
+
 /** Build query string. Prefer reader NAME (stable); index is optional fallback. */
 function readerQuery(readerOrIndex, maybeName) {
   const q = new URLSearchParams()
@@ -146,6 +164,24 @@ export const api = {
   runKeepalive: (id) => j('POST', `/api/instances/${id}/keepalive/run`),
   // delete messages: { ids:[...] } | { peer } (whole conversation) | { all:true }
   deleteMessages: (id, sel) => j('POST', `/api/instances/${id}/messages/delete`, sel),
+
+  // MMS. Sending is multipart/form-data (attachments), so it goes through form() rather
+  // than j(); everything else is plain JSON like the rest of the API.
+  mmsDownload: (id, mid) => j('POST', `/api/instances/${id}/messages/${mid}/mms/download`, {}),
+  // Same-origin, cookie-authenticated URL for a part's content — used directly as an <img
+  // src>, <audio>/<video> src, or download <a href>. download=1 forces attachment disposition.
+  mmsPartUrl: (id, mid, pid, download = false) =>
+    `/api/instances/${id}/messages/${mid}/mms/parts/${pid}${download ? '?download=1' : ''}`,
+  sendMms: (id, { to, text, subject, files }) => {
+    const fd = new FormData()
+    fd.append('to', to || '')
+    fd.append('text', text || '')
+    if (subject) fd.append('subject', subject)
+    for (const file of (files || [])) fd.append('attachments', file, file.name)
+    return form('POST', `/api/instances/${id}/mms/send`, fd)
+  },
+  mmsSettings: (id) => j('GET', `/api/instances/${id}/mms/settings`),
+  saveMmsSettings: (id, body) => j('PUT', `/api/instances/${id}/mms/settings`, body),
 
   voicemails: (id) => j('GET', `/api/instances/${id}/voicemails`),
   // Served as audio/wav by the control plane; the <audio> element fetches it directly

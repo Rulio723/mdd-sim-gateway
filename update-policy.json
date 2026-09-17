@@ -1,21 +1,21 @@
 {
   "schema": 1,
   "release": {
-    "version": "1.9.5",
-    "kind": "patch"
+    "version": "1.10.0",
+    "kind": "main"
   },
   "auto_update": {
-    "version": "1.9.1",
-    "not_before": "2026-09-04T17:17:53Z"
+    "version": "1.9.5",
+    "not_before": "2026-09-17T17:18:00Z"
   },
   "channels": {
     "all": {
-      "version": "1.9.1",
-      "not_before": "2026-09-04T17:17:53Z"
+      "version": "1.9.5",
+      "not_before": "2026-09-17T17:18:00Z"
     },
     "main": {
-      "version": "1.9.1",
-      "not_before": "2026-09-04T17:17:53Z"
+      "version": "1.9.5",
+      "not_before": "2026-09-17T17:18:00Z"
     }
   }
 }

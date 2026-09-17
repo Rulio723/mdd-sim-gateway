@@ -154,4 +154,22 @@ sudo systemctl restart docker
 3. 换完镜像**每条线都要重建**。恰好绑在 reader 索引 0 上的那条线在旧镜像下
    "看起来正常"，其实是回退撞对的，不换同样不可信。
 
+## 彩信（MMS）收不到或发不出
+
+彩信分两步：通知以 WAP Push 短信到达（VoWiFi 或 4G 模块均可），正文再从运营商 MMSC 通过 HTTP 取回。MMSC 通常只在运营商的彩信 APN 内可达，公网和普通上网 APN 访问不到。
+
+1. **设置是否已识别**：短信页“彩信设置”会显示按 SIM 网络代码从 `mobile-broadband-provider-info` 查到的 APN、MMSC 与代理。查不到时需手动填写 MMSC（`http://` 开头）、APN 和代理（`host:port`）。
+2. **模块通道**：“自动”在 SIM 所在模块支持 Quectel 内置 TCP/IP 协议栈时，于模块内部临时激活彩信 APN，不影响主机的数据连接和路由。它通过 ModemManager 命令通道下发 AT 指令，要求 ModemManager 以 `--debug` 运行：
+
+   ```bash
+   mmcli -m 0 --command='AT+QICSGP=?'
+   ```
+
+   返回 `+QICSGP:` 即可用；报错说明命令通道未开启或模块不支持，此时只能选择“主机网络”，且需保证主机能访问 MMSC。
+3. **发送彩信需要独占 AT 口**：经 ModemManager 转发时，模块的上传指令以 `SEND OK` 结束，ModemManager 不认，每段都要等超时，速度约 100 字节/秒，而且连续超时 10 次会被 ModemManager 判定模块失效。因此这条通道只用于下载和回执，超过 4 KB 的请求直接拒绝。安装程序会写入 `/etc/udev/rules.d/78-mdd-mms-at-port.rules`，让 ModemManager 放开 Quectel 模块中被它标记为**备用** AT 口（`ID_MM_PORT_TYPE_AT_SECONDARY`）的端口；主 AT 口和 QMI 仍归 ModemManager，只有一个 AT 口的模块不受影响。网关会在每台模块的端口列表中找到这个口并独占使用（也可用 `MDD_MMS_AT_PORT` 指定），100 KB 约 3 秒。插多台模块时每台各用自己的端口，不同模块的彩信收发并行，同一模块上依次进行。
+
+   检查是否生效：`mmcli -m 0` 的端口列表中备用 AT 口显示为 `(ignored)`。只有一个 AT 口的模块无法独占，发送彩信会报错说明原因，下载不受影响。规则写入或卸载时会重启 ModemManager，4G 数据连接会短暂断开。
+4. **状态“未知”**：请求已发出但没有收到 MMSC 答复。网关不会自动重发，以免对方收到两条彩信。
+5. **早已过期的通知**：模块离线期间积压、已超过 MMSC 保存期限的通知直接标记为“已过期”，不请求 MMSC，也不推送；仍可手动重试。
+
 提交问题前下载“诊断 → 脱敏支持包”，并再次确认其中没有个人信息。

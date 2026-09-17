@@ -176,8 +176,8 @@ class StaleSegmentTests(TempStore):
         stale = store.take_stale_sms_segments(timeout=180, now=5000)
         self.assertEqual([g["concat_ref"] for g in stale], [1])
         self.assertEqual(stale[0], {"instance": "7", "peer": "888", "concat_ref": 1,
-                                    "total": 3, "first_ts": 1000, "seqs": [1],
-                                    "bodies": ["old"]})
+                                    "total": 3, "first_ts": 1000, "sent_ts": None,
+                                    "seqs": [1], "bodies": ["old"]})
         self.assertEqual(self._buffered(), 1, "the fresh group stays buffered")
 
     def test_sweep_ages_a_group_by_its_first_part_not_its_last(self):
@@ -295,6 +295,44 @@ class InboundEventTests(unittest.IsolatedAsyncioTestCase, TempStore):
                               ts=group["first_ts"])
         self.assertEqual(self._stored(),
                          [{"peer": "888", "body": CTEXCEL[0] + main.SMS_GAP_MARK + CTEXCEL[2]}])
+
+    async def test_redelivered_text_and_modem_copy_are_not_shown_twice(self):
+        # SMS-DELIVER from 447700900123 with TP-SCTS 26-03-14 15:09:26 +02:00.
+        tpdu = "040c91447700091032" + "0000" + "62304151906280" + "01" + "41"
+        event = _event("7", "+447700900123", "A", ("", "", ""))
+        event["args"] += ["0", "0", "", tpdu]
+        first = await main.api_engine_event(event)
+        again = await main.api_engine_event(event)
+        self.assertNotIn("duplicate", first)
+        self.assertTrue(again.get("duplicate"))
+        with store._conn() as c:
+            ts = c.execute("SELECT ts FROM messages").fetchone()[0]
+        self.assertEqual(ts, 1773493766)
+        self.assertIsNone(store.ingest_message("7", "in", "07700900123", "A",
+                                               transport="cellular", sent_ts=1773493766))
+        self.assertEqual(self.push.call_count, 1)
+
+    async def test_parts_carry_the_first_parts_network_time(self):
+        store.add_sms_segment("7", "888", 4, 2, 2, "b", sent_ts=2_010)
+        group = store.add_sms_segment("7", "888", 4, 2, 1, "a", sent_ts=2_000, with_meta=True)
+        self.assertEqual(group, {"bodies": ["a", "b"], "sent_ts": 2_000})
+
+
+class DeliverTimestampTests(unittest.TestCase):
+    def test_scts_with_positive_zone(self):
+        # 26-03-14 15:09:26, zone 8 quarter hours east.
+        tpdu = "4404812143000462304151906280"
+        self.assertEqual(main.sms_pdu.deliver_timestamp(tpdu), 1773493766)
+
+    def test_negative_zone_and_malformed_input(self):
+        # 26-01-02 03:04:05, zone 0x8A: the low nibble 0xA is the sign bit plus a tens digit of 2,
+        # = sign + 2 tens, high nibble 8 -> 28 quarter hours west (-07:00).
+        tpdu = "0003a121f300006210203040508a"
+        self.assertEqual(main.sms_pdu.deliver_timestamp(tpdu), 1767323045 + 7 * 3600)
+        self.assertIsNone(main.sms_pdu.deliver_timestamp(""))
+        self.assertIsNone(main.sms_pdu.deliver_timestamp("zz"))
+        self.assertIsNone(main.sms_pdu.deliver_timestamp("0103a121f3"))   # SMS-SUBMIT
+        self.assertIsNone(main.sms_pdu.deliver_timestamp("0003a121f30000621320"))
 
 
 if __name__ == "__main__":

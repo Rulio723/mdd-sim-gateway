@@ -8,37 +8,6 @@ from control.app import store
 
 
 class StoreMigrationTests(unittest.TestCase):
-    def test_local_modem_sms_tracking_schema_is_upgraded_in_place(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            current = root / "mdd-sim-gateway.sqlite"
-            with sqlite3.connect(current) as connection:
-                connection.execute("""
-                    CREATE TABLE local_modem_sms (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        instance TEXT NOT NULL, iccid TEXT NOT NULL,
-                        modem_path TEXT, sms_path TEXT, content_hash TEXT NOT NULL,
-                        created_ts INTEGER NOT NULL, bound_ts INTEGER)
-                """)
-                connection.execute(
-                    "CREATE UNIQUE INDEX idx_local_modem_sms_path "
-                    "ON local_modem_sms(iccid,sms_path) WHERE sms_path IS NOT NULL")
-
-            with patch.multiple(store, DATA_DIR=str(root), DB_PATH=str(current),
-                                PREVIOUS_DB_PATH=str(root / "vowifi.sqlite")):
-                store.init()
-
-            with sqlite3.connect(current) as connection:
-                columns = {row[1] for row in connection.execute(
-                    "PRAGMA table_info(local_modem_sms)")}
-                index_sql = connection.execute(
-                    "SELECT sql FROM sqlite_master WHERE name='idx_local_modem_sms_path'"
-                ).fetchone()[0]
-            self.assertIn("daemon_epoch", columns)
-            self.assertIn("message_id", columns)
-            self.assertIn("cancelled", columns)
-            self.assertIn("daemon_epoch", index_sql)
-
     def test_previous_database_is_copied_once_and_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

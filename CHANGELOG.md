@@ -4,6 +4,100 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-18
+
+### Upgrade notes
+
+- **Modem SMS storage is not emptied on upgrade.** This version can delete an SMS from the
+  modem/SIM once it is safely in the database (`delete`), which is what keeps the small modem
+  storage from filling up and blocking new texts. An installation upgraded from an earlier
+  version gets `settings.cellular_sms_storage: keep` written into its configuration on first
+  start, so nothing on the modem changes by itself; new installations default to `delete`.
+  To opt in, set `cellular_sms_storage` to `delete` (or `when_full`) under `settings`, or
+  `MDD_CELLULAR_SMS_STORAGE` in the control service environment when the setting is absent,
+  and restart the control service. Anything still stored on the modem is imported first and
+  then removed.
+- **The history database is migrated in place, including deletions.** Duplicate inbound
+  messages (the same text imported more than once, or received over both VoWiFi and the modem)
+  are folded into one, and the `--` rows 1.9.3 stored for an unreadable body are removed. Each
+  step is transactional and runs once. Before the first step runs, a verified copy of the
+  database is written to `backups/` in the data directory (never removed automatically); if
+  that copy cannot be made, the control plane stops without migrating anything and says why. MMS notifications that earlier versions filed among the non-text
+  payloads are decoded again from their stored PDU: each becomes the MMS it announced, or is
+  dropped as a copy of one already in its conversation, and leaves the payload list. Rolling
+  back to an earlier version keeps working; returning to this version afterwards repairs what
+  the older version left, including notifications it filed again.
+- **Sending MMS over a modem restarts ModemManager once during installation** to release the
+  module's secondary AT port (see TROUBLESHOOTING, MMS).
+
+### Added
+
+- The Messages page shows MMS: pictures inline, audio and video players, other attachments
+  as downloads, and a Download/Retry button for an MMS that is not downloaded yet. Attaching
+  files to a message sends it as MMS -- through the attach button, or by pasting a screenshot or
+  copied picture into the message box, or by dropping files onto it; pictures are scaled down in the browser to fit the line's
+  size limit. An "MMS settings" dialog shows the detected carrier settings and lets each line
+  override them or turn auto-download off.
+- MMS can be sent: text, pictures, audio, video or contact cards to one or several
+  recipients, with a delivery report shown on the message when the carrier sends one. The
+  size limit is per line (300 KB by default). Over the modem this needs an AT port the gateway
+  owns: the installer adds a udev rule releasing the port ModemManager classifies as a Quectel
+  module's secondary AT port (the primary one and QMI stay with ModemManager, and a module with
+  a single AT port is left alone), and the gateway finds that port on each modem by itself (or
+  takes `MDD_MMS_AT_PORT`). A 100 KB MMS then uploads in about three seconds, and lines on
+  different modems send and download in parallel. Without it only retrievals go over the modem, because ModemManager
+  relays the module's upload command at about 100 bytes a second -- slow enough for the MMSC
+  proxy to give up, and each chunk counts toward ModemManager's limit of consecutive timeouts
+  after which it drops the modem. A send whose answer is lost is marked unknown and never
+  repeated automatically.
+- Received MMS are downloaded and shown: text, pictures, audio and video, in the sender's
+  conversation, and a push notification carries the text once it is known. A carrier's MMSC
+  normally answers only on its MMS APN, so a modem with Quectel's embedded TCP/IP stack opens
+  that APN inside the module for the duration of one exchange, leaving the host's own data
+  connection and routing untouched (this uses ModemManager's command channel, i.e. `--debug`,
+  as the SIM bridge already does). Where the MMSC is reachable from the host's network, the
+  line can use the host instead. The MMS APN, MMSC and proxy are looked up from the
+  `mobile-broadband-provider-info` database by the SIM's network code and can be set per line.
+  A failed download is retried with backoff until the notification expires; auto-download can
+  be turned off per line, and any MMS can be downloaded or retried by hand.
+- An MMS notification is recognised and kept as a pending MMS in its conversation, from
+  VoWiFi and from the modem alike. 1.9.4 looked for the text `application/vnd.wap.mms-message`
+  in the payload, but carriers send that content type as its one-byte binary code, so real
+  notifications were never matched: over VoWiFi they piled up among the non-text payloads and
+  on the modem they stayed in storage. A notification now becomes one MMS per MMSC location,
+  however many times and over whichever transport it arrives, and a WAP Push too long for one
+  SMS is reassembled first. Delivery reports for sent MMS are applied to the message they
+  belong to. `drop_mms_wap_push` is gone: the modem object is removed by the storage policy
+  once the notification is stored.
+- Modem SMS storage can be emptied as messages are imported. The gateway only ever read the modem's
+  SMS objects, so its storage (23 slots on a typical module, a few more on the SIM) filled up and
+  the modem then stopped accepting texts altogether. An object is now deleted once its message
+  is safely in the database -- checked again right before deleting, so a message that was not
+  imported can never be removed. `MDD_CELLULAR_SMS_STORAGE` (or `settings.cellular_sms_storage`)
+  selects `delete` (default for new installations), `when_full` (keep objects, remove the
+  oldest imported ones only when fewer than three slots remain) or `keep` (written for upgraded
+  installations; see Upgrade notes).
+
+### Fixed
+
+- An SMS no longer appears twice. A text still held by the modem was imported again every time
+  ModemManager restarted, because the import marker was tied to the modem's object number, which
+  restarts from zero with the daemon; and a SIM registered both over VoWiFi and on its modem is
+  often sent the same text over both, which showed as two identical messages. Every message now
+  has an identity that does not depend on where it came from -- sender, text and the network's
+  own timestamp -- and a copy arriving over the other transport within three minutes is
+  recognised as the same message. Identities belong to the SIM (its ICCID, or IMSI where the
+  modem exposes no ICCID) rather than to the line slot, so re-adding a SIM under a new line
+  does not bring back what its modem still holds, and another SIM given a reused line id starts
+  clean. Network timestamps are converted to absolute time independently of the host's time
+  zone, including ModemManager's hours-only zone suffix that older Python versions could not
+  parse. Duplicates already in the history are folded once on upgrade,
+  together with the `--` placeholder rows 1.9.3 stored for an unreadable body. A message you
+  delete stays deleted even if the modem still holds it.
+- A VoWiFi SMS is dated by the network's timestamp, like one received on the modem, instead
+  of the moment the gateway happened to process it. A multi-part text takes its first part's
+  time, which is also what ModemManager reports for the assembled copy.
+
 ## [1.9.5] - 2026-09-15
 
 ### Fixed

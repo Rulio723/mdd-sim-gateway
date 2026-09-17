@@ -85,7 +85,7 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 - Answer permanent/full-auth EAP-AKA identity requests as specified by RFC 4187 for any carrier
   that requires the standard identity flow.
 - Show each modem UICC's three logical-channel allocations, roles and explicit failures.
-- Provide an authenticated browser softphone, SMS, call history, missed-call notifications and
+- Provide an authenticated browser softphone, SMS and MMS, call history, missed-call notifications and
   per-line local voicemail. Recordings remain on the gateway and are never attached to notifications
   or support bundles; standalone SIP clients are not accepted.
 - Maintain reusable subscriptions, individual nodes and SOCKS5 proxies, then assign one to each

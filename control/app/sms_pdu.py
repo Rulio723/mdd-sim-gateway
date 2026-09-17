@@ -16,6 +16,7 @@ decoded body for an engine image that predates the patch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 # Characters a real text can legitimately contain despite being control codes. Everything
 # else below 0x20 is a byte that happened to land in a string, not something a person typed.
@@ -189,3 +190,71 @@ def body_to_hex(text: str) -> str:
         return text.encode("latin-1").hex()
     except (UnicodeEncodeError, AttributeError):
         return ""
+
+
+def _semi_octet(byte: int) -> int:
+    return (byte & 0x0F) * 10 + (byte >> 4)
+
+
+def deliver_timestamp(tpdu_hex: str) -> int | None:
+    """TP-SCTS of an SMS-DELIVER as epoch seconds, or None when absent or malformed.
+
+    The service-centre timestamp (TS 23.040 9.2.3.11) is what a handset shows as the time of
+    a text, and the one ModemManager reports for a message the modem received. Reading it
+    from the VoWiFi PDU too gives one text the same time -- and so the same identity -- on
+    both transports. Seven semi-octets: year, month, day, hour, minute, second, then the
+    zone in quarter hours whose sign is bit 3 of the first (low) nibble.
+    """
+    try:
+        pdu = bytes.fromhex(str(tpdu_hex or ""))
+    except ValueError:
+        return None
+    if len(pdu) < 2 or pdu[0] & 0x03 != 0x00:      # TP-MTI 00 = SMS-DELIVER
+        return None
+    index = 3 + (pdu[1] + 1) // 2                   # TP-OA: digit count, TON/NPI, digits
+    index += 2                                      # TP-PID, TP-DCS
+    if len(pdu) < index + 7:
+        return None
+    octets = pdu[index:index + 7]
+    zone = octets[6]
+    quarters = ((zone & 0x07) * 10) + (zone >> 4)
+    if zone & 0x08:
+        quarters = -quarters
+    try:
+        local = datetime(2000 + _semi_octet(octets[0]), _semi_octet(octets[1]),
+                         _semi_octet(octets[2]), _semi_octet(octets[3]),
+                         _semi_octet(octets[4]), _semi_octet(octets[5]),
+                         tzinfo=timezone(timedelta(minutes=15 * quarters)))
+    except ValueError:
+        return None
+    return int(local.timestamp())
+
+
+def deliver_user_data(tpdu_hex: str) -> bytes | None:
+    """The 8-bit user data of an SMS-DELIVER (after any UDH), or None if not 8-bit/readable.
+
+    Asterisk hands the body to the dialplan as a C string, so a binary payload arrives cut at
+    its first 0x00 -- every WAP Push has one within a few bytes. The raw TPDU the engine also
+    forwards is complete.
+    """
+    try:
+        pdu = bytes.fromhex(str(tpdu_hex or ""))
+    except ValueError:
+        return None
+    if len(pdu) < 2 or pdu[0] & 0x03 != 0x00:
+        return None
+    index = 2 + 1 + (pdu[1] + 1) // 2
+    if len(pdu) < index + 10:
+        return None
+    dcs = pdu[index + 1]
+    if not dcs_is_8bit(dcs):
+        return None
+    length = pdu[index + 9]
+    data = pdu[index + 10:index + 10 + length]
+    if len(data) != length:
+        return None
+    if pdu[0] & 0x40:                               # TP-UDHI: skip the user data header
+        if not data or len(data) < 1 + data[0]:
+            return None
+        data = data[1 + data[0]:]
+    return data

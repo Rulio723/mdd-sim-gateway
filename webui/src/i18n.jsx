@@ -548,6 +548,23 @@ const zh = {
   Payload: '载荷',
   'User data header': '用户数据头',
   'TP-DCS not reported': '未上报 TP-DCS',
+  // MMS: composing/receiving picture messages (Messages.jsx) and their per-line settings
+  // (MmsSettings.jsx). "MMS" itself is kept as the short label used inline and as a meta tag.
+  MMS: '彩信', 'MMS settings': '彩信设置',
+  'Sending MMS…': '正在发送彩信…', 'Sent as MMS': '将以彩信发送',
+  'MMS is not configured for this line': '此线路尚未配置彩信',
+  'Subject (optional)': '主题（可选）', 'Remove attachment': '删除附件', 'Attach files': '添加附件',
+  'Attach files, or paste or drop them here': '添加附件，也可直接粘贴或拖入图片',
+  'The attachments are too large for an MMS ({size} KB; limit {limit} KB)': '附件对于彩信来说太大了（{size} KB；上限 {limit} KB）',
+  'Waiting to download': '等待下载', Expired: '已过期',
+  'Auto-download': '自动下载', Transport: '传输方式',
+  'Automatic — modem if possible, else host': '自动——优先使用模块，否则使用主机网络',
+  'Modem (Quectel embedded TCP/IP)': '模块（Quectel 内置 TCP/IP）', 'Host network': '主机网络',
+  APN: 'APN', 'MMSC URL': 'MMSC 地址', Proxy: '代理', 'User-Agent': 'User-Agent',
+  'Leaving this empty uses the carrier settings detected for this SIM.': '留空则使用为此 SIM 检测到的运营商设置。',
+  unchanged: '未修改', 'Clear saved password': '清除已保存的密码', 'Size limit (KB)': '大小限制（KB）',
+  'Detected: {name} · APN {apn} · MMSC {mmsc} · proxy {proxy}': '已检测到：{name} · APN {apn} · MMSC {mmsc} · 代理 {proxy}',
+  'No carrier settings detected; enter the MMSC to enable MMS.': '未检测到运营商设置；请填写 MMSC 以启用彩信。',
 }
 
 const en = {

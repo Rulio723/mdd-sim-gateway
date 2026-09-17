@@ -116,13 +116,13 @@ class SmsTransportTests(unittest.IsolatedAsyncioTestCase):
             "stage": "send", "transport": "cellular", "unavailable": False,
             "uncertain": True, "modem_path": "/org/freedesktop/ModemManager1/Modem/0",
             "sms_path": "/org/freedesktop/ModemManager1/SMS/3",
-            "_reservation_id": 901,
+            "message_id": 901,
         }
         reserved = _message("5", "out", "888", "BAL", status="pending",
                             transport="cellular")
         with patch.object(main.cfg, "list_instances", return_value=[]), \
                 patch.object(main.cellular_sms, "send", return_value=cellular_result), \
-                patch.object(main.store, "local_modem_sms_message",
+                patch.object(main.store, "get_message",
                              return_value=reserved) as lookup, \
                 patch.object(main.store, "add_message") as add, \
                 patch.object(main.store, "set_message_status") as set_status, \
@@ -131,7 +131,7 @@ class SmsTransportTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["uncertain"])
         self.assertEqual(result["message"]["status"], "unknown")
-        self.assertNotIn("_reservation_id", result)
+        self.assertNotIn("message_id", result)
         lookup.assert_called_once_with(901)
         add.assert_not_called()
         set_status.assert_called_once_with(71, "unknown", cellular_result["error"])
