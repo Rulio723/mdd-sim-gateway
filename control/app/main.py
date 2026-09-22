@@ -25,6 +25,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from contextlib import asynccontextmanager
 
+import docker
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -33,7 +34,7 @@ from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd, mms,
-               mms_transport)
+               mms_media, mms_transport, softphone_ws)
 from .version import VERSION
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -406,7 +407,7 @@ def _ensure_card_draft(info: dict) -> dict | None:
             "idr_mode": "apn",
             "cp_mode": "auto",
             "sip": {**cfg.carrier_sip_defaults(mcc, mnc, iccid),
-                    "listen_addr": "0.0.0.0", "transport": "udp", "external": [],
+                    "transport": "udp", "external": [],
                     "webrtc": {"enable": True}},
             "debug": {"asterisk": False, "charon": False},
         }, unique_name=True)
@@ -443,6 +444,9 @@ class Hub:
         self.cards: dict[str, dict] = {}     # reader NAME -> detected card/reader info
         self.scanned = False                 # card_monitor completed its first scan
         self._learning: set[str] = set()     # instances currently learning MSISDN
+        # Last observed Docker RestartCount per instance, to tell a restart-policy bounce from
+        # a rebuild the manager performed itself.
+        self._restart_counts: dict[str, int] = {}
         self._msisdn_tries: dict[str, int] = {}
         self._msisdn_checked: dict[str, float] = {}   # last passive re-check
         # Serialise route selection and submission per line. In particular, two concurrent
@@ -546,7 +550,46 @@ class Hub:
         if (not runtime.get("running")
                 or self.ami_generation.get(str(iid)) not in (None, generation)):
             await self.drop_ami(iid)
+        if runtime.get("running"):
+            await self._note_unrequested_restart(str(iid), runtime)
         self.status_wakeup.set()
+
+    def seed_restart_baseline(self, iid: str, runtime: dict) -> None:
+        """Record the first RestartCount seen for a running line.
+
+        The baseline used to be set only from Docker start events, so after the manager itself
+        restarted, the first bounce of each line looked like a first sighting and was dropped —
+        exactly what happened to line 5's 09-17 crash. The status poll sees every line within
+        seconds of startup, so seed from there; only a missing baseline is filled in.
+        """
+        if runtime.get("running") and iid not in self._restart_counts:
+            self._restart_counts[iid] = int(runtime.get("restart_count") or 0)
+
+    async def _note_unrequested_restart(self, iid: str, runtime: dict) -> None:
+        """Record engine bounces that Docker's restart policy performed on its own.
+
+        A rebuild the manager asks for creates a fresh container, so its RestartCount is 0. A
+        restart-policy bounce increments the counter on the same container. Only the latter is
+        invisible today: it completes well inside the health policy's threshold, so no recovery
+        is scheduled and nothing reaches the timeline even though the line just spent ~40s
+        unable to take a call.
+        """
+        count = int(runtime.get("restart_count") or 0)
+        previous = self._restart_counts.get(iid)
+        self._restart_counts[iid] = count
+        if previous is None or count <= previous:
+            return
+        exit_record = await asyncio.to_thread(engine.last_engine_exit, iid)
+        disposition = str(exit_record.get("disposition") or "")
+        reason = {"signal": "engine_signal", "exit": "engine_exit"}.get(disposition, "unknown")
+        try:
+            await asyncio.to_thread(
+                engine.record_lifecycle, iid, "engine_restarted", reason_code=reason)
+        except Exception as exc:  # noqa
+            log.debug("could not record engine restart instance=%s: %r", iid, exc)
+        log.warning("engine %s was restarted by Docker's restart policy "
+                    "(restart_count %s -> %s, last exit: %s)", iid, previous, count,
+                    exit_record or "unrecorded")
 
     async def broadcast(self, msg: dict):
         dead = []
@@ -1608,18 +1651,31 @@ def _mms_push_text(rec: dict) -> str:
     return summary
 
 
+# How often the MMS worker looks for attachment files an interrupted save or deletion left.
+MMS_SWEEP_SECONDS = 6 * 3600
+
+
 async def mms_worker():
     """Retrieve notified MMS from the MMSC, retrying on the schedule mms.download() sets."""
     try:
         await asyncio.to_thread(store.reset_interrupted_mms)
     except Exception as exc:  # noqa
         log.debug("MMS state recovery failed: %r", exc)
+    swept = time.monotonic()
     while True:
         try:
             await asyncio.wait_for(hub.mms_wakeup.wait(), timeout=20)
         except asyncio.TimeoutError:
             pass
         hub.mms_wakeup.clear()
+        if time.monotonic() - swept > MMS_SWEEP_SECONDS:
+            swept = time.monotonic()
+            try:
+                removed = await asyncio.to_thread(store.sweep_mms_orphans)
+                if removed:
+                    log.info("removed %d unreferenced MMS file(s)", removed)
+            except Exception as exc:  # noqa
+                log.debug("MMS orphan sweep failed: %r", exc)
         try:
             due = await asyncio.to_thread(store.due_mms_downloads)
         except Exception as exc:  # noqa
@@ -2099,6 +2155,7 @@ async def _poll_instance_status(inst: dict) -> None:
         # One inspect supplies both running state and bridge IP to the whole sample. Previously
         # ami_for(), compute() and the grace-path each queried Docker independently.
         runtime = await hub.runtime.get(iid)
+        hub.seed_restart_baseline(iid, runtime)
         # A disabled line is authoritative user intent. Automatic recovery must never
         # resurrect a stale container left behind by an earlier retry or process restart;
         # doing so can retain the SIM/PCSC channel and disrupt another active line.
@@ -3592,8 +3649,7 @@ async def api_provision(body: dict):
         raise HTTPException(400, "could not read IMSI (is the PIN correct?)")
     sip = cfg.merge_carrier_sip_defaults(
         c.mcc, c.mnc, c.iccid or c.imsi,
-        body.get("sip") or {"listen_addr": "0.0.0.0", "transport": "udp",
-                            "external": []})
+        body.get("sip") or {"transport": "udp", "external": []})
     sip.setdefault("webrtc", {"enable": bool(body.get("webrtc", True))})
     # SMSC: manual override wins; otherwise read from the SIM (EF_SMSP, authoritative).
     # If the SIM can't provide it we ask the user to type it (no carrier presets).
@@ -4084,7 +4140,13 @@ async def _unified_devices() -> list[dict]:
                        "rekey_minutes": (inst or {}).get("rekey_minutes",
                            (cfg.get_settings().get("rekey") or {}).get("minutes", 30)),
                        "ike_rekey_minutes": (inst or {}).get("ike_rekey_minutes",
-                           (cfg.get_settings().get("rekey") or {}).get("ike_minutes", 150))},
+                           (cfg.get_settings().get("rekey") or {}).get("ike_minutes", 150)),
+                       # With the data-channel rekey at 0, whether the line accepts the ePDG's
+                       # own rekey decides what 0 means: the carrier renews the keys, or nobody
+                       # does and the first ePDG rekey rebuilds the tunnel. Same default as the
+                       # engine config (config.py).
+                       "accept_epdg_rekey": bool((inst or {}).get("accept_epdg_esp_rekey",
+                           (cfg.get_settings().get("rekey") or {}).get("accept_epdg", False)))},
             "egress": {"node": (egress.status().get("lines") or {}).get(
                 str(inst["id"]) if inst else "", {}).get("node") or "",
                 # The picker lives on the settings page, so without these the device page shows
@@ -5338,7 +5400,8 @@ async def api_mms_send(iid: str, request: Request):
         data = await upload.read(int(settings["max_size"]) + 1)
         attachments.append({"name": os.path.basename(upload.filename or "")[:80],
                             "content_type": upload.content_type or "", "data": data})
-    problem = mms.validate_outgoing(recipients, text, attachments, settings)
+    problem = await asyncio.to_thread(mms.validate_outgoing, recipients, text, attachments,
+                                      settings, subject)
     if problem:
         raise HTTPException(422, problem)
     rec = await asyncio.to_thread(mms.create_outgoing, iid, recipients, text, attachments,
@@ -5391,7 +5454,8 @@ def api_mms_part(iid: str, mid: int, pid: int, download: bool = False):
     media_type = content_type if inline else "application/octet-stream"
     if inline and content_type == "text/plain":
         media_type = f"text/plain; charset={part['charset'] or 'utf-8'}"
-    name = part["name"] or os.path.basename(part["file"])
+    # The same rule as when the name was stored; rows written before it existed get it here.
+    name = mms_media.display_name(part["name"] or "", content_type)
     return FileResponse(part["file"], media_type=media_type, filename=name,
                         content_disposition_type="inline" if inline else "attachment",
                         headers={"X-Content-Type-Options": "nosniff",
@@ -6387,22 +6451,50 @@ async def api_cellular_call_hangup(iid: str):
 
 @app.get("/api/instances/{iid}/softphone")
 def api_softphone(iid: str, request: Request):
-    """Provisioning for the browser softphone (JsSIP over WSS)."""
+    """Provisioning for the browser softphone (JsSIP over the same-origin WebSocket relay)."""
     inst = cfg.get_instance(iid)
     if not inst:
         raise HTTPException(404, "no such instance")
     sip = inst.get("sip", {}) or {}
     wr = sip.get("webrtc", {}) or {}
-    ports = inst.get("ports", {})
     host = (request.headers.get("host") or "").split(":")[0] or request.url.hostname
     return {
         "enabled": bool(wr.get("enable", True)),
         "username": wr.get("username", "webrtc"),
         "password": wr.get("password", ""),
-        "ws_port": ports.get("webrtc", 8089),
+        # Same origin as the WebUI, so it works unchanged behind a reverse proxy.
+        "ws_path": softphone_ws.path(iid),
         "host": host,
         "realm": cfg.ims_realm(inst["mcc"], inst["mnc"]),
     }
+
+
+@app.websocket("/api/instances/{iid}/softphone/ws")
+async def ws_softphone(ws: WebSocket, iid: str):
+    """The browser softphone's SIP-over-WebSocket, relayed to the line's engine.
+
+    WebSocket handshakes bypass the HTTP middleware, so the session check is repeated here.
+    The session cookie is SameSite=Strict, so a cross-site page cannot open this socket as the
+    admin. Rejections close before accepting (the browser sees a failed handshake)."""
+    if not auth.session(ws.cookies.get(auth.SESSION_COOKIE)):
+        await ws.close(code=4401)
+        return
+    inst = cfg.get_instance(iid)
+    webrtc = ((inst or {}).get("sip") or {}).get("webrtc") or {}
+    if not inst or not webrtc.get("enable", True) or \
+            not softphone_ws.offers_sip(ws.headers.get("sec-websocket-protocol")):
+        await ws.close(code=1008)
+        return
+    try:
+        runtime = await asyncio.to_thread(engine.container_runtime, str(iid))
+    except docker.errors.DockerException as exc:
+        log.warning("softphone relay: cannot inspect engine %s: %s", iid, exc)
+        await ws.close(code=1013)
+        return
+    if not runtime["running"] or not runtime["ip"]:
+        await ws.close(code=1013)
+        return
+    await softphone_ws.relay(ws, softphone_ws.engine_url(runtime["ip"]))
 
 
 # ----------------------------- engine event hook -----------------------------

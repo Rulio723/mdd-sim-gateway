@@ -11,6 +11,7 @@ import os
 from collections import deque
 from pathlib import Path
 import re
+import shutil
 import tarfile
 import time
 import zipfile
@@ -19,6 +20,7 @@ import docker
 import yaml
 
 from . import config as cfg
+from . import store
 
 
 _SECRET_KEYS = re.compile(
@@ -162,6 +164,12 @@ def redact_jsonl(text: str) -> str:
 
 
 CALL_EVENTS = ("call_out", "call_result", "ussd")
+# The dialplan's closed vocabulary for which side ended a call ([hangup-by]).
+HANGUP_BY = ("carrier", "local", "gateway")
+# Asterisk's own log lines at WARNING/ERROR, e.g. "[Sep 21 22:06:43] WARNING[2987][C-00000009]".
+_ASTERISK_PROBLEM = re.compile(r"\b(?:WARNING|ERROR)\[\d+\]")
+_SIP_USERINFO = re.compile(r"\b(sips?|tel):[^\s@;<>\"',]+@", re.I)
+_TEL_URI = re.compile(r"\btel:[^\s;<>\"',]+", re.I)
 CALL_EVENT_SCAN_LINES = 20_000
 SUPPORT_BUNDLE_MAX_BYTES = 10 * 1024 * 1024
 # Leave space for ZIP metadata, the manifest and compression overhead. The final archive is
@@ -277,6 +285,9 @@ def call_event_evidence(text: str) -> str:
         peer_at = 1 if (event == "call_result" and args and args[0] in ("in", "out")) else 0
         if peer_at < len(args) and not any(ch in args[peer_at] for ch in "*#"):
             args[peer_at] = "<number>"
+        if event == "call_result" and peer_at == 1 and len(args) > 4 \
+                and args[4] not in HANGUP_BY:
+            args[4] = "<unknown>"
         if event == "ussd" and len(args) > 1:
             # That a reply arrived, and how big it was, answers the question. Its text can
             # carry account details and answers nothing.
@@ -288,21 +299,98 @@ def call_event_evidence(text: str) -> str:
     return "\n".join(out)
 
 
+def asterisk_problem_lines(text: str) -> str:
+    """Asterisk's WARNING/ERROR lines, with every SIP/tel identity taken out.
+
+    The whole `messages` log cannot ship: its NOTICE lines name the subscriber's IMS public
+    identity on every registration. But an answered call that drops at once leaves its only
+    explanation here — a rejected SDP answer, a failed bridge, a media error — and without it
+    a report reading ANSWER/16 cannot be told apart from the carrier simply hanging up. So keep
+    the problem lines and drop the identity: the user part of any SIP/tel URI is replaced
+    before the generic redactor (long digit runs, hex blobs, key material) runs over the rest.
+    """
+    out = []
+    for line in text.splitlines():
+        if not _ASTERISK_PROBLEM.search(line):
+            continue
+        line = _SIP_USERINFO.sub(lambda m: f"{m.group(1)}:<user>@", line)
+        out.append(_TEL_URI.sub("tel:<number>", line))
+    return redact_log("\n".join(out)) if out else ""
+
+
 def create_local_backup(system_name: str = "gateway") -> dict:
-    """Create a root-local recovery archive. It is intentionally not returned over HTTP."""
+    """Create a root-local recovery archive. It is intentionally not returned over HTTP.
+
+    The message history goes in as a consistent snapshot rather than the live file, together
+    with every MMS attachment it refers to; the archive is then checked to hold each of those
+    attachments, so restoring it restores whole messages."""
     root = Path(cfg.DATA_DIR).resolve()
     target_dir = root / "backups"
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     target = target_dir / f"{_safe_name(system_name)}-{stamp}.tar.gz"
-    with tarfile.open(target, "w:gz") as archive:
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or target_dir in path.parents:
-                continue
-            archive.add(path, arcname=str(path.relative_to(root)), recursive=False)
+    history = Path(store.DB_PATH).resolve()
+    snapshot = history.is_relative_to(root) and history.is_file()
+    database_name = str(history.relative_to(root)) if snapshot else ""
+    skipped = {database_name + suffix for suffix in ("", "-journal", "-wal", "-shm")}
+    mms_root = Path(store.mms_dir()).resolve()
+    staging = target_dir / f".staging-{stamp}"
+    for stale in target_dir.glob(".staging-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+    try:
+        referenced = []
+        known_missing = set()
+        if snapshot:
+            snapshot_result = store.snapshot_history(
+                str(staging / database_name), str(staging / "mms"))
+            known_missing = set(snapshot_result.get("missing_parts", []))
+            referenced = _referenced_parts(staging / database_name)
+        with tarfile.open(target, "w:gz") as archive:
+            for path in sorted(root.rglob("*")):
+                if not path.is_file() or target_dir in path.parents:
+                    continue
+                relative = str(path.relative_to(root))
+                if snapshot and (relative in skipped or mms_root in path.parents):
+                    continue
+                archive.add(path, arcname=relative, recursive=False)
+            if snapshot:
+                archive.add(staging / database_name, arcname=database_name, recursive=False)
+                mms_name = str(mms_root.relative_to(root)) if mms_root.is_relative_to(root) \
+                    else "mms"
+                for path in sorted((staging / "mms").rglob("*")):
+                    if path.is_file():
+                        archive.add(path, recursive=False, arcname=str(
+                            Path(mms_name) / path.relative_to(staging / "mms")))
+        if referenced:
+            with tarfile.open(target, "r:gz") as archive:
+                names = set(archive.getnames())
+            mms_name = str(mms_root.relative_to(root)) if mms_root.is_relative_to(root) \
+                else "mms"
+            absent = [p for p in referenced if f"{mms_name}/{p}" not in names]
+            copy_failures = [part for part in absent if part not in known_missing]
+            if copy_failures:
+                raise RuntimeError(f"the backup is missing {len(copy_failures)} MMS "
+                                   f"attachment(s), e.g. {copy_failures[0]}")
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     os.chmod(target, 0o600)
     return {"ok": True, "name": target.name, "created_at": int(time.time()),
-            "size": target.stat().st_size, "location": "gateway-local"}
+            "size": target.stat().st_size, "location": "gateway-local",
+            "missing_attachments": len(known_missing)}
+
+
+def _referenced_parts(database: Path) -> list[str]:
+    """"<message id>/<file>" of every attachment the history snapshot refers to."""
+    import sqlite3
+    with sqlite3.connect(database) as check:
+        if not check.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                             "AND name='mms_parts'").fetchone():
+            return []
+        rows = check.execute("SELECT message_id, path FROM mms_parts WHERE path!=''").fetchall()
+    return [f"{int(m)}/{p}" for m, p in rows]
 
 
 def list_local_backups() -> list[dict]:
@@ -478,9 +566,34 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
         except OSError:
             continue
 
+    # Asterisk's `messages` is filtered the way events are, never exported whole (see
+    # asterisk_problem_lines); `full` stays out entirely.
+    for path in sorted(base.glob("*/logs/asterisk/messages")):
+        try:
+            tail = deque(maxlen=CALL_EVENT_SCAN_LINES)
+            raw_line_count = 0
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    raw_line_count += 1
+                    tail.append(line.rstrip("\r\n"))
+            source = list(tail)
+            eligible = asterisk_problem_lines("\n".join(source)).splitlines()
+            selected = eligible[-log_lines:]
+            if selected:
+                add_candidate(path, f"logs/{path.parents[2].name}-asterisk-problems.log",
+                              source, eligible, selected, "\n".join(selected), 30,
+                              raw_line_count)
+        except OSError:
+            continue
+
     # Explicit allow-list: voicemail recordings and every unknown future file stay excluded.
+    # Note this deliberately does NOT include the rest of /logs/asterisk: Asterisk's own `full`
+    # and `messages` carry the subscriber's IMS public identity on every registration. Only
+    # supervisor.jsonl is admitted whole, and it is a closed schema of exit codes and
+    # durations; `messages` reaches the bundle only through the filter above.
     paths = [*base.glob("*/run/*.log"), *base.glob("*/logs/diagnostics.jsonl"),
              *base.glob("*/logs/lifecycle.jsonl"),
+             *base.glob("*/logs/asterisk/supervisor.jsonl"),
              *base.glob("*/logs/ike/charon-*.log")]
     for path in sorted(paths):
         try:
@@ -492,8 +605,9 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
                 selected = source[-log_lines:]
             joined = "\n".join(selected)
             text = redact_jsonl(joined) if path.suffix == ".jsonl" else redact_log(joined)
-            iid = path.parents[2].name if path.parent.name == "ike" else path.parent.parent.name
-            priority = 50 if path.name == "lifecycle.jsonl" else 40 \
+            iid = path.parents[2].name if path.parent.name in ("ike", "asterisk") \
+                else path.parent.parent.name
+            priority = 50 if path.name in ("lifecycle.jsonl", "supervisor.jsonl") else 40 \
                 if path.name == "diagnostics.jsonl" else 10
             add_candidate(path, f"logs/{iid}-{path.name}", source, source, selected,
                           text, priority)

@@ -485,6 +485,29 @@ class SendTests(DownloadTests):
         self.assertEqual(mms.parse_recipients("+447700900123; +447700900124,+447700900123"),
                          ["+447700900123", "+447700900124"])
 
+    def test_the_limit_applies_to_the_packaged_message(self):
+        jpeg = {"name": "p.jpg", "content_type": "image/jpeg",
+                "data": b"\xff\xd8\xff" + b"x" * 997}
+        request = mms.build_request("0" * 20, ["+447700900123"], "",
+                                    mms._compose_parts("hi", [jpeg]))
+        self.assertGreater(len(request), 1002, "SMIL and headers take room of their own")
+        exact = {"max_size": len(request)}
+        self.assertIsNone(mms.validate_outgoing(["+447700900123"], "hi", [jpeg], exact))
+        self.assertIn("once packaged", mms.validate_outgoing(
+            ["+447700900123"], "hi", [jpeg], {"max_size": len(request) - 1}))
+        self.assertIn("once packaged", mms.validate_outgoing(
+            ["+447700900123"], "hi", [jpeg], exact, subject="a subject takes room too"))
+
+    def test_a_message_over_the_limit_is_never_submitted(self):
+        rec = self.compose()
+        client = FakeClient([])
+        with patch.object(t, "resolve_settings",
+                          return_value={**t.resolve_settings(self.inst), "max_size": 64}):
+            result = mms.send(self.inst, rec["id"], client=client)
+        self.assertEqual((result["status"], client.requests), ("failed", []))
+        self.assertIn("once packaged", result["error"])
+        self.assertEqual(store.get_message(rec["id"])["status"], "failed")
+
     def test_accepted_send_records_the_mmsc_message_id(self):
         rec = self.compose()
         self.assertEqual((rec["status"], rec["mms"]["state"]), ("pending", "sending"))
@@ -501,6 +524,24 @@ class SendTests(DownloadTests):
         stored = store.get_message(rec["id"])
         self.assertEqual((stored["status"], stored["mms"]["state"], stored["mms"]["message_ref"]),
                          ("sent", "sent", "MSG-7"))
+
+    def test_same_named_attachments_are_sent_with_distinct_references(self):
+        jpeg = b"\xff\xd8\xff\xe0" + b"x" * 8
+        rec = self.compose("caption & more", [
+            {"name": "photo.jpg", "content_type": "image/jpeg", "data": jpeg + b"1"},
+            {"name": "photo.jpg", "content_type": "image/jpeg", "data": jpeg + b"2"}])
+        conf = bytes([0x8C, 0x81, 0x98]) + m.write_text_string("x") + b"\x8D\x92" + \
+            bytes([0x92, 0x80])
+        client = FakeClient([t.HttpResponse(200, {}, conf)])
+        self.assertEqual(mms.send(self.inst, rec["id"], client=client)["status"], "sent")
+        sent = m.decode_pdu(client.requests[0][2])
+        smil = sent.parts[0]
+        by_id = {p.content_id: p for p in sent.parts}
+        self.assertEqual(len(by_id), 4)
+        m.check_smil(smil, sent.parts[1:])
+        images = [p for p in sent.parts if p.content_type == "image/jpeg"]
+        self.assertEqual([p.name for p in images], ["photo.jpg", "photo.jpg"])
+        self.assertEqual(len({p.content_location for p in images}), 2)
 
     def test_refusal_is_failed_and_a_lost_answer_is_unknown(self):
         rec = self.compose()

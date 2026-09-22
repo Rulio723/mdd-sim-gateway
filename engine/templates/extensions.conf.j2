@@ -69,12 +69,14 @@ exten => t,1,Hangup()
 ; The hangup handler ALWAYS runs (whether the caller hangs up unanswered, we decline, or the
 ; call completes), so the "ringing" record is finalized to a real disposition here instead of
 ; only after Dial() (which is skipped when the inbound leg is torn down first).
-; CRITICAL: after priority 1 Asterisk auto-increments to h,2 which does NOT exist, so it would
-; FALL THROUGH to the broad catch-all (priorities 2-9: Set/Progress/call_in/Dial…) and fire
+; CRITICAL: after its last priority Asterisk auto-increments to one 'h' does NOT define, so it
+; would FALL THROUGH to the broad catch-all (priorities 2-9: Set/Progress/call_in/Dial…) and fire
 ; a phantom SECOND `call_in` (+ a stray Dial) for every call — leaving a ghost 'ringing' row in
-; the call log. Return() ends the 'h' routine cleanly so no fall-through happens.
-exten => h,1,TrySystem(/usr/local/bin/notify.py call_result in "${CALLPEER}" "${DIALSTATUS}" "${HANGUPCAUSE}" &)
-same => n,Return()
+; the call log. Hangup() terminates the ordinary 'h' routine so no fall-through happens; Return()
+; is invalid here because this special extension was not entered through Gosub().
+exten => h,1,Gosub(hangup-by,s,1)
+same => n,TrySystem(/usr/local/bin/notify.py call_result in "${CALLPEER}" "${DIALSTATUS}" "${HANGUPCAUSE}" "${GOSUB_RETVAL}" &)
+same => n,Hangup()
 
 {% if vm_enabled %}
 ; ===== Voicemail =====
@@ -177,8 +179,24 @@ same => n,Hangup()
 ; vars when REAL* are unset (caller hung up mid-ring → jumped straight to 'h' before Set).
 exten => h,1,Set(ST=${IF($["${REALSTATUS}" != ""]?${REALSTATUS}:${DIALSTATUS})})
 same => n,Set(CS=${IF($["${REALCAUSE}" != ""]?${REALCAUSE}:${HANGUPCAUSE})})
-same => n,TrySystem(/usr/local/bin/notify.py call_result out "${CALLPEER}" "${ST}" "${CS}" &)
-same => n,Return()
+same => n,Gosub(hangup-by,s,1)
+same => n,TrySystem(/usr/local/bin/notify.py call_result out "${CALLPEER}" "${ST}" "${CS}" "${GOSUB_RETVAL}" &)
+same => n,Hangup()
+
+[hangup-by]
+; Which side ended the call, as a closed token for the call log and the support bundle: an
+; answered call that drops within a second reads identically as ANSWER/16 whether the carrier,
+; the browser or this gateway tore it down, and a report cannot be diagnosed without knowing.
+; chan_pjsip stamps CHANNEL(hangupsource) with the name of the FIRST SIP session to end — a
+; BYE or final failure received on it, or a session-layer teardown such as a rejected SDP
+; answer — and copies it onto the bridged peer. It stays empty when the channel core hung up
+; first (the dialplan's own Hangup(), a Dial timeout). So "carrier" means the carrier's dialog
+; ended first, not strictly that the carrier sent the BYE; Asterisk's WARNING lines in the
+; support bundle tell those apart.
+exten => s,1,Set(HS=${CHANNEL(hangupsource)})
+same => n,Set(BY=${IF($["${HS}" = ""]?gateway:local)})
+same => n,ExecIf($["${HS:0:16}" = "PJSIP/volte_ims-"]?Set(BY=carrier))
+same => n,Return(${BY})
 
 [ims-outbound-headers]
 exten => s,1,Set(PJSIP_HEADER(add,P-Preferred-Identity)=<tel:{{ msisdn }}>)
