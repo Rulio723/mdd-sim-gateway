@@ -223,7 +223,8 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
     try {
       const result = await api.saveDeviceHardware(device.id, { imei: digits })
       await refreshDevices()
-      showToast(t(result.applied ? 'Hardware IMEI saved and the active line was restarted' : 'Hardware IMEI saved'))
+      showToast(t(result.started ? 'Hardware IMEI saved; the line was completed and started automatically'
+        : result.applied ? 'Hardware IMEI saved and the active line was restarted' : 'Hardware IMEI saved'))
     } catch (error) { showToast(`${t('Error')}: ${error.message}`) }
     finally { setSaving(false) }
   }
@@ -252,11 +253,13 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
     {isReader && <div className="u-hardware-action u-hardware-imei">
       <div className="u-hardware-action-copy"><h4>{t('Hardware IMEI')}</h4>
         <p>{t('This IMEI belongs to the physical reader. Any SIM inserted here uses it automatically.')}</p>
+        {!device.imei && device.provisioning?.missing?.includes('imei') &&
+          <p className="u-error">{t('VoWiFi is waiting for a 15-digit IMEI. Save it here and the new line will start automatically.')}</p>}
       </div>
       <input className="mono" inputMode="numeric" maxLength={18} value={imei}
         onChange={event => setImei(event.target.value.replace(/[^0-9 -]/g, ''))}
         placeholder={t('15-digit IMEI required for VoWiFi')} />
-      <button className="btn btn-primary" disabled={saving} onClick={save}>{t('Save')}</button>
+      <button className="btn btn-primary" disabled={saving} onClick={save}>{t(!device.imei && device.provisioning?.missing?.includes('imei') ? 'Save IMEI and start line' : 'Save')}</button>
     </div>}
     <div className="u-hardware-action u-hardware-danger">
       <div className="u-hardware-action-copy"><h4>{t('Remove device record')}</h4>
@@ -847,6 +850,7 @@ export function SystemPage({ showToast, openUpdateDialog }) {
   const tabs = [['general', t('General')], ['web', t('Web access')], ['voice', t('Calls & VoWiFi')], ['security', t('Security')], ['backup', t('Backup & updates')], ['maintenance', t('Maintenance')]]
   const buildCacheReclaimable = status?.host?.project_storage?.build_cache_reclaimable_bytes
   const oldImagesReclaimable = status?.host?.project_storage?.mdd_old_images_reclaimable_bytes
+  const hostRestartAvailable = status?.deployment?.host_restart_available !== false
   const save = async () => { try { const saved = await api.saveSettings(s); setS(saved); showToast(t('Saved')) } catch (e) { showToast(e.message) } }
   const action = async name => { try { const result = name === 'backup' ? await api.createBackup() : await api.maintenance(name); showToast(name === 'backup' && result.missing_attachments ? t('Backup created, but {count} attachment(s) were already missing', { count: result.missing_attachments }) : result.ok ? t('Operation completed') : t('Operation completed with errors')); loadStatus() } catch (e) { showToast(e.message) } }
   const pruneBuildCache = async () => {
@@ -942,8 +946,8 @@ export function SystemPage({ showToast, openUpdateDialog }) {
       <section className="card u-panel u-settings-card"><div className="u-settings-card-head"><div><h2>{t('Restart')}</h2><p>{t('Ordered by how much they interrupt: the control plane can be restarted without touching a call, the host cannot.')}</p></div></div><div className="u-action-list">
           <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('control')}>{t('Restart the control plane')}</button>
           <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('services')}>{t('Restart all gateway services')}</button>
-          <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('host')}>{t('Restart the host')}</button>
-        </div>{restarting && <p className="u-note u-restart-note">{t(`restart.waiting.${restarting}`)}</p>}</section>
+          <button className="btn btn-ghost" disabled={!!restarting || !hostRestartAvailable} onClick={() => restart('host')}>{t('Restart the host')}</button>
+        </div>{!hostRestartAvailable && <p className="u-hint">{t('Host restart is unavailable in container mode. Restart the NAS from its own administration interface.')}</p>}{restarting && <p className="u-note u-restart-note">{t(`restart.waiting.${restarting}`)}</p>}</section>
     </div>}
   </div>{!['backup', 'maintenance'].includes(tab) && <button className="btn btn-primary" onClick={save}>{t('Save')}</button>}</div>
 }

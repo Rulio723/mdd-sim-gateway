@@ -379,7 +379,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       // screen by now; this is what tells the user why.
       else if (type === 'mediafail') toast(t(microphoneMessage(data)))
     }, audioRef.current)
-    ph.start(prov, prov.host || location.hostname)
+    if (!ph.start(prov, prov.host || location.hostname)) return
     phone.current = ph
     setReg('connecting')
   }, [prov])

@@ -88,6 +88,7 @@ UPDATE_CHECK_INTERVAL_SECONDS = float(os.environ.get("MDD_UPDATE_CHECK_INTERVAL"
 _line_state_written: dict[str, tuple[str, float]] = {}
 _line_registered_written: dict[str, float] = {}   # per-line throttle for the durable
                                                  # "last registered" stamp
+_background_tasks: set[asyncio.Task] = set()
 LINE_REGISTERED_WRITE_INTERVAL_SECONDS = 3600
 
 logging.basicConfig(level=logging.INFO,
@@ -1842,7 +1843,11 @@ async def host_health_poller():
     previous_alerts = None
     while True:
         try:
-            snapshot = await asyncio.to_thread(sysinfo.collect, cfg.DATA_DIR)
+            # Docker df walks every image-layer xattr on DSM and can occupy dockerd for minutes.
+            # The minute health sampler needs host health, not an inventory of reclaimable
+            # layers; explicit cleanup actions refresh that inventory after the operator asks.
+            snapshot = await asyncio.to_thread(
+                sysinfo.collect, cfg.DATA_DIR, include_docker_storage=False)
             # Rate-based conditions need the previous sample; the first pass reports none.
             alerts = sysinfo.alerts(snapshot, hub.host_snapshot or None)
             alerts = _sustained_alerts(alerts, streaks)
@@ -2587,7 +2592,10 @@ async def update_automation_poller():
     await asyncio.sleep(30)
     while True:
         try:
-            await asyncio.to_thread(update_check.automation_cycle)
+            result = await asyncio.to_thread(update_check.automation_cycle)
+            if (operations.container_stack_enabled() and isinstance(result, dict)
+                    and result.get("auto_update_requested")):
+                await asyncio.to_thread(operations.launch_container_update)
         except Exception as exc:  # noqa: a failed poll must never take the control plane down
             log.warning("background update check failed: %s", type(exc).__name__)
         await asyncio.sleep(max(300, UPDATE_CHECK_INTERVAL_SECONDS))
@@ -2595,6 +2603,8 @@ async def update_automation_poller():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if operations.container_stack_enabled():
+        await asyncio.to_thread(operations.settle_container_service_restart)
     _keep_modem_storage_on_upgrade(store.schema_version())
     store.set_subscriber_resolver(_line_subscriber)
     try:
@@ -3981,6 +3991,13 @@ async def _unified_devices() -> list[dict]:
     configured_exits = settings.get("proxy", {}).get("exits", {}) or {}
     available_countries = sorted(country for country, value in configured_exits.items()
                                  if isinstance(value, dict) and value.get("enabled", False))
+    # Host routing publishes per-line state, while the container SOCKS transport publishes
+    # one shared listener/state per country.  Device presentation must understand both
+    # contracts: a working container exit otherwise appears as "Not connected" even while
+    # the Engine is actively sending IKE through it.
+    egress_state = egress.status()
+    egress_lines = egress_state.get("lines") or {}
+    egress_exits = egress_state.get("exits") or {}
     result = []
     for device_id in device_ids:
         native_card = native_readers.get(device_id)
@@ -4091,12 +4108,20 @@ async def _unified_devices() -> list[dict]:
                 "carrier_identity": (inst or {}).get("carrier_identity") or {},
             }
         carrier = _carrier_description(inst, card_info, cellular_view)
+        exit_country = egress.line_country(inst or card_info)
+        line_exit = egress_lines.get(str(inst["id"]) if inst else "", {}) or {}
+        country_exit = egress_exits.get(exit_country, {}) or {}
+        active_exit = line_exit if line_exit.get("node") else country_exit
         if native_card:
             hardware_imei, _hardware_id, _hardware_type = _hardware_imei_for_card(
                 native_card, cards)
             hardware_record = device_state.hardware().get(device_id) or hardware_record
         else:
             hardware_imei = cfg.normalize_imei(identity.get("imei", ""))
+        if is_draft and len(hardware_imei) != 15:
+            vowifi.update(
+                available=False,
+                reason="Set a 15-digit IMEI in Hardware; the line will then start automatically")
         masked_imei = _masked_identifier(hardware_imei)
         bridge_active = bool(actual_state.get("vowifi_bridge_active"))
         logical_channels = (None if is_native_reader else
@@ -4147,17 +4172,15 @@ async def _unified_devices() -> list[dict]:
                        # engine config (config.py).
                        "accept_epdg_rekey": bool((inst or {}).get("accept_epdg_esp_rekey",
                            (cfg.get_settings().get("rekey") or {}).get("accept_epdg", False)))},
-            "egress": {"node": (egress.status().get("lines") or {}).get(
-                str(inst["id"]) if inst else "", {}).get("node") or "",
+            "egress": {"node": active_exit.get("node") or "",
                 # The picker lives on the settings page, so without these the device page shows
                 # a node that silently disagrees with what the operator chose.
-                **{key: ((egress.status().get("exits") or {}).get(
-                    egress.line_country(inst or card_info), {}).get(key) or "")
+                **{key: (country_exit.get(key) or "")
                    for key in ("pinned_node", "pin_mode", "selection",
                                # Why the exit moved, and whether the pinned node is still
                                # serving a cooldown — otherwise a mismatch looks arbitrary.
                                "last_change", "pinned_cooldown_seconds")},
-                "country": egress.line_country(inst or card_info),
+                "country": exit_country,
                 "detected_country": egress.country_for_mcc((inst or card_info).get("mcc")),
                 "override": egress.normalize_country((inst or {}).get("proxy_country")),
                 "available_countries": available_countries},
@@ -4209,26 +4232,46 @@ async def api_device_hardware(device_id: str, body: dict):
         "stable_path": device.get("stable_path") or "", "imei": imei})
 
     # A running line renders the device identity inside its container. Apply a hardware
-    # change immediately to the SIM currently inserted in this reader.
+    # change immediately to the SIM currently inserted in this reader. A new reader line is
+    # deliberately a stopped draft until its hardware IMEI exists; saving that last missing
+    # fact must also promote and start it, without requiring a second Save on the SIM tab.
     iid = str(device.get("instance_id") or "")
     applied = False
+    started = False
     if iid and imei:
         inst = cfg.get_instance(iid) or {}
-        previous_imeisv = str(inst.get("imeisv") or "")
-        svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
-               and previous_imeisv[-2:].isdigit() else _random_svn())
-        inst = cfg.upsert_instance({"id": iid, "imei": imei,
-                                    "imei_source_device_id": device_id,
-                                    "imeisv": cfg.imeisv_from_imei(imei, svn=svn)})
-        if await asyncio.to_thread(engine.is_running, iid):
+        cards = hub.cards_list()
+        card_info = next((item for item in cards if item.get("present") and (
+            str(item.get("hardware_id") or "") == device_id
+            or (inst.get("iccid") and str(item.get("iccid") or "")
+                == str(inst.get("iccid") or "")))), None)
+        if inst.get("provisioning_state") == "draft" and card_info:
+            inst = await asyncio.to_thread(_auto_promote_card_draft, inst, card_info, cards)
+        else:
+            previous_imeisv = str(inst.get("imeisv") or "")
+            svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
+                   and previous_imeisv[-2:].isdigit() else _random_svn())
+            inst = cfg.upsert_instance({"id": iid, "imei": imei,
+                                        "imei_source_device_id": device_id,
+                                        "imeisv": cfg.imeisv_from_imei(imei, svn=svn)})
+        running = await asyncio.to_thread(engine.is_running, iid)
+        if running:
             await hub.drop_ami(iid)
             await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
                                     dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
             hub.reset_health(iid, "configuration_restart")
             applied = True
+        elif inst.get("provisioning_state") != "draft":
+            allowed, _reason = _line_auto_start_allowed(inst)
+            if allowed:
+                await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
+                                        dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
+                hub.reset_health(iid, "hardware_identity_completed")
+                applied = True
+                started = True
     await hub.broadcast({"type": "hardware", "device": device_id})
     return {"ok": True, "imei_masked": _masked_identifier(record.get("imei")),
-            "applied": applied}
+            "applied": applied, "started": started}
 
 
 def _remove_device_from_document(path: str, device_id: str, mapping_key: str) -> None:
@@ -4772,7 +4815,8 @@ def api_system_status():
     settings = cfg.get_settings()
     # Served from the poller's sample: collecting here would shell out to vcgencmd/dmesg on
     # every page load of an already power-constrained box.
-    host = hub.host_snapshot or sysinfo.collect(cfg.DATA_DIR)
+    host = hub.host_snapshot or sysinfo.collect(
+        cfg.DATA_DIR, include_docker_storage=False)
     return {
         "system_name": "MDD Sim Gateway",
         "host": host,
@@ -4782,6 +4826,10 @@ def api_system_status():
         "unheard_voicemails": sum(store.unheard_voicemail_counts().values()),
         "timezone": settings.get("timezone") or "UTC",
         "version": VERSION,
+        "deployment": {
+            "container_stack": operations.container_stack_enabled(),
+            "host_restart_available": not operations.container_stack_enabled(),
+        },
         "repository_url": f"https://github.com/{update_check.repository()}",
         "backups": operations.list_local_backups(),
         "security": {
@@ -4838,10 +4886,17 @@ async def api_system_repository_stars(force: bool = False):
 
 @app.post("/api/system/update/apply")
 async def api_system_update_apply(body: dict):
-    """One-click update: publish a request for the host orchestrator, which runs the detached
-    updater (host/mdd_update.py). Responds immediately; progress is polled separately."""
+    """Start a detached update through the host orchestrator or container-stack helper.
+
+    The response remains immediate in both deployment modes; progress is polled separately.
+    """
     version = body.get("version")
-    return await asyncio.to_thread(update_check.request_apply, version=version)
+    result = await asyncio.to_thread(update_check.request_apply, version=version)
+    if result.get("ok") and operations.container_stack_enabled():
+        launched = await asyncio.to_thread(operations.launch_container_update)
+        if not launched.get("ok"):
+            return launched
+    return result
 
 
 @app.get("/api/system/update/progress")
@@ -4918,12 +4973,20 @@ async def api_system_maintenance(body: dict):
             except Exception as exc:
                 failed[iid] = str(getattr(exc, "detail", exc))
         return {"ok": not failed, "action": action, "restarted": restarted, "failed": failed}
-    # Restarting services is the one maintenance action this process cannot perform itself:
-    # it is unprivileged, and in every scope it is itself one of the things being restarted.
+    # Publish one shared request contract. The Pi host orchestrator consumes it externally;
+    # container mode launches its bounded Docker executor after the response has been flushed.
     scope = {"restart_control": "control", "restart_services": "services",
              "restart_host": "host"}.get(action)
     if scope:
         result = await asyncio.to_thread(operations.request_service_restart, scope)
+        if result.get("ok") and operations.container_stack_enabled():
+            async def restart_after_response():
+                # Let Uvicorn flush the accepted response before the Docker daemon stops us.
+                await asyncio.sleep(.75)
+                await asyncio.to_thread(operations.perform_container_service_restart, scope)
+            task = asyncio.create_task(restart_after_response())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         return {**result, "action": action}
     raise HTTPException(400, "unknown maintenance action")
 

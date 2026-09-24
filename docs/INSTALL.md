@@ -1,5 +1,8 @@
 # 安装与升级
 
+本文描述传统宿主辅助安装。Synology Container Manager 及其他全容器环境请使用
+[全容器部署指南](CONTAINER_DEPLOYMENT.md)，不要在 NAS 上执行本页的 `install.sh install`。
+
 ## 支持环境
 
 - 推荐 ARM64 Debian、Ubuntu 或 Armbian，systemd 可用。

@@ -9,6 +9,7 @@
   <a href="#quick-install">Quick install</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="docs/INSTALL.md">Installation</a> ·
+  <a href="docs/CONTAINER_DEPLOYMENT.en.md">NAS/container deployment</a> ·
   <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">Discussions</a>
 </p>
 
@@ -45,7 +46,13 @@ cd mdd-sim-gateway
 sudo ./install.sh install
 ```
 
-When installation completes, open `https://<gateway-address>:8443` and create the administrator account immediately on a trusted LAN or VPN. See [Installation](docs/INSTALL.md) for prerequisites, the full install process and upgrades.
+When installation completes, open `https://<gateway-address>:8443` and create the administrator account immediately on a trusted LAN or VPN. See [Installation](docs/INSTALL.md) for prerequisites, the full install process and upgrades. NAS Compose deployments use host port `10443` by default.
+
+Synology and other NAS users can run the complete gateway as a Container Manager/Compose project
+without installing the application stack on the host. Use the version-pinned Compose YAML attached
+to a Release and follow the [full container deployment guide](docs/CONTAINER_DEPLOYMENT.en.md).
+Verified and pending NAS/kernel combinations are tracked in the
+[NAS compatibility and driver catalogue](drivers/README.en.md).
 
 > This software directly controls cellular radios, SIMs, network routes and IMS. Carrier support for Wi-Fi Calling still depends on the plan, region, device identity and network policy.
 

@@ -13,6 +13,7 @@ pcscd (Dockerfile PCSC_VERSION == install.sh PCSC_VERSION) so client/server prot
 from __future__ import annotations
 
 from datetime import datetime
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import time
 import docker
 
 from . import config as cfg, egress, sysinfo
+from .egress_contract import ENGINE_LABEL
 
 log = logging.getLogger("mdd.engine")
 
@@ -79,6 +81,12 @@ PCSCD_SOCK = os.environ.get("MDD_PCSCD_DIR", "/run/pcscd")
 # Absolute host path to the project data dir (needed for bind mounts when the manager
 # itself runs in a container; defaults to DATA_DIR on the host).
 HOST_DATA_DIR = os.environ.get("MDD_HOST_DATA", DATA_DIR)
+# Container-native deployments share their own pcscd directory and Docker network.
+# The mount source is a Docker-host path, distinct from Control's client socket path.
+HOST_PCSCD_DIR = os.environ.get("MDD_HOST_PCSCD_DIR", PCSCD_SOCK)
+PCSCD_VOLUME = os.environ.get("MDD_PCSCD_VOLUME", "").strip()
+ENGINE_NETWORK = os.environ.get("MDD_ENGINE_NETWORK", "").strip()
+DIRECT_NETWORK = os.environ.get("MDD_ENGINE_DIRECT_NETWORK", "").strip()
 MANAGED_LABEL = "io.mdd-sim-gateway.managed"
 
 
@@ -343,15 +351,64 @@ def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
 
 def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "rebuild"):
     """(Re)create and start the engine container for an instance."""
+    if ENGINE_NETWORK in {"host", "none"}:
+        raise ValueError("MDD_ENGINE_NETWORK must be a Docker bridge network")
+    if DIRECT_NETWORK in {"host", "none"} or (DIRECT_NETWORK and DIRECT_NETWORK == ENGINE_NETWORK):
+        raise ValueError("MDD_ENGINE_DIRECT_NETWORK must be a separate Docker bridge network")
+    network_options = {"network": ENGINE_NETWORK} if ENGINE_NETWORK else {}
+    engine_sysctls = {
+        # These six settings predate the full-container runtime and remain part of the native
+        # Pi Engine isolation policy.
+        "net.ipv6.conf.all.accept_ra": "0",
+        "net.ipv6.conf.default.accept_ra": "0",
+        "net.ipv6.conf.all.autoconf": "0",
+        "net.ipv6.conf.default.autoconf": "0",
+        "net.ipv6.conf.all.use_tempaddr": "0",
+        "net.ipv6.conf.default.use_tempaddr": "0",
+    }
+    if ENGINE_NETWORK:
+        # Docker disables IPv6 inside containers attached only to an IPv4 bridge. Many IMS
+        # PDNs assign only an IPv6 inner address and P-CSCF, so container mode re-enables it.
+        engine_sysctls.update({
+            "net.ipv6.conf.all.disable_ipv6": "0",
+            "net.ipv6.conf.default.disable_ipv6": "0",
+        })
     iid = str(inst["id"])
-    # Fail closed before creating the container when country routing is enabled. The host-side
-    # orchestrator confirms that this carrier's outer ePDG address is routed through the selected
-    # country TUN; inner IMS/SIP/RTP then stays inside the resulting IPsec tunnel.
-    egress.ensure_line(inst, settings)
-    cfg.write_instance_json(inst, settings)
+    client = _client()
+    # Check readiness before replacing a working container. Host mode requires the ePDG
+    # route; container mode requires the current country's SOCKS listener and image support.
+    selected_exit = egress.ensure_line(inst, settings) or {}
+    proxy_environment = {}
+    selected_image = IMAGE
+    rendered_inst = inst
+    if selected_exit.get("transport") == "socks5":
+        if not ENGINE_NETWORK:
+            raise egress.EgressError("SOCKS egress requires MDD_ENGINE_NETWORK")
+        # Old images ignore unknown environment variables and would silently go direct.
+        # Inspect before writing configuration or removing the previous container.
+        image = client.images.get(IMAGE)
+        supported = (image.attrs.get("Config", {}).get("Labels") or {}).get(ENGINE_LABEL, "")
+        if "socks5" not in supported.split(","):
+            raise egress.EgressError("engine image does not support SOCKS egress; rebuild required")
+        selected_image = image.id
+        proxy_environment["SWU_EGRESS_PROXY"] = selected_exit["proxy_url"]
+        epdg = egress.epdg_for(inst)
+        try:
+            ipaddress.IPv4Address(epdg)
+            epdg_ip = epdg
+        except ValueError:
+            epdg_ip = egress.resolve_ipv4_via_socks(selected_exit["proxy_url"], epdg)
+        # The Engine network is internal and deliberately cannot query public DNS.
+        # Render a one-run copy with the resolved peer; the saved line keeps its hostname.
+        rendered_inst = {**inst, "epdg": epdg_ip}
+    direct_network = None
+    if not proxy_environment and DIRECT_NETWORK:
+        # Resolve this before replacing an existing Engine. A missing deployment
+        # network must not destroy a line which is already running.
+        direct_network = client.networks.get(DIRECT_NETWORK)
+    cfg.write_instance_json(rendered_inst, settings)
     base, host_base = _instance_paths(iid)
     ports = inst.get("ports", {})
-    client = _client()
     # remove any existing container
     try:
         old = client.containers.get(container_name(iid))
@@ -369,7 +426,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         os.path.join(host_base, "instance.json"): {"bind": "/config/instance.json", "mode": "ro"},
         os.path.join(host_base, "logs"): {"bind": "/logs", "mode": "rw"},
         os.path.join(host_base, "run"): {"bind": "/run/mdd-sim-gateway", "mode": "rw"},
-        PCSCD_SOCK: {"bind": "/run/pcscd", "mode": "rw"},
+        (PCSCD_VOLUME or HOST_PCSCD_DIR): {"bind": "/run/pcscd", "mode": "rw"},
     }
     # The image has no timezone, so every engine log (IKE, Asterisk) was stamped in UTC while
     # the timeline, the WebUI and the operator's shell read local time. Correlating a rekey or
@@ -400,7 +457,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         port_bindings[f"{p}/udp"] = p
 
     c = client.containers.run(
-        IMAGE,
+        selected_image,
         name=container_name(iid),
         detach=True,
         cap_add=["NET_ADMIN"],
@@ -418,6 +475,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
             "MDD_ID": iid,
             "SWU_LIVENESS_PERIOD": str(inst.get("liveness_period", 0)),
             "SWU_TUN_MTU": os.environ.get("SWU_TUN_MTU", "1400"),
+            **proxy_environment,
             # How a new P-CSCF is pushed into Asterisk on reconnect: "restart" (default,
             # Asterisk-internal cold restart) or "reload" (the old path, which crashes — see
             # swu_apply_pcscf). Settable per line, then globally, so a line can be moved back
@@ -427,16 +485,16 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
                 or (settings.get("engine") or {}).get("pcscf_apply_mode")
                 or "restart"),
         },
-        sysctls={
-            "net.ipv6.conf.all.accept_ra": "0",
-            "net.ipv6.conf.default.accept_ra": "0",
-            "net.ipv6.conf.all.autoconf": "0",
-            "net.ipv6.conf.default.autoconf": "0",
-            "net.ipv6.conf.all.use_tempaddr": "0",
-            "net.ipv6.conf.default.use_tempaddr": "0",
-        },
         extra_hosts={"host.docker.internal": "host-gateway"},  # so notify.py can reach the manager
+        sysctls=engine_sysctls,
+        **network_options,
     )
+    if direct_network is not None:
+        try:
+            direct_network.connect(c)
+        except Exception:
+            c.remove(force=True)
+            raise
     log.info("started engine container %s", c.name)
     return c.id
 
@@ -505,7 +563,10 @@ def container_runtime(iid: str) -> dict:
         running = c.status == "running"
         ip = None
         if running:
-            for network in c.attrs.get("NetworkSettings", {}).get("Networks", {}).values():
+            networks = c.attrs.get("NetworkSettings", {}).get("Networks", {})
+            candidates = ([networks.get(ENGINE_NETWORK, {})] if ENGINE_NETWORK
+                          else networks.values())
+            for network in candidates:
                 if network.get("IPAddress"):
                     ip = network["IPAddress"]
                     break

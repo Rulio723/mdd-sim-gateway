@@ -24,6 +24,8 @@ This list covers the material dependencies intentionally used by MDD Sim Gateway
 | Tailwind CSS | Web interface styling | MIT | https://github.com/tailwindlabs/tailwindcss |
 | Twemoji Mozilla | Bundled color Emoji font used for country flags in proxy node names | Apache-2.0 (font tooling/code); Twemoji artwork CC-BY-4.0 | https://github.com/mozilla/twemoji-colr |
 | FastAPI | Control API framework | MIT | https://github.com/fastapi/fastapi |
+| Docker CLI 27.5.1 | Detached container-project update client | Apache-2.0 | https://github.com/docker/cli |
+| Docker Compose 2.32.4 | Transactional recreation of the Compose project during updates | Apache-2.0 | https://github.com/docker/compose |
 | Android Open Source Project Carrier ID table | Offline MNO/MVNO identification data | Apache-2.0 | https://android.googlesource.com/platform/packages/providers/TelephonyProvider/ |
 
 Twemoji Mozilla is built by Mozilla from Twemoji artwork. The font project is Copyright

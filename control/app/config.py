@@ -226,7 +226,8 @@ def internal_event_token() -> str:
 # engine through the control surface relay (softphone_ws), so the key is ignored. WebRTC
 # *media* (ICE, DTLS-SRTP) is unaffected and still uses the rtp_start..rtp_span range below.
 PORT_BASE = {"sip_udp": 5060, "sip_tls": 5061, "ami": 5038,
-             "rtp_start": 10000, "rtp_end": 11000}
+             "rtp_start": int(os.environ.get("MDD_RTP_BASE", "10000")),
+             "rtp_end": int(os.environ.get("MDD_RTP_BASE", "10000")) + 1000}
 PORT_STRIDE = {"sip_udp": 10, "sip_tls": 10, "ami": 10,
                "rtp_start": 2000, "rtp_end": 2000}
 
@@ -623,14 +624,18 @@ def _host_port_free(port: int) -> bool:
 
 
 def _block_free(block: dict, reserved: set[int]) -> bool:
-    """A candidate block is usable if none of its ports collide with reserved ports and
-    none of its 3 service ports are already listening on the host."""
+    """A candidate block is usable if none of its TCP or UDP ports are occupied."""
     bp = _block_ports(block)
     if bp & reserved:
         return False
-    # Only probe the 3 service ports on the host (probing 60 RTP ports every try is slow;
-    # RTP conflicts are caught by the reserved-set check against other instances).
-    for port in (block["sip_udp"], block["sip_tls"], block["ami"]):
+    # Engine ports are published in the host namespace, which is not visible from Control's
+    # bridge namespace. Docker remains authoritative when it creates the Engine container.
+    if os.environ.get("MDD_CONTAINER_STACK") == "1":
+        return True
+    # A compact block probes 16 ports and a legacy block 64. This runs only while
+    # provisioning, and avoids discovering an RTP collision after Docker has already
+    # removed/replaced the previous Engine.
+    for port in sorted(bp):
         if not _host_port_free(port):
             return False
     return True
@@ -1109,15 +1114,19 @@ def render_instance_json(inst: dict, settings: dict) -> dict:
         "msisdn": inst.get("msisdn", ""),
         "smsc": inst.get("smsc", ""),
         "pcscf": inst.get("pcscf", ""),
+        # Usually blank so the Engine derives the carrier ePDG hostname.  In an
+        # isolated country-egress run Control resolves that hostname first and
+        # writes the one-run IPv4 peer here because the Engine has no public DNS.
+        "epdg": inst.get("epdg", ""),
         "ami_user": inst.get("ami_user", "vowifi"),
         "ami_secret": ami_secret,
         # Where engine notify.py POSTs events. Explicit setting wins; else MDD_MANAGER_URL
         # env (the installer sets this to the PUBLISHED host port when the control plane runs
-        # in a bridge-networked container with a non-8443 port map); else the default assumes
+        # in a bridge-networked container with a different host port); else the default assumes
         # a 1:1 host.docker.internal:<http_port> mapping.
         "manager_url": settings.get("manager_url")
                        or os.environ.get("MDD_MANAGER_URL")
-                       or f"https://host.docker.internal:{settings.get('http_port', 8443)}",
+                       or f"https://host.docker.internal:{settings.get('http_port', 10443)}",
         "manager_event_token": internal_event_token(),
         "domain": settings.get("tls", {}).get("domain", ""),
         "rtp_start": ports["rtp_start"],

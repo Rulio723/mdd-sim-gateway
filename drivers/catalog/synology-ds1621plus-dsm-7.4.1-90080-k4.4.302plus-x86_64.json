@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "id": "synology-ds1621plus-dsm-7.4.1-90080-k4.4.302plus-x86_64",
+  "vendor": "Synology",
+  "product": "DS1621+",
+  "platform": "v1000",
+  "architecture": "x86_64",
+  "os": {
+    "name": "DSM",
+    "version": "7.4.1",
+    "build": "90080"
+  },
+  "kernel": {
+    "release": "4.4.302+",
+    "vermagic": "4.4.302+ SMP mod_unload"
+  },
+  "validation": {
+    "status": "driver-verified",
+    "date": "2026-09-24",
+    "deployment": "full-container",
+    "notes": "VoWiFi, IMS registration, cellular data, hotplug, PC/SC and eSIM listing were validated. The formal SPK asset is not published yet."
+  },
+  "host_native": false,
+  "required_modules": ["mii", "cdc-wdm", "qmi_wwan", "usb_wwan", "option"],
+  "tested_usb": [
+    {
+      "vid": "2c7c",
+      "pid": "0125",
+      "kind": "cellular-modem",
+      "result": "working"
+    },
+    {
+      "vid": "04d9",
+      "pid": "c001",
+      "kind": "pcsc-reader",
+      "result": "working"
+    }
+  ],
+  "expected_nodes": ["ttyUSB", "cdc-wdm", "wwan", "usb-bus"],
+  "driver_pack": {
+    "status": "packaging-pending",
+    "asset": null,
+    "sha256": null
+  }
+}

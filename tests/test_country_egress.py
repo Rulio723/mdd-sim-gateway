@@ -1118,6 +1118,14 @@ class UdpProbeTargetTests(unittest.TestCase):
         self.assertEqual(calls[0], ("dns", "1.1.1.1", 53))
         self.assertEqual(calls[-1], ("dns", "9.9.9.9", 53))
 
+    def test_epdg_resolution_uses_the_selected_socks_udp_path(self):
+        with patch.object(egress, "_udp_probe_once", return_value="198.51.100.25") as probe:
+            address = egress.resolve_ipv4_via_socks(
+                "socks5://mdd-egress:22157", "epdg.example.net")
+        self.assertEqual(address, "198.51.100.25")
+        self.assertEqual(probe.call_args.args[2],
+                         ("resolve", "1.1.1.1", 53, "epdg.example.net"))
+
     def test_every_probe_failing_names_each_one(self):
         with patch.object(egress, "_udp_probe_once",
                           side_effect=egress.EgressError("timed out")):

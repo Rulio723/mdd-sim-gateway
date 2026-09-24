@@ -248,11 +248,15 @@ const UPDATE_PHASES = {
   requested: 'Contacting the host…', launching: 'Contacting the host…',
   downloading: 'Downloading the new release…', verifying: 'Verifying the package…',
   engine_image: 'Importing the verified Engine image…',
+  hardware_image: 'Importing the verified Hardware image…',
+  egress_image: 'Importing the verified Egress image…',
   backup: 'Backing up the current version…', applying: 'Applying files…',
   control_image: 'Importing the verified control image…',
   reloading: 'Rebuilding and restarting services…',
+  engine_rollout: 'Restarting lines with the new Engine image…',
+  rollback: 'Restoring the previous container version…',
 }
-const UPDATE_PHASE_ORDER = ['requested', 'downloading', 'verifying', 'engine_image', 'control_image', 'backup', 'applying', 'reloading', 'done']
+const UPDATE_PHASE_ORDER = ['requested', 'downloading', 'verifying', 'control_image', 'hardware_image', 'egress_image', 'engine_image', 'backup', 'applying', 'reloading', 'engine_rollout', 'done']
 const normalizedUpdatePhase = phase => phase === 'launching' ? 'requested' : (phase || 'requested')
 const formatUpdateBytes = value => {
   const bytes = Math.max(0, Number(value) || 0)
@@ -347,14 +351,15 @@ function UpdateModal({ update, current, t, onClose }) {
   }
   const mute = { fontSize: 12, color: 'var(--text-mute)' }
   const visiblePhases = UPDATE_PHASE_ORDER.filter(key =>
-    (key !== 'control_image' || progress?.install_mode === 'docker') &&
+    (key !== 'control_image' || ['docker', 'container'].includes(progress?.install_mode)) &&
+    (!['hardware_image', 'egress_image', 'engine_rollout'].includes(key) || progress?.install_mode === 'container') &&
     (key !== 'engine_image' || progress?.engine_image_required))
   const activePhase = normalizedUpdatePhase(phase)
   const activeIndex = Math.max(0, visiblePhases.indexOf(activePhase))
   const downloaded = Number(progress?.downloaded_bytes) || 0
   const total = Number(progress?.total_bytes) || 0
   const percent = total > 0 ? Math.min(100, Math.round(downloaded * 100 / total)) : 0
-  const transferring = ['downloading', 'engine_image', 'control_image'].includes(activePhase)
+  const transferring = ['downloading', 'engine_image', 'control_image', 'hardware_image', 'egress_image'].includes(activePhase)
   const speed = Number(progress?.bytes_per_second) || 0
   // Only an estimate the host can actually support: a Release whose size the check never
   // returned, or a transfer that has not moved yet, gets no countdown rather than a wrong one.
@@ -390,7 +395,7 @@ function UpdateModal({ update, current, t, onClose }) {
             {mode === 'restarting' ? t('The gateway is restarting — the page will reload automatically. Sign in again afterwards.') : t(UPDATE_PHASES[phase] || UPDATE_PHASES.requested)}
           </p>
           <div className="u-update-facts">
-            <div><span>{t('Installation mode')}</span><b>{progress?.install_mode === 'docker' ? t('Docker container') : progress?.install_mode === 'local' ? t('Local service') : '—'}</b></div>
+            <div><span>{t('Installation mode')}</span><b>{progress?.install_mode === 'container' ? t('Full container project') : progress?.install_mode === 'docker' ? t('Docker container') : progress?.install_mode === 'local' ? t('Local service') : '—'}</b></div>
             <div><span>{t('Download route')}</span><b title={progress?.route ? routeDetail : ''}>{progress?.route ? routeDetail : '—'}</b></div>
             <div><span>{t('Elapsed time')}</span><b>{formatUpdateDuration(elapsed, t)}</b></div>
           </div>

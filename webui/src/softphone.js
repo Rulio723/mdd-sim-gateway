@@ -147,21 +147,37 @@ export class Softphone {
     })
   }
 
-  // prov: { username, password, ws_path, host, realm }
+  // prov: { username, password, ws_path, host, realm }. ws_port is accepted while a
+  // control/engine pair is being upgraded from the old directly-published WSS transport.
   start(prov, host) {
     if (this.ua) this.stop()
-    // Same origin as the page: the control surface relays the socket to this line's engine.
-    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${prov.ws_path}`
-    const socket = new JsSIP.WebSocketInterface(wsUrl)
-    const domain = prov.domain || host
-    this.ua = new JsSIP.UA({
-      sockets: [socket],
-      uri: `sip:${prov.username}@${domain}`,
-      password: prov.password,
-      register: true,
-      session_timers: false,
-      contact_uri: `sip:${prov.username}@${domain};transport=wss`,
-    })
+    // Prefer the same-origin relay. The fallback keeps the page usable during a rolling update
+    // in which an older control plane still returns ws_port. Invalid/mixed provisioning must
+    // report a failed registration rather than throw from a React effect and blank the page.
+    const path = typeof prov?.ws_path === 'string' && prov.ws_path.startsWith('/')
+      ? prov.ws_path : ''
+    const oldPort = Number(prov?.ws_port)
+    const wsUrl = path
+      ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${path}`
+      : (Number.isInteger(oldPort) && oldPort > 0 && oldPort <= 65535
+          ? `wss://${host}:${oldPort}/ws` : '')
+    if (!wsUrl) { this.emit('regfail', 'invalid provisioning'); return false }
+    try {
+      const socket = new JsSIP.WebSocketInterface(wsUrl)
+      const domain = prov.domain || host
+      this.ua = new JsSIP.UA({
+        sockets: [socket],
+        uri: `sip:${prov.username}@${domain}`,
+        password: prov.password,
+        register: true,
+        session_timers: false,
+        contact_uri: `sip:${prov.username}@${domain};transport=wss`,
+      })
+    } catch (error) {
+      this.ua = null
+      this.emit('regfail', (error && error.message) || 'invalid provisioning')
+      return false
+    }
     this.ua.on('connected', () => this.emit('ws', 'connected'))
     // Only the 'disconnected' event is gated on _dead: ua.stop() (called when the user switches
     // lines) fires 'disconnected' ASYNCHRONOUSLY ~1s later, and without this guard that late event
@@ -173,7 +189,12 @@ export class Softphone {
     this.ua.on('unregistered', () => this.emit('registered', false))
     this.ua.on('registrationFailed', (e) => this.emit('regfail', (e && e.cause) || 'failed'))
     this.ua.on('newRTCSession', (e) => this.handleSession(e))
-    this.ua.start()
+    try { this.ua.start() } catch (error) {
+      this.ua = null
+      this.emit('regfail', (error && error.message) || 'start failed')
+      return false
+    }
+    return true
   }
 
   handleSession(e) {

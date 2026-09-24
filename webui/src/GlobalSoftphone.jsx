@@ -80,8 +80,8 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
           }
         }
         phone = new Phone(onEvent, null)
+        if (!phone.start(prov, prov.host || location.hostname)) return
         phones.current.set(id, phone)
-        phone.start(prov, prov.host || location.hostname)
       }).catch(() => {})
     }
   }, [lineKey, excludedId]) // eslint-disable-line react-hooks/exhaustive-deps

@@ -685,8 +685,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={
                     "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
                 patch.object(main, "_cached_line_status", return_value=None), \
-                patch.object(main.egress, "status", return_value={"lines": {}}), \
-                patch.object(main.egress, "line_country", return_value="GB"), \
+                patch.object(main.egress, "status", return_value={
+                    "exits": {"gb": {"ready": True, "node": "London container exit"}}}), \
+                patch.object(main.egress, "line_country", return_value="gb"), \
                 patch.object(main.egress, "country_for_mcc", return_value="GB"):
             devices = await main._unified_devices()
 
@@ -698,6 +699,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device["sim"]["carrier"]["plmn"], "234-10")
         self.assertEqual(device["instance_id"], "3")
         self.assertEqual(device["capabilities"]["cellular"]["actual"], "on")
+        self.assertEqual(device["egress"]["node"], "London container exit")
 
     async def test_saved_unplugged_modem_never_looks_like_it_is_transitioning(self):
         desired = {"devices": {"modem-a": {

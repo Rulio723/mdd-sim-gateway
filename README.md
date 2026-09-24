@@ -9,6 +9,7 @@
   <a href="#快速安装">快速安装</a> ·
   <a href="docs/ARCHITECTURE.md">架构</a> ·
   <a href="docs/INSTALL.md">安装文档</a> ·
+  <a href="docs/CONTAINER_DEPLOYMENT.md">NAS/容器部署</a> ·
   <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">社区讨论</a>
 </p>
 
@@ -42,7 +43,11 @@ cd mdd-sim-gateway
 sudo ./install.sh install
 ```
 
-安装完成后访问 `https://<网关地址>:8443`，并在受信的局域网或 VPN 中立即创建管理员账号。完整的前置检查、安装过程和升级方式见 [安装与升级](docs/INSTALL.md)。
+安装完成后访问 `https://<网关地址>:8443`，并在受信的局域网或 VPN 中立即创建管理员账号。完整的前置检查、安装过程和升级方式见 [安装与升级](docs/INSTALL.md)。NAS Compose 部署默认使用宿主端口 `10443`。
+
+Synology 和其他 NAS 的全容器版本通过 Container Manager 导入发布版 Compose YAML，详见
+[全容器部署指南](docs/CONTAINER_DEPLOYMENT.md)；已验证和待验证的 NAS/内核组合见
+[NAS 兼容性与驱动目录](drivers/README.md)。
 
 > 本项目直接控制蜂窝模块、SIM、网络路由和 IMS。运营商是否开放 Wi‑Fi Calling 仍取决于套餐、区域、设备身份和网络策略。
 

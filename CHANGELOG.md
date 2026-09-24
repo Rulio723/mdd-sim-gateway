@@ -2,6 +2,50 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.12.0-rc1] - 2026-09-24
+
+Release candidate, published to exercise the container deployment's update and rollback
+paths on real hardware. The automatic update channel stays on 1.9.5.
+
+### Added
+
+- Full-container deployment for NAS hosts: Control, Hardware and Egress base containers plus one
+  Engine per enabled line (`3 + N`). Hardware runs a private D-Bus, ModemManager, NetworkManager,
+  pcscd and the SIM bridge; Egress serves one SOCKS5 TCP/UDP listener per country and never
+  installs a host route. SWu opens separate SOCKS5 UDP associations for IKE/500 and NAT-T/4500
+  with no direct fallback. Control, Hardware and Engine share the virtual readers through a named
+  PC/SC volume. Deployment guide: `docs/CONTAINER_DEPLOYMENT.md`.
+- One-click update and whole-stack rollback for the container deployment. A short-lived sibling of
+  the running Control image verifies four release image archives against the Release
+  `SHA256SUMS`, backs up the database and configuration, preserves operator edits to the Compose
+  file, recreates the base containers and rolls the Engines one line at a time, and restores the
+  previous Compose, base images and Engine images if any stage fails.
+- The Release workflow now builds Control, Hardware, Egress and Engine natively on both amd64 and
+  arm64, publishes eight offline image archives, a version-pinned Compose project file and four
+  multi-architecture GHCR tags, all covered by one `SHA256SUMS`.
+
+### Changed
+
+- Saving a hardware IMEI for a reader line now promotes the draft and starts the line, instead of
+  requiring a second save on the SIM tab.
+- Port-block allocation probes every port in a candidate block rather than only the three service
+  ports, so an RTP collision is found before the previous Engine is replaced. Container
+  deployments skip the probe entirely, because Control cannot see the host namespace; Docker
+  reports the conflict when it creates the Engine.
+- The Control image now ships the patched `lpac` binary. A configured path still wins, and the
+  packaged copy is used only when the default data-directory path has no file.
+
+### Known limitations
+
+- The NAS full-container path is experimental in this release candidate. No installable driver
+  asset is published yet, and the startup hardware preflight with `host-native` /
+  `driver_required` status described in `docs/design/container-release-plan.md` is not
+  implemented — see that document's "实现状态" section for the full list.
+- Update gates are limited to Docker health checks. The updater does not verify IMS
+  re-registration, the NAS default route or NetworkManager's device scope before completing.
+- Adding or removing a cellular module restarts the private pcscd, so running lines see one brief
+  SIM-channel interruption.
+
 ## [1.11.0] - 2026-09-22
 
 ### Fixed
