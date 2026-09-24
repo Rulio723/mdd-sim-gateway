@@ -318,6 +318,16 @@ bearer.stats.tx-bytes : 456
         self.assertEqual(add[add.index("connection.autoconnect") + 1], "no")
         self.assertEqual(add[add.index("ipv4.never-default") + 1], "yes")
 
+    def test_the_first_dial_is_not_held_back_on_a_freshly_booted_host(self):
+        """The 45-second limit stored "never attempted" as monotonic zero, so on a host up
+        for less than 45 seconds the first dial was skipped."""
+        snapshot = {"powered": True, "data_active": False, "registration": "home",
+                    "primary_port": "ttyUSB5", "apn": "internet",
+                    "profile": Orchestrator.cellular_profile_name("modem-a")}
+        with patch("host.mdd_orchestrator.time.monotonic", return_value=5.0):
+            calls, _app = self._orchestrator_calls("ensure_modem_data", snapshot, exists=False)
+        self.assertTrue(any(call[:3] == ["nmcli", "connection", "up"] for call in calls))
+
     def test_an_existing_legacy_profile_is_corrected_even_without_an_apn(self):
         """Profiles written by an older version carry autoconnect=yes and no route guard, and
         they outlive the upgrade. Correcting them only when an APN was known left them."""

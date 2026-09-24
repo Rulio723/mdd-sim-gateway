@@ -7,6 +7,11 @@ services:
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
+    # The data directory is whatever folder the operator created, often owned by their
+    # DSM account with mode 0700. Without these, root in this container is just
+    # "other" there: it could neither enter it nor set its mode, and a folder made in
+    # File Station failed to start. Control already holds the Docker socket.
+    cap_add: [DAC_OVERRIDE, FOWNER]
     security_opt: [no-new-privileges:true]
     pids_limit: 256
     mem_limit: 512m
@@ -99,6 +104,9 @@ services:
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
+    # Enter an operator-owned data directory (see control). Every file inside is created
+    # by root, so owner permissions already give this container access to them.
+    cap_add: [DAC_OVERRIDE]
     security_opt: [no-new-privileges:true]
     pids_limit: 64
     mem_limit: 256m

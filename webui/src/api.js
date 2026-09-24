@@ -86,6 +86,7 @@ export const api = {
   deviceCellular: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/cellular`),
   deviceDiagnostics: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/diagnostics`, {}),
   saveDeviceHardware: (id, patch) => j('PUT', `/api/devices/${encodeURIComponent(id)}/hardware`, patch),
+  rereadDeviceSim: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/sim/reread`),
   deleteDevice: (id) => j('DELETE', `/api/devices/${encodeURIComponent(id)}`),
   readers: () => j('GET', '/api/readers'),
   detect: (i = 0) => j('GET', `/api/sim/detect?reader_index=${i}`),

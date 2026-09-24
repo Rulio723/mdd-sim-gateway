@@ -65,6 +65,25 @@ class ContainerEgressTests(unittest.TestCase):
         self.assertNotIn("secret-value", status)
         self.assertEqual(json.loads(status)["exits"], {})
 
+    def test_the_engine_network_address_is_resolved_once(self):
+        """This used to run inside the inbound loop, so it resolved once per enabled
+        country on every reconcile pass. A container's own address is fixed."""
+        answers = [(None, None, None, None, ("172.30.0.3", 0))]
+        with patch("runtime.egress.socket.getaddrinfo", return_value=answers) as resolve:
+            self.assertEqual(self.app.listen_address(), "172.30.0.3")
+            self.assertEqual(self.app.listen_address(), "172.30.0.3")
+        self.assertEqual(resolve.call_count, 1)
+
+    def test_an_ambiguous_address_is_not_cached_as_a_success(self):
+        two = [(None, None, None, None, ("172.30.0.3", 0)),
+               (None, None, None, None, ("10.9.0.4", 0))]
+        with patch("runtime.egress.socket.getaddrinfo", return_value=two):
+            with self.assertRaises(ListenAddressError):
+                self.app.listen_address()
+        one = [(None, None, None, None, ("172.30.0.3", 0))]
+        with patch("runtime.egress.socket.getaddrinfo", return_value=one):
+            self.assertEqual(self.app.listen_address(), "172.30.0.3")
+
     def test_ambiguous_engine_listener_has_a_diagnostic_error_code(self):
         with patch.object(self.app, "build_proxy_config",
                           side_effect=ListenAddressError("two addresses")):

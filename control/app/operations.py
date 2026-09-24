@@ -430,6 +430,91 @@ def container_stack_enabled() -> bool:
         "1", "true", "yes", "on"}
 
 
+def _container_download_routes(selections: list) -> list[dict]:
+    """Turn update network selections into routes the container helper can dial.
+
+    A host install hands the selections to the orchestrator, whose resolve_route() turns
+    "country US" into the local SOCKS listener. Nothing did that in the container
+    deployment: the helper received the bare selection, found no proxy URL in it, and
+    downloaded directly while reporting route "direct" — exactly where an operator had
+    picked a proxy because the direct path to GitHub is unusable. Resolve against the
+    Egress SOCKS status here, and refuse a route that is not ready instead of dropping it
+    to direct. As on the host, `auto` offers several candidates and only those that
+    resolve are kept.
+    """
+    from urllib.parse import quote
+    from . import egress
+    from .egress_contract import current_status, socks_endpoint
+
+    proxy = cfg.get_settings().get("proxy") or {}
+    state = egress.status() or {}
+    live = (state.get("exits") or {}) if current_status(state, proxy, time.time()) else {}
+    exits = proxy.get("exits") or {}
+
+    def exit_url(country: str) -> str:
+        exit_state = live.get(country)
+        if (not (exits.get(country) or {}).get("enabled") or not isinstance(exit_state, dict)
+                or exit_state.get("ready") is not True
+                or exit_state.get("transport") != "socks5"):
+            return ""
+        try:
+            # socks5h: GitHub's hostname is resolved by the exit, not by this NAS.
+            return "socks5h://" + socks_endpoint(exit_state).split("://", 1)[1]
+        except ValueError:
+            return ""
+
+    routes, errors = [], []
+    for selection in selections:
+        if not isinstance(selection, dict):
+            continue
+        mode = str(selection.get("proxy_mode") or "direct").strip().lower()
+        if mode == "direct":
+            routes.append({"proxy_url": "", "route": "direct", "route_name": ""})
+        elif mode == "country":
+            country = str(selection.get("proxy_country") or "").strip().lower()
+            url = exit_url(country) if re.fullmatch(r"[a-z]{2}", country) else ""
+            if url:
+                routes.append({"proxy_url": url, "route": "country",
+                               "route_name": country.upper()})
+            else:
+                errors.append(f"update country exit {country.upper() or '?'} is not ready")
+        elif mode == "library":
+            profile_id = str(selection.get("proxy_profile_id") or "").strip()
+            profile = (proxy.get("profiles") or {}).get(profile_id)
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) \
+                    or not isinstance(profile, dict):
+                errors.append("selected update proxy is not in the proxy library")
+                continue
+            name = str(profile.get("name") or profile_id).strip()[:120]
+            if profile.get("type") == "socks5":
+                host = str(profile.get("server") or "").strip()
+                try:
+                    port = int(profile.get("port") or 1080)
+                except (TypeError, ValueError):
+                    port = 0
+                if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
+                    errors.append("selected SOCKS5 update proxy is invalid")
+                    continue
+                user = quote(str(profile.get("username") or ""), safe="")
+                password = quote(str(profile.get("password") or ""), safe="")
+                auth = f"{user}:{password}@" if user or password else ""
+                url = f"socks5h://{auth}{host}:{port}"
+            else:
+                url = next((exit_url(country) for country, exit_cfg in exits.items()
+                            if isinstance(exit_cfg, dict)
+                            and exit_cfg.get("profile_id") == profile_id
+                            and exit_url(country)), "")
+                if not url:
+                    errors.append("selected update proxy has no ready country exit")
+                    continue
+            routes.append({"proxy_url": url, "route": "library", "route_name": name})
+        else:
+            errors.append("invalid update proxy mode")
+    if not routes:
+        raise ValueError(errors[-1] if errors else "no usable update download route")
+    return routes
+
+
 def launch_container_update() -> dict:
     """Consume the WebUI update request in a detached sibling of the current Control image."""
     root = Path(cfg.DATA_DIR)
@@ -454,10 +539,19 @@ def launch_container_update() -> dict:
         request_path.unlink(missing_ok=True)
         return {"ok": False, **result}
     network_path = root / "update" / "network.json"
-    network = dict(request.get("network") or {})
-    network["routes"] = request.get("networks") or [network]
-    network["asset_sizes"] = request.get("asset_sizes") or {}
-    _write_private_json(network_path, network)
+    selections = request.get("networks")
+    if not isinstance(selections, list) or not selections:
+        selections = [request.get("network") or {}]
+    try:
+        routes = _container_download_routes(selections)
+    except ValueError as exc:
+        result = {"state": "failed", "phase": "launch", "error": str(exc)[:400],
+                  "target": version, "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        request_path.unlink(missing_ok=True)
+        return {"ok": False, **result}
+    _write_private_json(network_path, {"routes": routes,
+                                       "asset_sizes": request.get("asset_sizes") or {}})
 
     client = None
     try:

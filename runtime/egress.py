@@ -26,6 +26,8 @@ class SocksEgress(Orchestrator):
         # Separate contract: existing Control must never mistake SOCKS readiness
         # for installed ePDG routes and accidentally start a direct Engine.
         self.status_path = self.root / "socks-egress-status.json"
+        self._listen_address = ""
+
 
     def build_proxy_config(self, proxy):
         config, states = super().build_proxy_config(proxy)
@@ -47,10 +49,18 @@ class SocksEgress(Orchestrator):
                 state["proxy_host"] = os.environ.get("MDD_EGRESS_HOST", "mdd-egress")
         return config, states
 
-    @staticmethod
-    def listen_address():
+    def listen_address(self):
+        """The internal Engine-network address this service binds SOCKS to.
+
+        Resolved once and kept: a container's own addresses are fixed for its lifetime,
+        while this used to run once per enabled country on every pass — each one a DNS
+        round trip to the Docker resolver.
+        """
+        if self._listen_address:
+            return self._listen_address
         configured = os.environ.get("MDD_EGRESS_LISTEN", "").strip()
         if configured:
+            self._listen_address = configured
             return configured
         # The service has an uplink and an internal Engine interface. Resolve the Compose
         # alias which exists only on the internal network so SOCKS is not exposed on uplink.
@@ -60,7 +70,8 @@ class SocksEgress(Orchestrator):
         if len(addresses) != 1:
             raise ListenAddressError(
                 f"Engine network alias resolved to {len(addresses)} IPv4 addresses")
-        return addresses.pop()
+        self._listen_address = addresses.pop()
+        return self._listen_address
 
     def apply_routes(self, wanted):
         raise RuntimeError("SOCKS egress must never install network routes")

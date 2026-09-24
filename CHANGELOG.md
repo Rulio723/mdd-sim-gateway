@@ -2,6 +2,105 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.12.0-rc5] - 2026-09-25
+
+Fifth release candidate. The rc3 -> rc4 rollback drill passed on a DS1621+: every container
+switched to rc4, the drill failed the update on purpose, and the whole stack returned to rc3
+with all lines registered. This release fixes what that round and a fresh install from the
+guide turned up. The automatic update channel stays on 1.9.5.
+
+### Fixed
+
+- A fresh container install into a folder created in File Station failed: the folder belongs
+  to the operator's DSM account with mode 0700, and Control and Egress, which drop every
+  capability, could not enter it. Control and Egress now keep the minimum needed. Existing
+  installs keep their previous capabilities; their folders already work.
+- The web console reported a failed update as successful. After the new Control came up it
+  showed the new version, although the update could still roll back. A banner now shows the
+  current step, or that a rollback is running, and the outcome is reported when it lands.
+- A draft line said it only needed an IMEI while it was really waiting for the SMSC. The
+  device page now lists exactly the fields that block the line, with buttons for the Hardware
+  tab, the SIM tab, or reading the SIM again.
+- A SIM whose first read missed a field (an Alcor AK9563 returned no SMSC at insertion) stayed
+  a draft until the operator pressed Save. The card is re-read on a widening schedule, and
+  "Read SIM card" on the SIM tab now completes the draft by itself.
+- The draft line's IMEI hint was not translated into Chinese.
+
+## [1.12.0-rc4] - 2026-09-24
+
+Fourth release candidate. Updating rc3 -> rc4 from the web console is the first container
+update performed entirely by released code, and the first chance to run the whole-stack
+rollback drill on hardware. The automatic update channel stays on 1.9.5.
+
+### Changed
+
+- The README presents both deployment methods up front — host install and full-container
+  deployment on a NAS — with a comparison and step-by-step instructions for the container
+  path. The capability table no longer implies that every deployment uses a per-country TUN.
+- The container deployment guide covers moving rc1/rc2 by editing image tags, the rollback
+  drill, removing Engine containers before uninstalling, and two DSM startup messages.
+
+### Fixed
+
+- On a host install, the orchestrator skipped the first cellular dial during the first 45
+  seconds of uptime, because "never attempted" was stored as monotonic time zero.
+
+## [1.12.0-rc3] - 2026-09-24
+
+Third release candidate. rc1 and rc2 cannot update themselves: the container update
+helper is launched from the running Control image, and theirs is broken. Move them to
+rc3 by changing the four image tags in the Compose file. The automatic update channel
+stays on 1.9.5.
+
+### Fixed
+
+- The container update failed at its first step with a `run.py` traceback. The disk-space
+  probe did not override the Control image's entrypoint and started a second control
+  plane. On Synology its output was then lost as well, because docker-py returns a
+  container's output only for the json-file and journald log drivers.
+- The update helper ran Compose with the Control image's environment, whose
+  `MDD_HTTP_PORT=8443` is Control's in-container port. The new Control tried to publish
+  host port 8443, so on a host where that port is taken the update and its rollback both
+  failed; elsewhere the web console would have moved. Compose now sees only what the
+  Docker CLI needs.
+- Container updates ignored the selected download route and went direct while reporting
+  "direct". Control now resolves country exits and proxy-library entries to the Egress
+  SOCKS listener, and refuses a route that is not ready instead of falling back.
+- A failure before any change no longer reports `rollback_succeeded: false`.
+
+### Added
+
+- A one-shot rollback drill: `update/fail-after-switch` in the data directory makes the
+  next update fail after every container runs the new release, so the whole-stack
+  rollback can be validated on hardware. The marker is removed when it fires.
+
+## [1.12.0-rc2] - 2026-09-24
+
+Second release candidate. Its purpose is the first real one-click update of a container
+deployment (rc1 -> rc2) on hardware. The automatic update channel stays on 1.9.5.
+
+### Fixed
+
+- A container deployment could not start after Hardware was recreated. A new Hardware
+  container inherits the modem's stale QMI session and recovers it by resetting the modem,
+  which took longer than the image's 30-second health-check grace period; Compose then gave
+  up on Control, leaving it in `Created`. The grace period is now 180 seconds, and the update
+  helper starts Hardware and Egress, waits for them itself, and only then starts Control, so
+  an update and its rollback no longer depend on the image's health-check timing.
+- Hardware suppressed its stale-QMI recovery for the first five minutes of host uptime,
+  because "never reset" was stored as monotonic time zero.
+- Control now fetches the Engine image on first use when the deployment names a registry
+  image. Compose only pulls the three base services, so a fresh container install previously
+  came up with healthy base containers and every line failing on `ImageNotFound`. A locally
+  built tag is never looked up in a registry.
+
+### Changed
+
+- Hardware reads each modem once per reconcile pass instead of up to four times, and only
+  re-reads after a command actually changed the modem: 8 subprocesses per pass become 3 for a
+  single modem. `host-diagnostics.json` is written every 15 seconds instead of every pass.
+- Egress resolves its internal listener address once instead of once per country per pass.
+
 ## [1.12.0-rc1] - 2026-09-24
 
 Release candidate, published to exercise the container deployment's update and rollback

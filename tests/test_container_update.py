@@ -49,6 +49,110 @@ services:
                 mdd_container_update.find_compose(root)
 
 
+class ContainerDownloadRouteTests(unittest.TestCase):
+    """The container helper gets URLs, never bare selections it would treat as direct."""
+
+    settings = {"proxy": {"exits": {"us": {"enabled": True, "profile_id": "sub"}},
+                          "profiles": {"sub": {"type": "subscription", "name": "Sub"},
+                                       "hk": {"type": "socks5", "name": "HK",
+                                              "server": "hk.example", "port": 1080}}}}
+    ready = {"exits": {"us": {"ready": True, "transport": "socks5",
+                              "proxy_host": "mdd-egress", "proxy_port": 22538}}}
+
+    def resolve(self, selections, state=None, current=True):
+        from control.app import egress, egress_contract
+        with patch.object(operations.cfg, "get_settings", return_value=self.settings), \
+                patch.object(egress, "status", return_value=state or self.ready), \
+                patch.object(egress_contract, "current_status", return_value=current):
+            return operations._container_download_routes(selections)
+
+    def test_a_country_exit_becomes_its_internal_socks_listener(self):
+        self.assertEqual(self.resolve([{"proxy_mode": "country", "proxy_country": "us"}]), [
+            {"proxy_url": "socks5h://mdd-egress:22538", "route": "country",
+             "route_name": "US"}])
+
+    def test_a_subscription_profile_goes_through_the_exit_that_uses_it(self):
+        routes = self.resolve([{"proxy_mode": "library", "proxy_profile_id": "sub"}])
+        self.assertEqual(routes[0]["proxy_url"], "socks5h://mdd-egress:22538")
+        self.assertEqual(routes[0]["route"], "library")
+
+    def test_a_socks_profile_is_dialled_directly(self):
+        routes = self.resolve([{"proxy_mode": "library", "proxy_profile_id": "hk"}])
+        self.assertEqual(routes[0]["proxy_url"], "socks5h://hk.example:1080")
+
+    def test_an_exit_that_is_not_ready_is_refused_rather_than_made_direct(self):
+        with self.assertRaisesRegex(ValueError, "US is not ready"):
+            self.resolve([{"proxy_mode": "country", "proxy_country": "us"}],
+                         state={"exits": {"us": {"ready": False}}})
+
+    def test_stale_egress_status_counts_as_not_ready(self):
+        with self.assertRaisesRegex(ValueError, "not ready"):
+            self.resolve([{"proxy_mode": "country", "proxy_country": "us"}], current=False)
+
+    def test_auto_keeps_only_the_candidates_that_resolve(self):
+        routes = self.resolve([{"proxy_mode": "direct"},
+                               {"proxy_mode": "library", "proxy_profile_id": "sub"}],
+                              state={"exits": {}})
+        self.assertEqual([route["route"] for route in routes], ["direct"])
+
+
+class ContainerComposeOrderTests(unittest.TestCase):
+    def test_control_starts_only_after_our_own_wait_for_hardware(self):
+        """Compose's service_healthy gate gave up on the first unhealthy report, which a
+        Hardware start recovering a stale QMI session always produces."""
+        events = []
+        with patch.object(mdd_container_update, "run",
+                          side_effect=lambda command, **_: events.append(command[-2:])):
+            mdd_container_update.compose_up(Path("/data/docker-compose.yml"),
+                                            lambda component: events.append(component))
+        self.assertEqual(events, [["hardware", "egress"], "hardware", "egress",
+                                  ["--no-deps", "control"]])
+
+    def test_every_compose_start_skips_compose_dependency_gating(self):
+        commands = []
+        with patch.object(mdd_container_update, "run",
+                          side_effect=lambda command, **_: commands.append(command)):
+            mdd_container_update.compose_up(Path("/data/docker-compose.yml"), lambda _c: None)
+        self.assertTrue(all("--no-deps" in command for command in commands))
+
+
+class ComposeEnvironmentTests(unittest.TestCase):
+    def test_the_control_image_environment_never_reaches_compose_interpolation(self):
+        """The Control image sets MDD_HTTP_PORT=8443 for its own listener; the Compose file
+        uses the same name for the host port. Inherited, it moved the published port."""
+        envs = []
+        leaked = {"PATH": "/usr/bin", "MDD_HTTP_PORT": "8443", "MDD_RTP_BASE": "10000",
+                  "MDD_DATA": "/data"}
+        with patch.dict(os.environ, leaked, clear=True), \
+                patch.object(mdd_container_update, "run",
+                             side_effect=lambda command, **kwargs: envs.append(kwargs["env"])):
+            mdd_container_update.compose_up(Path("/data/docker-compose.yml"), lambda _c: None)
+        self.assertEqual(envs, [{"PATH": "/usr/bin"}, {"PATH": "/usr/bin"}])
+
+
+class DockerRootSpaceTests(unittest.TestCase):
+    def test_the_probe_overrides_the_control_entrypoint(self):
+        """rc1 and rc2 passed the probe as a command only. The Control image's ENTRYPOINT
+        is `python run.py`, so the probe started the whole control plane in a container
+        without /data and every container update failed at its first step."""
+        client = Mock()
+        client.info.return_value = {"DockerRootDir": "/volume1/@docker"}
+        client.containers.get.return_value.image.id = "sha256:control"
+        client.containers.run.return_value = b"12345\n"
+
+        self.assertEqual(mdd_container_update.docker_root_free_bytes(client), 12345)
+
+        kwargs = client.containers.run.call_args.kwargs
+        self.assertEqual(kwargs["entrypoint"], ["python", "-c"])
+        # DSM defaults to its `db` log driver, from which docker-py returns no output.
+        self.assertEqual(kwargs["log_config"]["type"], "json-file")
+        command = client.containers.run.call_args.args[1]
+        self.assertEqual(len(command), 1)
+        self.assertIn("statvfs('/docker-root')", command[0])
+        self.assertEqual(kwargs["volumes"], {"/volume1/@docker": {
+            "bind": "/docker-root", "mode": "ro"}})
+
+
 class ContainerUpdateLaunchTests(unittest.TestCase):
     def test_control_launches_a_detached_owned_helper_on_both_project_networks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,6 +211,16 @@ class ContainerUpdateLaunchTests(unittest.TestCase):
 
 class ContainerUpdateRollbackTests(unittest.TestCase):
     def test_failed_base_recreation_restores_the_original_compose(self):
+        attempts = []
+
+        def compose_up_stub(_compose, wait):
+            # The first start (new release) fails; the rollback start waits like the real one.
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise mdd_container_update.mdd_update.UpdateError("new Control unhealthy")
+            wait("hardware")
+            wait("egress")
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "update").mkdir()
@@ -149,8 +263,7 @@ class ContainerUpdateRollbackTests(unittest.TestCase):
                     patch("control.app.operations.create_local_backup",
                           return_value={"name": "backup.tar.gz"}), \
                     patch.object(mdd_container_update, "compose_up",
-                                 side_effect=[mdd_container_update.mdd_update.UpdateError(
-                                     "new Control unhealthy"), None]) as compose_up, \
+                                 side_effect=compose_up_stub) as compose_up, \
                     patch.object(mdd_container_update, "wait_container") as wait:
                 with self.assertRaises(mdd_container_update.mdd_update.UpdateError):
                     mdd_container_update.perform(
@@ -159,6 +272,71 @@ class ContainerUpdateRollbackTests(unittest.TestCase):
             self.assertEqual((root / "docker-compose.yml").read_text(), original)
             self.assertEqual(compose_up.call_count, 2)
             self.assertEqual(wait.call_count, len(mdd_container_update.BASE_COMPONENTS))
+            self.assertEqual([call.args[1] for call in wait.call_args_list],
+                             [f"mdd-sim-gateway-{c}" for c in ("hardware", "egress", "control")])
+            failed = json.loads((root / "orchestrator/update-status.json").read_text())
+            self.assertEqual(failed["state"], "failed")
+            self.assertTrue(failed["rollback_succeeded"])
+
+    def test_the_rollback_drill_fails_once_after_the_switch_and_restores_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "update").mkdir()
+            (root / "update/fail-after-switch").touch()
+            original = """services:
+  control:
+    image: ghcr.io/mddidd/mdd-sim-gateway-control:v1.0.0
+    environment:
+      MDD_ENGINE_IMAGE: ghcr.io/mddidd/mdd-sim-gateway-engine:v1.0.0
+  hardware:
+    image: ghcr.io/mddidd/mdd-sim-gateway-hardware:v1.0.0
+  egress:
+    image: ghcr.io/mddidd/mdd-sim-gateway-egress:v1.0.0
+"""
+            (root / "docker-compose.yml").write_text(original)
+            network = root / "update/network.json"
+            network.write_text(json.dumps({"routes": [{"route": "direct", "proxy_url": ""}]}))
+            base = {name: SimpleNamespace(image=SimpleNamespace(id=f"sha256:old-{name}"))
+                    for name in mdd_container_update.BASE_COMPONENTS}
+            client = Mock()
+            client.containers.get.side_effect = lambda name: base[name.removeprefix(
+                "mdd-sim-gateway-")]
+            client.containers.list.return_value = []
+            status = mdd_container_update.mdd_update.Status(
+                root / "orchestrator/update-status.json", "2.0.0")
+            composes = []
+
+            def fetch(_url, destination, *_args, **_kwargs):
+                destination.write_bytes(b"verified")
+                return 0
+
+            with patch.object(mdd_container_update.docker, "from_env", return_value=client), \
+                    patch.object(mdd_container_update.mdd_update, "fetch_release_asset",
+                                 side_effect=fetch), \
+                    patch.object(mdd_container_update.mdd_update, "verify_release_file"), \
+                    patch.object(mdd_container_update, "docker_root_free_bytes",
+                                 return_value=10 * 1024 ** 3), \
+                    patch.object(mdd_container_update, "run"), \
+                    patch.object(mdd_container_update, "verify_and_tag_image",
+                                 side_effect=lambda _c, component, *_a: f"sha256:new-{component}"), \
+                    patch("control.app.operations.create_local_backup",
+                          return_value={"name": "backup.tar.gz"}), \
+                    patch.object(mdd_container_update, "compose_up",
+                                 side_effect=lambda compose, _wait: composes.append(
+                                     compose.read_text())), \
+                    patch.object(mdd_container_update, "roll_engines") as rolled, \
+                    patch.object(mdd_container_update, "wait_container"):
+                with self.assertRaisesRegex(mdd_container_update.mdd_update.UpdateError,
+                                            "rollback drill"):
+                    mdd_container_update.perform(
+                        root, "2.0.0", "MddIdd/mdd-sim-gateway", network, status)
+
+            rolled.assert_called_once()
+            self.assertIn("control:v2.0.0", composes[0])     # the new release really ran
+            self.assertEqual(composes[1], original)           # then the old one came back
+            self.assertEqual((root / "docker-compose.yml").read_text(), original)
+            self.assertFalse((root / "update/fail-after-switch").exists())
+            self.assertFalse((root / "update/installed-images.json").exists())
             failed = json.loads((root / "orchestrator/update-status.json").read_text())
             self.assertEqual(failed["state"], "failed")
             self.assertTrue(failed["rollback_succeeded"])

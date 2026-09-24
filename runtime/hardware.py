@@ -30,6 +30,10 @@ DEFAULT_MODEM_PROFILES = (("2c7c", "0125", 2),)
 BASE_VPCD_PORT = 0x3C00
 VPCD_PORT_STRIDE = 0x100
 VPCD_SLOTS = 3
+# Support bundles are the only consumer of host-diagnostics.json and none of them check
+# its age, while producing it means a seek-read of every bridge log plus a write of a few
+# tens of kilobytes. There is no reason to pay that on every reconcile pass.
+DIAGNOSTICS_INTERVAL = 15
 
 
 def tail_lines(path, count=25, max_bytes=128 * 1024):
@@ -99,6 +103,10 @@ class HardwareSupervisor:
             self.data_path / "orchestrator" / "bridge-restart-status")
         self.bridge_restarts = {}
         self.log_ring = collections.deque(maxlen=200)
+        # Cleared at the start of every reconcile pass; see mmcli_keyvalue().
+        self._mmcli_details = {}
+        # `None` means "never published", which is not the same as "published at time zero".
+        self._diagnostics_at = None
         for path in self.bridge_restart_status_dir.glob("*.json"):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
@@ -113,6 +121,24 @@ class HardwareSupervisor:
         return subprocess.run(args, text=True, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, check=check,
                               env={**os.environ, "LC_ALL": "C"})
+
+    def mmcli_keyvalue(self, flag, target):
+        """Cached `mmcli <flag> <target> --output-keyvalue` for one reconcile pass.
+
+        A pass asks about the same modem repeatedly — once to match a tty to its object,
+        then again for every snapshot — and each call is a fork, a D-Bus round trip and a
+        parse. The cache is dropped at the start of each pass and whenever a command
+        changes the modem, so it never serves a view from before a state change.
+        """
+        key = (flag, target)
+        cached = self._mmcli_details.get(key)
+        if cached is None:
+            cached = self.command("mmcli", flag, target, "--output-keyvalue")
+            self._mmcli_details[key] = cached
+        return cached
+
+    def forget_mmcli_details(self):
+        self._mmcli_details.clear()
 
     def log(self, message):
         line = f"{time.strftime('%F %T')} {message}"
@@ -222,7 +248,7 @@ class HardwareSupervisor:
     def modem_object_for_tty(self, tty, objects):
         basename = Path(tty).name
         for obj in objects:
-            detail = self.command("mmcli", "-m", obj, "--output-keyvalue")
+            detail = self.mmcli_keyvalue("-m", obj)
             if detail.returncode == 0 and re.search(
                     rf"(?<![A-Za-z0-9_.-]){re.escape(basename)}(?![A-Za-z0-9_.-])",
                     detail.stdout):
@@ -541,7 +567,7 @@ class HardwareSupervisor:
                  "profile": self.cellular_profile_name(modem["id"])}
         if not obj:
             return empty
-        detail = self.command("mmcli", "-m", obj, "--output-keyvalue")
+        detail = self.mmcli_keyvalue("-m", obj)
         if detail.returncode:
             return empty
         text = detail.stdout or ""
@@ -570,7 +596,7 @@ class HardwareSupervisor:
         bearer_paths = re.findall(
             r"modem\.generic\.bearers\.value\[\d+\]\s*:\s*(\S+)", text)
         for bearer in bearer_paths:
-            info = self.command("mmcli", "-b", bearer, "--output-keyvalue")
+            info = self.mmcli_keyvalue("-b", bearer)
             if info.returncode:
                 continue
             body = info.stdout or ""
@@ -606,21 +632,22 @@ class HardwareSupervisor:
                 "ipv4.never-default", "yes", "ipv6.never-default", "yes"]
 
     def ensure_modem_data(self, modem, snapshot):
+        """Bring up this modem's bearer. Returns whether the modem state was touched."""
         if not snapshot.get("powered") or snapshot.get("data_active"):
-            return
+            return False
         if snapshot.get("registration") not in {"home", "roaming", "registered"}:
-            return
+            return False
         device_id = modem["id"]
         # `None` means "never attempted". Defaulting the timestamp to 0 instead would compare
         # against a monotonic clock that starts near zero on a freshly booted host, so the
         # first attempts would be suppressed for the first 45 seconds of uptime.
         last_attempt = self.data_attempt_at.get(device_id)
         if last_attempt is not None and time.monotonic() - last_attempt < 45:
-            return
+            return False
         self.data_attempt_at[device_id] = time.monotonic()
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
         if not primary or any(device == primary for _name, device in self.active_gsm_profiles()):
-            return
+            return False
         profile = self.cellular_profile_name(device_id)
         apn = str(snapshot.get("apn") or "").strip()
         exists = self.command("nmcli", "connection", "show", profile).returncode == 0
@@ -639,21 +666,30 @@ class HardwareSupervisor:
         if result.returncode:
             self.log(f"could not configure cellular profile for {device_id}: "
                      f"{result.stdout.strip()[-300:]}")
-            return
+            return False
         result = self.command("nmcli", "connection", "up", profile)
         if result.returncode:
             self.log(f"could not activate cellular profile for {device_id}: "
                      f"{result.stdout.strip()[-300:]}")
+        return True
 
     def disconnect_modem_data(self, snapshot):
+        """Tear down this modem's bearer. Returns whether the modem state was touched.
+
+        `connection modify` only rewrites the saved policy, so only an actual `down`
+        counts as a change worth re-reading the modem for.
+        """
         profile = str(snapshot.get("profile") or "")
         if profile and self.command("nmcli", "connection", "show", profile).returncode == 0:
             self.command("nmcli", "connection", "modify", profile,
                          *self.modem_profile_policy())
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
+        disconnected = False
         for name, device in self.active_gsm_profiles():
             if name == profile or (primary and device == primary):
                 self.command("nmcli", "connection", "down", name)
+                disconnected = True
+        return disconnected
 
     @staticmethod
     def terminate_qmi_proxy():
@@ -697,21 +733,28 @@ class HardwareSupervisor:
                 self.qmi_reset_at[device_id] = time.monotonic()
                 self.terminate_qmi_proxy()
                 self.command("mmcli", "-m", obj, "--reset")
+                self.forget_mmcli_details()
                 self.cellular_states[device_id] = snapshot
                 continue
             radio_enabled = not wanted["flight_mode"]
             if obj and snapshot.get("radio_enabled") != radio_enabled:
                 result = self.command(
                     "mmcli", "-m", obj, "--enable" if radio_enabled else "--disable")
+                self.forget_mmcli_details()
                 if result.returncode and "already" not in result.stdout.lower():
                     self.cellular_states[device_id] = snapshot
                     continue
                 snapshot = self.modem_snapshot(modem, objects)
             if wanted["cellular_enabled"] and radio_enabled:
-                self.ensure_modem_data(modem, snapshot)
+                changed = self.ensure_modem_data(modem, snapshot)
             else:
-                self.disconnect_modem_data(snapshot)
-            self.cellular_states[device_id] = self.modem_snapshot(modem, objects)
+                changed = self.disconnect_modem_data(snapshot)
+            # Re-reading costs three subprocesses. In the steady state nothing above
+            # touched the modem, so the snapshot already in hand is the current one.
+            if changed:
+                self.forget_mmcli_details()
+                snapshot = self.modem_snapshot(modem, objects)
+            self.cellular_states[device_id] = snapshot
         self.cellular_states = {key: value for key, value in self.cellular_states.items()
                                 if key in live}
 
@@ -872,6 +915,7 @@ class HardwareSupervisor:
         })
 
     def reconcile(self):
+        self.forget_mmcli_details()
         current = kernel_objects()
         for subsystem, name in sorted(self.reported - current):
             self.report_event("remove", subsystem, name)
@@ -920,7 +964,10 @@ class HardwareSupervisor:
             "kernel_objects": [f"{subsystem}/{name}" for subsystem, name in sorted(current)],
         })
         self.publish_control_state(discovered, ready_ids)
-        self.publish_host_diagnostics(discovered, modems)
+        if (self._diagnostics_at is None
+                or time.monotonic() - self._diagnostics_at >= DIAGNOSTICS_INTERVAL):
+            self._diagnostics_at = time.monotonic()
+            self.publish_host_diagnostics(discovered, modems)
 
     def publish_reconcile_error(self, exc):
         """Keep the hardware plane alive while making one failed pass explicit and fail-closed."""

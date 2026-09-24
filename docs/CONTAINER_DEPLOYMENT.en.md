@@ -106,11 +106,15 @@ Container Manager package only during a maintenance window. **DSM 7.4 has been o
 then restart every container project during this package restart**; it is not a zero-downtime UI
 refresh. Projects created in the DSM UI are registered automatically and do not need this procedure.
 
-Do not copy the common `chown -R user:users` step used by ordinary Compose projects. The MDD data
-directory contains messages, certificates, SIM configuration and notification credentials and must
-remain root-owned with mode `0700`. Control and Egress intentionally cannot bypass directory
-permissions, so changing its owner prevents them from starting. Edit the YAML through Container
-Manager or a root SSH session.
+Create the data directory in File Station as usual; its owner and mode need no changes. Every file
+inside is created by the containers as root with mode `0600`/`0700`, so messages, certificates, SIM
+configuration and notification credentials are not readable by DSM accounts. Do not copy the common
+`chown -R user:users` step used by ordinary Compose projects: it would hand those files to that
+account and expose them through File Station or SMB. Edit the YAML through Container Manager.
+
+Compose files from v1.12.0-rc4 and earlier lack this permission. In a folder created in File Station,
+Control and Egress then exit with `Operation not permitted` or `Permission denied`. Run
+`sudo chown root:root <data-dir>` once and start the project again, or use a newer Compose file.
 
 ## 5. Security boundaries in the Compose file
 
@@ -186,6 +190,22 @@ The helper starts from the old Control image and survives replacement of Control
 only the project data directory and Docker socket; it receives no host PID/network namespace or
 privileged mode. Keep the NAS powered on during the update and sign in again when the UI returns.
 
+The update is performed by the helper of the **currently running** release, so fixes to the helper
+itself take effect from the next update. The helpers in v1.12.0-rc1 and rc2 are broken and cannot
+update from the web console: in Container Manager, change the four image tags in the project YAML to
+the target release and start the project again, leaving everything else unchanged. From rc3 onward
+the one-click update works.
+
+A successful report means the base containers are healthy and the Engines were recreated on the new
+image. If the health policy had stopped a line during the update, Control recovers it on the new image
+shortly afterwards, so that line may re-register a minute or two later.
+
+**Rollback drill** (for release validation): run `sudo touch <data-dir>/update/fail-after-switch`, then
+start an update. The helper fails deliberately after every container runs the new release and the
+Engines have been recreated, and restores the whole stack to the previous release. The marker is
+removed when it fires, so the next update is a normal one. The drill interrupts the lines twice; do not
+run it during business hours.
+
 If the WebUI is unavailable, use the same boundaries for a manual recovery:
 
 1. download and verify the target Release Compose asset and images;
@@ -199,12 +219,29 @@ Do not let Watchtower update one component independently. Stopping or deleting t
 not delete its bind-mounted data unless the administrator removes that directory. Manually
 installed kernel drivers are independent of Compose and must be removed separately.
 
+Engine containers are created per line by Control and are not part of the Compose project, so deleting
+the project leaves them behind, still attached to `mdd-sim-gateway-engine`; removing that network then
+fails with "Resource is still in use". When uninstalling over SSH, remove the Engines first:
+
+```sh
+sudo docker ps -aq --filter "label=io.mdd-sim-gateway.component=engine" | xargs -r sudo docker rm -f
+```
+
 ## 9. Common problems
 
 **Hardware is unhealthy:** confirm the host enumerated the USB device, then use the section 2
 commands to check whether the required device nodes exist — missing nodes mean the host lacks the
 kernel driver. `docker logs mdd-sim-gateway-hardware` reports why the supervisor failed.
 Re-evaluate drivers against the complete build and kernel after every DSM update.
+
+**Rebuilding the project reports "dependency failed to start: container mdd-sim-gateway-hardware is
+unhealthy":** a new Hardware container inherits the modem's stale QMI session and must reset the modem
+and wait for it to re-enumerate, which takes a minute or two. From v1.12.0-rc2 the health-check grace
+period is 180 seconds; older images allow less, leaving Control in `Created`. Wait for Hardware to
+become healthy, then click Start on the project — not Build, which recreates Hardware again.
+
+**Startup logs say "PIDs limit discarded":** the DSM 7.4 kernel (4.4) has no pids cgroup, so Docker
+ignores `pids_limit` from the Compose file and warns. It is harmless; memory limits still apply.
 
 **A reader is missing:** stop any host pcscd or other container that has claimed it. The Hardware
 image already contains pcsc-lite, libccid and the project's verified reader patches.

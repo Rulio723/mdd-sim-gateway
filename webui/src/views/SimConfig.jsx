@@ -246,7 +246,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   }
 
   const missing = targetDevice?.provisioning?.missing || []
-  const missingLabels = { imsi: 'IMSI / PIN', imei: 'IMEI', smsc: t('SMS centre (SMSC)') }
+  const missingLabels = { imsi: 'IMSI / PIN', imei: 'IMEI', smsc: t('SMS centre (SMSC)'), mcc_mnc: 'MCC/MNC', pin: t('setup.field.pin') }
   const imeiReady = String(targetDevice?.imei || '').replace(/[^0-9]/g, '').length === 15
   const existingLine = instances.some(line => String(line.id) === String(form.id))
 

@@ -80,9 +80,19 @@ class ContainerComposeTests(unittest.TestCase):
                       dockerfile)
         self.assertIn("HEALTHCHECK --interval=10s", dockerfile)
 
+    def test_an_operator_owned_data_directory_can_be_used(self):
+        """A folder created in File Station belongs to the operator's account with mode
+        0700. Control and Egress drop every capability, so root inside them could neither
+        enter it nor chmod it, and a fresh install failed. Only these are added back."""
+        services = self.compose["services"]
+        self.assertEqual(services["control"]["cap_drop"], ["ALL"])
+        self.assertEqual(set(services["control"]["cap_add"]), {"DAC_OVERRIDE", "FOWNER"})
+        self.assertEqual(services["egress"]["cap_add"], ["DAC_OVERRIDE"])
+
     def test_engine_network_is_the_only_egress_control_path(self):
         egress = self.compose["services"]["egress"]
         self.assertEqual(egress["cap_drop"], ["ALL"])
+        self.assertEqual(egress["cap_add"], ["DAC_OVERRIDE"])
         self.assertNotIn("ports", egress)
         control_env = self.compose["services"]["control"]["environment"]
         self.assertEqual(control_env["MDD_EGRESS_TRANSPORT"], "socks5")

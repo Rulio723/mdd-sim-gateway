@@ -1602,7 +1602,10 @@ class Orchestrator:
         if registration not in {"home", "roaming", "registered"}:
             return
         device_id = modem["id"]
-        if time.monotonic() - self.data_attempt_at.get(device_id, 0) < 45:
+        # `None` means "never attempted"; a 0 default would compare against a monotonic clock
+        # that starts near zero at boot and hold back the first dial for 45 seconds of uptime.
+        last_attempt = self.data_attempt_at.get(device_id)
+        if last_attempt is not None and time.monotonic() - last_attempt < 45:
             return
         self.data_attempt_at[device_id] = time.monotonic()
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")

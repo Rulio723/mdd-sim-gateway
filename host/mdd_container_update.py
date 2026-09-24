@@ -30,6 +30,8 @@ except ModuleNotFoundError:  # Imported as host.mdd_container_update by tests.
 
 COMPONENTS = ("control", "hardware", "egress", "engine")
 BASE_COMPONENTS = ("hardware", "egress", "control")
+# Hardware may have to reset the modem to recover a stale QMI session before it is healthy.
+WAIT_SECONDS = {"hardware": 300}
 MANAGED = "io.mdd-sim-gateway.managed"
 COMPONENT = "io.mdd-sim-gateway.component"
 VERSION = "org.opencontainers.image.version"
@@ -103,10 +105,11 @@ def rewrite_compose(source: str, images: dict[str, str]) -> str:
     return "".join(output)
 
 
-def run(command: list[str], *, cwd: Path | None = None, timeout: int = 600) -> str:
+def run(command: list[str], *, cwd: Path | None = None, timeout: int = 600,
+        env: dict | None = None) -> str:
     completed = subprocess.run(command, cwd=str(cwd) if cwd else None, text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               timeout=timeout)
+                               timeout=timeout, env=env)
     if completed.returncode:
         raise mdd_update.UpdateError(
             f"{' '.join(command[:3])} failed: {completed.stdout[-2000:].strip()}")
@@ -161,10 +164,40 @@ def wait_container(client, name: str, image_id: str, timeout: int = 180) -> None
     raise mdd_update.UpdateError(f"{name} did not become healthy ({last})")
 
 
-def compose_up(compose: Path) -> None:
-    run(["docker", "compose", "-p", "mdd-sim-gateway", "-f", str(compose),
-         "up", "-d", "--no-build", "--force-recreate", *BASE_COMPONENTS],
-        cwd=compose.parent, timeout=600)
+# Only what the Docker CLI itself needs. Compose interpolates ${VAR:-default} from its own
+# environment, and this helper runs in the Control image, whose ENV includes
+# MDD_HTTP_PORT=8443 — the port Control listens on *inside* its container. The Compose
+# file uses the same name for the *host* port, so an inherited environment published the
+# web console on host port 8443: on a NAS where that port belongs to another service the
+# update and its rollback both failed, and elsewhere the console would silently have moved.
+COMPOSE_ENVIRONMENT = ("PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONFIG",
+                       "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY")
+
+
+def compose_environment() -> dict:
+    """The environment an operator's own `docker compose up` would interpolate with."""
+    return {name: os.environ[name] for name in COMPOSE_ENVIRONMENT if name in os.environ}
+
+
+def compose_up(compose: Path, wait) -> None:
+    """Recreate the base services in dependency order, waiting on this helper's clock.
+
+    Control declares `depends_on: {condition: service_healthy}` on Hardware, and Compose
+    gives up the moment Hardware first reports unhealthy. A freshly recreated Hardware
+    usually inherits a stale QMI session from the container it replaced, and recovering
+    it (a modem reset plus re-enumeration) outlasts the image's health-check grace
+    period. Leaving the ordering to Compose therefore failed the update, and then the
+    rollback, on the very restart it was performing. `--no-deps` hands the ordering to
+    wait(), whose deadline is long enough for that recovery, including when rolling back
+    to an image whose own grace period is still the short one.
+    """
+    command = ["docker", "compose", "-p", "mdd-sim-gateway", "-f", str(compose),
+               "up", "-d", "--no-build", "--force-recreate", "--no-deps"]
+    environment = compose_environment()
+    run([*command, "hardware", "egress"], cwd=compose.parent, timeout=600, env=environment)
+    wait("hardware")
+    wait("egress")
+    run([*command, "control"], cwd=compose.parent, timeout=600, env=environment)
 
 
 def docker_root_free_bytes(client) -> int:
@@ -173,10 +206,16 @@ def docker_root_free_bytes(client) -> int:
     if not root.startswith("/"):
         raise mdd_update.UpdateError("Docker did not report an absolute image-store path")
     current = client.containers.get(socket.gethostname())
+    # The Control image's ENTRYPOINT is `python run.py`, so a bare command would be
+    # appended to it and start the whole control plane instead of this one-liner.
     output = client.containers.run(
         current.image.id,
-        ["python", "-c",
-         "import os; s=os.statvfs('/docker-root'); print(s.f_bavail*s.f_frsize)"],
+        ["import os; s=os.statvfs('/docker-root'); print(s.f_bavail*s.f_frsize)"],
+        entrypoint=["python", "-c"],
+        # docker-py returns a finished container's output only for the json-file and
+        # journald drivers and None otherwise. Synology's daemon defaults to its own `db`
+        # driver, so without this the measurement ran and was then lost.
+        log_config={"type": "json-file", "config": {}},
         remove=True, network_disabled=True, read_only=True, cap_drop=["ALL"],
         volumes={root: {"bind": "/docker-root", "mode": "ro"}},
     )
@@ -321,10 +360,22 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
         switched = True
 
         status.publish("running", "reloading", backup=saved.get("name", ""))
-        compose_up(compose)
-        for component in BASE_COMPONENTS:
-            wait_container(client, f"mdd-sim-gateway-{component}", image_ids[component])
+        def wait_new(component):
+            wait_container(client, f"mdd-sim-gateway-{component}", image_ids[component],
+                           timeout=WAIT_SECONDS.get(component, 180))
+
+        compose_up(compose, wait_new)
+        wait_new("control")
         roll_engines(client, image_ids["engine"], status)
+        # Release validation: `touch <data>/update/fail-after-switch` makes the next update
+        # fail once every container already runs the new release, so the whole-stack
+        # rollback can be exercised on real hardware. It must live in the helper that
+        # performs the update, i.e. in the release being updated *from*. One-shot: the
+        # marker is consumed when it fires, so a forgotten file cannot block later updates.
+        drill = project / "update" / "fail-after-switch"
+        if drill.exists():
+            drill.unlink(missing_ok=True)
+            raise mdd_update.UpdateError("rollback drill requested by update/fail-after-switch")
         mdd_update.atomic_json(project / "update" / "installed-images.json", {
             "version": version, "architecture": arch, "installed_at": int(time.time()),
             "images": verified_images})
@@ -337,10 +388,13 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
             try:
                 status.publish("running", "rollback", error=str(exc)[:1000])
                 shutil.copy2(compose_backup, compose)
-                compose_up(compose)
-                for component in BASE_COMPONENTS:
+                def wait_old(component):
                     wait_container(client, f"mdd-sim-gateway-{component}",
-                                   old_base_ids[component])
+                                   old_base_ids[component],
+                                   timeout=WAIT_SECONDS.get(component, 180))
+
+                compose_up(compose, wait_old)
+                wait_old("control")
                 for name, old_image_id in old_engine_ids.items():
                     try:
                         current = client.containers.get(name)
@@ -356,9 +410,12 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
                 rollback_ok = True
             except Exception as rollback_exc:  # preserve both causes in the private status
                 rollback_error = str(rollback_exc)[:1000]
+        # Before the Compose switch nothing was changed, so there is no rollback to report;
+        # "rollback_succeeded: false" there read as if the stack had been left broken.
+        rollback = ({"rollback_succeeded": rollback_ok, "rollback_error": rollback_error}
+                    if switched else {})
         status.publish("failed", "rollback" if switched else status.phase,
-                       error=str(exc)[:2000], rollback_succeeded=rollback_ok,
-                       rollback_error=rollback_error)
+                       error=str(exc)[:2000], **rollback)
         raise
     finally:
         if client is not None:

@@ -34,6 +34,15 @@ def js_map(source: str, name: str) -> dict:
 
 
 class BackendStringCoverageTests(unittest.TestCase):
+    def test_every_device_capability_reason_is_translated(self):
+        """`reason="..."` on a device capability is shown through t() on the device page.
+        The draft line's IMEI hint shipped in English in the Chinese UI for this reason."""
+        source = (ROOT / "control" / "app" / "main.py").read_text(encoding="utf-8")
+        reasons = set(re.findall(r'reason=\(?\s*"([^"{}]+)"', source))
+        self.assertTrue(reasons)
+        block = zh_block()
+        self.assertEqual(sorted(r for r in reasons if not translated(r, block)), [])
+
     def test_every_status_reason_is_translated(self):
         block = zh_block()
         missing = [code for code, text in status_mod.REASONS.items()

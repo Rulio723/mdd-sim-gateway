@@ -9,6 +9,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
+def _docker_errors():
+    """Mirror docker-py's hierarchy: ImageNotFound is a subclass of NotFound there, so a
+    stub that makes them unrelated would hide a handler catching the wrong one."""
+    not_found = type("NotFound", (Exception,), {})
+    return SimpleNamespace(
+        NotFound=not_found,
+        ImageNotFound=type("ImageNotFound", (not_found,), {}),
+    )
+
+
 class EnginePathTests(unittest.TestCase):
     def test_old_engine_cannot_silently_ignore_proxy_before_replacement(self):
         engine = self.engine_module()
@@ -25,6 +35,48 @@ class EnginePathTests(unittest.TestCase):
         write.assert_not_called()
         client.containers.get.assert_not_called()
         client.containers.run.assert_not_called()
+
+    def test_a_missing_registry_engine_image_is_fetched_once(self):
+        """Compose only knows the three base services, so nothing brings the Engine image
+        down before the first line needs it."""
+        engine = self.engine_module()
+        from unittest.mock import Mock
+        fetched = SimpleNamespace(
+            id="sha256:pulled", attrs={"Config": {"Labels": {engine.ENGINE_LABEL: "socks5"}}})
+        client = Mock()
+        client.images.get.side_effect = [
+            engine.docker.errors.ImageNotFound("absent"), fetched]
+
+        with patch.object(engine, "IMAGE", "ghcr.io/owner/mdd-sim-gateway-engine:v1"):
+            self.assertIs(engine.ensure_image(client), fetched)
+
+        client.images.pull.assert_called_once_with("ghcr.io/owner/mdd-sim-gateway-engine:v1")
+
+    def test_a_present_image_is_never_re_fetched(self):
+        engine = self.engine_module()
+        from unittest.mock import Mock
+        client = Mock()
+        client.images.get.return_value = SimpleNamespace(id="sha256:local", attrs={})
+
+        with patch.object(engine, "IMAGE", "ghcr.io/owner/mdd-sim-gateway-engine:v1"):
+            engine.ensure_image(client)
+
+        client.images.pull.assert_not_called()
+
+    def test_a_locally_built_tag_is_not_looked_for_in_a_registry(self):
+        """`mdd-sim-gateway/engine` is what a host-assisted install builds. Pulling it
+        would ask Docker Hub for a repository that does not exist, replacing a clear
+        "the image was never built" with a confusing registry error."""
+        engine = self.engine_module()
+        from unittest.mock import Mock
+        client = Mock()
+        client.images.get.side_effect = engine.docker.errors.ImageNotFound("absent")
+
+        with patch.object(engine, "IMAGE", "mdd-sim-gateway/engine"):
+            with self.assertRaises(engine.docker.errors.ImageNotFound):
+                engine.ensure_image(client)
+
+        client.images.pull.assert_not_called()
 
     def test_supported_engine_is_pinned_to_inspected_image_and_receives_proxy(self):
         engine = self.engine_module()
@@ -183,7 +235,7 @@ class EnginePathTests(unittest.TestCase):
     def engine_module():
         fake_docker = SimpleNamespace(
             from_env=lambda: None,
-            errors=SimpleNamespace(NotFound=type("NotFound", (Exception,), {})),
+            errors=_docker_errors(),
         )
         with patch.dict(sys.modules, {"docker": fake_docker}):
             sys.modules.pop("control.app.engine", None)

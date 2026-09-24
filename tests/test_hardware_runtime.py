@@ -261,6 +261,49 @@ class HardwareRuntimeTests(unittest.TestCase):
         self.assertEqual(app.modem_object_for_tty(
             "/dev/ttyUSB2", list(details)), "/org/freedesktop/ModemManager1/Modem/1")
 
+    def test_one_pass_reads_each_modem_once(self):
+        """A reconcile pass used to run `mmcli -m ... --output-keyvalue` four times for a
+        single modem: once to match the tty, once per snapshot, and once more at the end."""
+        obj = "/org/freedesktop/ModemManager1/Modem/0"
+        detail = ("modem.generic.state : connected\n"
+                  "modem.generic.power-state : on\n"
+                  "modem.3gpp.registration-state : home\n"
+                  "modem.generic.primary-port : cdc-wdm0\n"
+                  "modem.generic.ports.value[1] : ttyUSB2 (at)\n"
+                  "modem.generic.ports.value[2] : wwan0 (net)\n")
+        app = HardwareSupervisor()
+        app.assert_networkmanager_isolated = Mock()
+        app.desired_devices = Mock(return_value={
+            "modem-a": {"cellular_enabled": True, "vowifi_enabled": True,
+                        "flight_mode": False}})
+        calls = []
+
+        def command(*args):
+            calls.append(list(args))
+            if args[0] == "mmcli":
+                return Mock(returncode=0, stdout=detail)
+            return Mock(returncode=0, stdout="")
+
+        app.command = command
+        app.reconcile_cellular([{"id": "modem-a", "tty": "/dev/ttyUSB2"}], [obj])
+
+        reads = [call for call in calls
+                 if call[:2] == ["mmcli", "-m"] and "--output-keyvalue" in call]
+        self.assertEqual(len(reads), 1, reads)
+        self.assertTrue(app.cellular_states["modem-a"]["data_active"])
+
+    def test_a_command_that_changes_the_modem_drops_the_cached_read(self):
+        app = HardwareSupervisor()
+        app.command = Mock(return_value=Mock(returncode=0, stdout="modem.generic.state : on"))
+
+        app.mmcli_keyvalue("-m", "/modem/0")
+        app.mmcli_keyvalue("-m", "/modem/0")
+        self.assertEqual(app.command.call_count, 1)
+
+        app.forget_mmcli_details()
+        app.mmcli_keyvalue("-m", "/modem/0")
+        self.assertEqual(app.command.call_count, 2)
+
     def test_rejected_event_fails_closed(self):
         app = HardwareSupervisor()
         app.command = Mock(return_value=Mock(returncode=1, stdout="denied"))

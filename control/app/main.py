@@ -481,6 +481,7 @@ class Hub:
         self.esim_switch_locks: dict[str, asyncio.Lock] = {}
         self.lpa_busy: dict[str, bool] = {}  # readers currently owned by an LPA op
         self.lpa_downloads: dict[str, dict] = {}  # reader_name -> active download handle
+        self.card_rereads: set[str] = set()  # readers with a draft-completing re-read queued
         self.hotplug_starts: set[str] = set()  # debounce duplicate modem VPCD slots
         # When each line last became healthy, so a failure can be attributed. A line that
         # carried IMS for a long time and then broke is not evidence against its exit node.
@@ -845,6 +846,8 @@ async def _on_card_insert(name, idx):
             if inst:
                 info["matched"] = inst["id"]
     hub.cards[name] = info
+    if _draft_needs_card_read(name):
+        asyncio.create_task(_complete_draft_from_card(name))
     log.info("card inserted reader=%s (%s) identity=%s matched=%s", idx, name,
              "available" if info["iccid"] else "unknown", info["matched"])
     if info.get("matched"):
@@ -934,20 +937,22 @@ def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> dict:
-    """Promote a complete auto-created draft, or return it with missing-field hints.
+_DRAFT_FIELD_KEYS = {"IMSI": "imsi", "MCC/MNC": "mcc_mnc", "IMEI": "imei", "SMSC": "smsc",
+                     "SIM PIN": "pin"}
 
-    Hardware identity follows the physical reader/modem; SIM identity follows the ICCID.
-    Keeping this as a synchronous helper makes the promotion rules independently testable.
+
+def _draft_missing(inst: dict, card_info: dict, cards: list[dict]) -> list[str]:
+    """What an auto-created draft still lacks before it can become a line.
+
+    The device page shows this list, so the operator is told what is actually missing. It
+    used to say only that an IMEI was needed. Once the IMEI was saved, a SIM whose SMSC the
+    reader could not read stayed a draft, and the only hint left was a generic "waiting".
     """
-    if inst.get("provisioning_state") != "draft":
-        return inst
-
     imsi = str(card_info.get("imsi") or inst.get("imsi") or "").strip()
     mcc = str(card_info.get("mcc") or inst.get("mcc") or (imsi[:3] if len(imsi) >= 3 else ""))
     mnc = str(card_info.get("mnc") or inst.get("mnc") or "")
     smsc = str(card_info.get("smsc") or inst.get("smsc") or "").strip()
-    imei, hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
+    imei, _hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
     missing = []
     if not imsi:
         missing.append("IMSI")
@@ -959,8 +964,109 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
         missing.append("SMSC")
     if card_info.get("pin_enabled") is True and not inst.get("pin"):
         missing.append("SIM PIN")
+    return missing
+
+
+# Draft fields that only a card read can supply; the rest come from the operator.
+_CARD_READ_FIELDS = {"IMSI", "MCC/MNC", "SMSC"}
+# Seen on an Alcor AK9563: the read at insertion returned no SMSC for a SIM whose EF_SMSP a
+# later read returned without trouble. Retry on a widening schedule, then leave it to the
+# operator, who is shown the missing field and a re-read button.
+_CARD_REREAD_DELAYS = (10, 30, 60, 120, 300)
+
+
+def _merge_card_read(entry: dict, card) -> bool:
+    """Fill what an earlier read of the same card left empty. Returns whether anything did.
+
+    Identity is only ever added, never replaced: a read that fails half way must not erase
+    what a better one found. PIN retry counters are live state and are always refreshed.
+    """
+    if not card.iccid or str(card.iccid) != str(entry.get("iccid") or ""):
+        return False
+    filled = False
+    for key, value in (("imsi", card.imsi), ("mcc", card.mcc), ("mnc", card.mnc),
+                       ("mnc_len", getattr(card, "mnc_len", None)), ("smsc", card.smsc)):
+        if value not in (None, "") and not entry.get(key):
+            entry[key] = value
+            filled = True
+    if filled:
+        entry["carrier_identity"] = entry.get("carrier_identity") or _carrier_identity(card)
+    for key in ("pin_enabled", "pin_tries"):
+        if getattr(card, key, None) is not None:
+            entry[key] = getattr(card, key)
+    return filled
+
+
+async def _reread_card(name: str) -> bool:
+    """Read the card in reader `name` again and merge what the first read missed."""
+    entry = hub.cards.get(name)
+    if not entry or not entry.get("present") or hub.lpa_busy.get(name):
+        return False
+    lock = hub.reader_lock(name)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=0.5)
+    except asyncio.TimeoutError:
+        return False
+    try:
+        card = await asyncio.to_thread(sim.read_card, entry["index"])
+    except Exception as exc:  # noqa: a failed read leaves the cache as it was
+        log.debug("card re-read failed for %s: %r", name, exc)
+        return False
+    finally:
+        lock.release()
+    return _merge_card_read(entry, card)
+
+
+def _draft_needs_card_read(name: str) -> str:
+    """The draft id behind reader `name` if a card read could still complete it, else ''."""
+    entry = hub.cards.get(name) or {}
+    iid = str(entry.get("matched") or "")
+    inst = cfg.get_instance(iid) if iid and entry.get("present") else None
+    if not inst or inst.get("provisioning_state") != "draft":
+        return ""
+    missing = _draft_missing(inst, entry, hub.cards_list())
+    return iid if set(missing) & _CARD_READ_FIELDS else ""
+
+
+async def _complete_draft_from_card(name: str):
+    """Re-read a draft's card on a widening schedule while it lacks card-only fields."""
+    if name in hub.card_rereads:
+        return
+    hub.card_rereads.add(name)
+    try:
+        for delay in _CARD_REREAD_DELAYS:
+            await asyncio.sleep(delay)
+            iid = _draft_needs_card_read(name)
+            if not iid:
+                return
+            if await _reread_card(name) and not _draft_needs_card_read(name):
+                log.info("draft %s: a later card read supplied what the first one missed", iid)
+                asyncio.create_task(_auto_start_hotplugged_line(iid))
+                return
+        if _draft_needs_card_read(name):
+            log.info("draft behind %s still lacks card data after %d re-reads",
+                     name, len(_CARD_REREAD_DELAYS))
+    finally:
+        hub.card_rereads.discard(name)
+
+
+def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> dict:
+    """Promote a complete auto-created draft, or return it with missing-field hints.
+
+    Hardware identity follows the physical reader/modem; SIM identity follows the ICCID.
+    Keeping this as a synchronous helper makes the promotion rules independently testable.
+    """
+    if inst.get("provisioning_state") != "draft":
+        return inst
+
+    missing = _draft_missing(inst, card_info, cards)
     if missing:
         return {**inst, "auto_provision_missing": missing}
+    imsi = str(card_info.get("imsi") or inst.get("imsi") or "").strip()
+    mcc = str(card_info.get("mcc") or inst.get("mcc") or (imsi[:3] if len(imsi) >= 3 else ""))
+    mnc = str(card_info.get("mnc") or inst.get("mnc") or "")
+    smsc = str(card_info.get("smsc") or inst.get("smsc") or "").strip()
+    imei, hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
 
     previous_imeisv = str(inst.get("imeisv") or "")
     svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
@@ -2842,8 +2948,15 @@ async def api_sim_detect(reader_index: int = 0):
         raise HTTPException(400, "reader index out of range")
     name = rlist[reader_index]
     async with hub.reader_lock(name):
-        return await asyncio.to_thread(
-            lambda: _client_card_info(sim.read_card(reader_index).dict()))
+        card = await asyncio.to_thread(sim.read_card, reader_index)
+    # This read used to reach only the form. A draft waiting on a field the insertion read
+    # missed then stayed a draft until the operator also pressed Save.
+    entry = hub.cards.get(name)
+    if entry is not None and _merge_card_read(entry, card):
+        iid = str(entry.get("matched") or "")
+        if iid and not _draft_needs_card_read(name):
+            asyncio.create_task(_auto_start_hotplugged_line(iid))
+    return _client_card_info(card.dict())
 
 
 def _resolve_reader_index(body: dict) -> int:
@@ -4118,10 +4231,20 @@ async def _unified_devices() -> list[dict]:
             hardware_record = device_state.hardware().get(device_id) or hardware_record
         else:
             hardware_imei = cfg.normalize_imei(identity.get("imei", ""))
-        if is_draft and len(hardware_imei) != 15:
-            vowifi.update(
-                available=False,
-                reason="Set a 15-digit IMEI in Hardware; the line will then start automatically")
+        draft_missing = None
+        if is_draft and card_info.get("present"):
+            # Exactly the rule that decides promotion, so the page cannot name one field
+            # while the line is really waiting for another.
+            missing = draft_missing = _draft_missing(inst, card_info, cards)
+            if missing == ["IMEI"]:
+                vowifi.update(available=False, reason=(
+                    "Set a 15-digit IMEI in Hardware; the line will then start automatically"))
+            elif "IMEI" in missing:
+                vowifi.update(available=False, reason=(
+                    "Set the IMEI in Hardware and complete the SIM details; the line will then start automatically"))  # noqa: E501 - one literal: the i18n coverage test reads it
+            elif missing:
+                vowifi.update(available=False, reason=(
+                    "Complete the SIM details; the line will then start automatically"))
         masked_imei = _masked_identifier(hardware_imei)
         bridge_active = bool(actual_state.get("vowifi_bridge_active"))
         logical_channels = (None if is_native_reader else
@@ -4185,10 +4308,13 @@ async def _unified_devices() -> list[dict]:
                 "override": egress.normalize_country((inst or {}).get("proxy_country")),
                 "available_countries": available_countries},
             "provisioning": {"state": "draft" if is_draft else "ready" if inst else "detecting",
-                "missing": ([key for key, value in (
-                    ("imsi", (inst or card_info).get("imsi")),
-                    ("imei", hardware_imei),
-                    ("smsc", (inst or card_info).get("smsc"))) if not value])},
+                # IMEI is set on the Hardware tab; everything else on the SIM tab.
+                "missing": ([_DRAFT_FIELD_KEYS[name] for name in draft_missing]
+                            if draft_missing is not None else
+                            [key for key, value in (
+                                ("imsi", (inst or card_info).get("imsi")),
+                                ("imei", hardware_imei),
+                                ("smsc", (inst or card_info).get("smsc"))) if not value])},
             "capabilities": {"cellular": {"desired": cell_desired, "actual": cell_actual,
                                              "reason": cell_reason},
                              "flight": {"desired": flight_desired,
@@ -4211,6 +4337,27 @@ async def api_devices():
     # in the list yet. `discovering` lets the UI say so instead of reporting a confident zero.
     return {"devices": await _unified_devices(), "discovering": not hub.scanned,
             "shared": device_state.status().get("shared") or {}}
+
+
+@app.post("/api/devices/{device_id}/sim/reread")
+async def api_device_sim_reread(device_id: str):
+    """Read this device's SIM again; a draft completed by it is promoted and started."""
+    cards = hub.cards_list()
+    name = next((str(card.get("name") or "") for card in cards
+                 if card.get("present") and _device_for_card(card, cards)[0] == device_id), "")
+    if not name:
+        raise HTTPException(404, "no SIM is present in this device")
+    filled = await _reread_card(name)
+    iid = str((hub.cards.get(name) or {}).get("matched") or "")
+    inst = cfg.get_instance(iid) if iid else None
+    is_draft = bool(inst and inst.get("provisioning_state") == "draft")
+    missing = _draft_missing(inst, hub.cards.get(name) or {}, hub.cards_list()) if is_draft else []
+    # Only a complete draft is handed on; one still waiting for the IMEI or a PIN reports that.
+    completing = is_draft and not missing
+    if completing:
+        asyncio.create_task(_auto_start_hotplugged_line(iid))
+    await hub.broadcast({"type": "cards", "cards": _client_cards()})
+    return {"ok": True, "updated": filled, "completing": completing, "missing": missing}
 
 
 @app.put("/api/devices/{device_id}/hardware")
@@ -4270,8 +4417,10 @@ async def api_device_hardware(device_id: str, body: dict):
                 applied = True
                 started = True
     await hub.broadcast({"type": "hardware", "device": device_id})
+    still_missing = (list(inst.get("auto_provision_missing") or [])
+                     if iid and imei and inst.get("provisioning_state") == "draft" else [])
     return {"ok": True, "imei_masked": _masked_identifier(record.get("imei")),
-            "applied": applied, "started": started}
+            "applied": applied, "started": started, "missing": still_missing}
 
 
 def _remove_device_from_document(path: str, device_id: str, mapping_key: str) -> None:

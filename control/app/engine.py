@@ -349,6 +349,38 @@ def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
         log.warning("diagnostic capture failed for instance %s: %s", iid, exc)
 
 
+def _names_a_registry(reference: str) -> bool:
+    """Whether pulling this reference would reach a registry rather than a local build.
+
+    Docker treats the first segment as a registry host only when it contains a dot or a
+    colon. ``mdd-sim-gateway/engine`` is the tag a host-assisted install builds locally;
+    pulling it would ask Docker Hub for a repository that does not exist, turning a clear
+    "the image was never built" into a confusing registry error.
+    """
+    head, _, rest = reference.partition("/")
+    return bool(rest) and ("." in head or ":" in head or head == "localhost")
+
+
+def ensure_image(client, reference: str = "") -> object:
+    """The Engine image, fetched once when this deployment names a registry copy.
+
+    Compose knows only the three base services. ``MDD_ENGINE_IMAGE`` is an environment
+    variable of the Control service, so neither Compose nor the container manager ever
+    fetches the Engine image, and nothing else does either: the container update helper
+    imports release archives instead. Without this, a container deployment comes up with
+    three healthy base services and every line failing on ImageNotFound.
+    """
+    reference = reference or IMAGE
+    try:
+        return client.images.get(reference)
+    except docker.errors.ImageNotFound:
+        if not _names_a_registry(reference):
+            raise
+    log.info("engine image %s is absent; fetching it once", reference)
+    client.images.pull(reference)
+    return client.images.get(reference)
+
+
 def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "rebuild"):
     """(Re)create and start the engine container for an instance."""
     if ENGINE_NETWORK in {"host", "none"}:
@@ -386,7 +418,7 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
             raise egress.EgressError("SOCKS egress requires MDD_ENGINE_NETWORK")
         # Old images ignore unknown environment variables and would silently go direct.
         # Inspect before writing configuration or removing the previous container.
-        image = client.images.get(IMAGE)
+        image = ensure_image(client)
         supported = (image.attrs.get("Config", {}).get("Labels") or {}).get(ENGINE_LABEL, "")
         if "socks5" not in supported.split(","):
             raise egress.EgressError("engine image does not support SOCKS egress; rebuild required")

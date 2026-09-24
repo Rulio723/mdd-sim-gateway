@@ -13,11 +13,11 @@
   <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">Discussions</a>
 </p>
 
-MDD Sim Gateway is a self-hosted multi-SIM communications gateway for Debian, Ubuntu and Armbian ARM64 hosts. It brings cellular modems, USB smart-card readers, IMS, EAP-AKA, eSIM, ModemManager and sing-box into one bilingual Web console.
+MDD Sim Gateway is a self-hosted multi-SIM communications gateway. It installs directly on Debian, Ubuntu and Armbian ARM64 hosts, or runs entirely in containers on a Synology or other NAS. It brings cellular modems, USB smart-card readers, IMS, EAP-AKA, eSIM, ModemManager and sing-box into one bilingual Web console.
 
 | Real SIM authentication | Calls and SMS | Multi-modem control | Isolated country exits |
 |---|---|---|---|
-| Perform EAP-AKA and IMS-AKA inside a physical SIM/eSIM without reading Ki/OP/OPc | Browser softphone, SMS, call history and incoming notifications | Manage cellular modems, PC/SC readers and eUICCs in one console | Route each SIM's ePDG through its own country TUN and fail closed when UDP checks fail |
+| Perform EAP-AKA and IMS-AKA inside a physical SIM/eSIM without reading Ki/OP/OPc | Browser softphone, SMS, call history and incoming notifications | Manage cellular modems, PC/SC readers and eUICCs in one console | Route each SIM's ePDG traffic through the chosen country exit (a TUN on host installs, SOCKS5 in containers) and fail closed when it is down |
 
 ## Interface tour
 
@@ -26,6 +26,19 @@ MDD Sim Gateway is a self-hosted multi-SIM communications gateway for Debian, Ub
 <p align="center">Overview → device management → browser calling → messages → balance & keeping → system updates · All identities and content shown are fictional demo data</p>
 
 ## Quick install
+
+There are two ways to deploy. Both provide the same features; choose by host:
+
+| | Host install | Full-container deployment |
+|---|---|---|
+| For | Raspberry Pi and other Debian / Ubuntu / Armbian ARM64 hosts | Synology and other NAS, or any Linux that runs Docker Compose |
+| Installed on the host | systemd services; the installer provisions pcscd, ModemManager and NetworkManager | Nothing besides Docker; every service runs in a container |
+| Resident containers | One Engine per line | Control, Hardware and Egress, plus one Engine per line |
+| Country exits | A TUN and ePDG routes per country | A SOCKS5 listener per country; the host routing table and DNS are untouched |
+| Console | `https://<gateway-address>:8443` | `https://<nas-address>:10443` |
+| Status | Stable | Release candidate (v1.12.0-rc), validated on a Synology DS1621+ |
+
+### Option 1: host install
 
 Use an ARM64 Debian, Ubuntu or Armbian host with systemd, Docker, USB and a stable network connection.
 
@@ -46,13 +59,31 @@ cd mdd-sim-gateway
 sudo ./install.sh install
 ```
 
-When installation completes, open `https://<gateway-address>:8443` and create the administrator account immediately on a trusted LAN or VPN. See [Installation](docs/INSTALL.md) for prerequisites, the full install process and upgrades. NAS Compose deployments use host port `10443` by default.
+When installation completes, open `https://<gateway-address>:8443` and create the administrator account immediately on a trusted LAN or VPN. See [Installation](docs/INSTALL.md) for prerequisites, the full install process and upgrades.
 
-Synology and other NAS users can run the complete gateway as a Container Manager/Compose project
-without installing the application stack on the host. Use the version-pinned Compose YAML attached
-to a Release and follow the [full container deployment guide](docs/CONTAINER_DEPLOYMENT.en.md).
-Verified and pending NAS/kernel combinations are tracked in the
-[NAS compatibility and driver catalogue](drivers/README.en.md).
+### Option 2: full-container deployment (NAS / Docker Compose)
+
+No install script over SSH, and no pcscd, ModemManager or similar services on the host.
+
+1. **Check that the host sees the modem.** After plugging it in, the host should show
+   `/dev/ttyUSB*`, `/dev/cdc-wdm*` and a `wwan*` interface; a standard PC/SC reader only needs to
+   appear under `/dev/bus/usb`. Missing nodes mean the host lacks a kernel driver, and no Release
+   ships an installable driver package yet — see the
+   [NAS compatibility and driver catalogue](drivers/README.en.md).
+2. **Download the Compose file.** Get `mdd-sim-gateway-compose-vX.Y.Z.yaml` from
+   [Releases](https://github.com/MddIdd/mdd-sim-gateway/releases); its four images are pinned to that
+   version.
+3. **Edit the two values marked at the top.** Set `MDD_ADVERTISE_ADDR` to the NAS LAN address (the
+   media address for browser calls), and change the data directory if it is not
+   `/volume1/docker/mdd-sim-gateway`. The console port defaults to `10443`.
+4. **Create the project.** On Synology, create a project in Container Manager and paste the YAML;
+   elsewhere, save it as `docker-compose.yml` in the data directory and run `docker compose up -d`.
+5. **Open `https://<nas-address>:10443`** and create the administrator account immediately.
+
+When Hardware starts or is recreated it may reset the modem once and take a minute or two to become
+healthy; that is expected. The four images take about 1.3 GB per generation once unpacked, and a one-click update keeps
+two generations side by side, so leave at least 6 GiB for Docker storage. Updates, rollback and
+troubleshooting are in the [full container deployment guide](docs/CONTAINER_DEPLOYMENT.en.md).
 
 > This software directly controls cellular radios, SIMs, network routes and IMS. Carrier support for Wi-Fi Calling still depends on the plan, region, device identity and network policy.
 
@@ -124,7 +155,7 @@ will permit the service.
 
 ## What the installer does
 
-The installer reuses a working system Docker daemon, or installs the distribution package when
+This applies to host installs only; a full-container deployment runs no install script. The installer reuses a working system Docker daemon, or installs the distribution package when
 Docker is absent. It provisions pcscd, ModemManager/NetworkManager, checksummed sing-box and
 Xray-core, a pinned
 lpac source build, the Web console and the per-SIM VoWiFi engine. It does not prune Docker or
