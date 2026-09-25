@@ -2,6 +2,79 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.12.0-rc11] - 2026-09-26
+
+Eleventh release candidate. The automatic update channel stays on 1.9.5.
+
+### Fixed
+
+- In the full-container deployment a line behind a country exit never connected: its Engine sits
+  on an internal network with no default route, and the SWu client crashed looking for one, first
+  at start-up and then, once the tunnel was up, while pinning the ePDG route. It now needs no
+  default route there, since IKE and ESP reach the ePDG through the exit's SOCKS proxy.
+
+## [1.12.0-rc10] - 2026-09-26
+
+Tenth release candidate. The automatic update channel stays on 1.9.5.
+
+### Fixed
+
+- In the full-container deployment every modem was named "Cellular modem", and configured modem
+  profiles were ignored: Hardware looked for them in a `config.json` that Control never writes. It
+  now reads `config.yaml`, so a modem shows its profile name (such as "DJI/Quectel EC25") as in a
+  native install.
+- The VoWiFi row of a carrier without Wi-Fi Calling alternated every few seconds between the reason
+  and "Stopped."; it now keeps the reason while the line is off.
+- Renaming a running line still restarted it when the SIM form also saved the MNC padded to three
+  digits or the live reader index. Neither changes what the engine uses, so a rename no longer
+  restarts the line.
+- On hosts where pcscd runs as an unprivileged user (Ubuntu 26.04), the modem readers never
+  appeared because their definition file was created readable by root only. It is now written
+  world-readable, and a file left by an older release is repaired on upgrade.
+
+## [1.12.0-rc9] - 2026-09-25
+
+Ninth release candidate. The automatic update channel stays on 1.9.5.
+
+### Added
+
+- A device's 4G tab shows whether the modem can hand cellular call audio to the gateway, from a
+  read-only probe. The DJI-customised EC25/EG25-G reports `firmware_locked`: calls can be answered
+  but carry no audio, so auto-answer, recording and browser calls are not possible on it.
+
+### Changed
+
+- Idle CPU on a Raspberry Pi 3 drops from about one core to a quarter: the configuration and the
+  country-exit subscription are parsed once per change instead of on every request, Hardware
+  checks every 8 s when nothing is in flight (waking at once on hotplug or a UI change), and the
+  container health checks run every 30 s.
+
+### Fixed
+
+- A container update failed, and so did its rollback, when an old base container took longer than
+  Docker's stop timeout to exit, leaving Hardware and Egress stopped. The updater now stops each
+  base container itself, waits up to two minutes for it to exit, and removes containers a failed
+  recreate left behind. This protects the update *after* the one that installs it, since the
+  updater comes from the release being updated from.
+- A modem ModemManager gave up on at start-up (its QMI port timed out) stayed unused until someone
+  reset it by hand. Hardware now resets such a modem through its AT port after two minutes, at
+  most once every five minutes.
+- **An upgraded gateway no longer serves the old WebUI from the browser's cache.** The page that
+  names which build to load is now marked `no-cache`, so every client revalidates it, and the
+  files it names -- whose names contain a hash of their contents -- are marked immutable. Before
+  this the answers carried an ETag but no caching rule at all, which let a client decide for
+  itself how long to reuse them; a web view, with no reload button, could keep showing the
+  previous build indefinitely.
+- **Messages works on a phone.** Below 760 px it shows the conversation list or one conversation
+  (or a new message) at a time, with a back button, and the system back gesture returns to the
+  list. A conversation row is a real button, so it opens on the first tap.
+- An outgoing MMS whose upload the modem refused part way through -- its MMSC socket
+  occasionally answers `SEND FAIL` -- is submitted again on a fresh connection after 3 and then
+  10 seconds instead of being marked failed at once. Only an attempt that stopped before the
+  last chunk, or never connected, is repeated, since the MMSC cannot have received it whole; a
+  request that may have arrived complete is still never sent twice. The error now carries the
+  modem's own answer and the byte offset where the upload stopped.
+
 ## [1.12.0-rc8] - 2026-09-25
 
 Eighth release candidate. The automatic update channel stays on 1.9.5.

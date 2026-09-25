@@ -22,6 +22,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   const [messagesLoading, setMessagesLoading] = useState(false)
   const [text, setText] = useState('')
   const [newTo, setNewTo] = useState('')
+  const [composing, setComposing] = useState(false) // a new message open, with no peer yet
   const [transport, setTransport] = useState('auto')
   const [sending, setSending] = useState(false)
   const [selMode, setSelMode] = useState(false)      // multi-select messages to delete
@@ -191,6 +192,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   useEffect(() => {
     ++threadsRequest.current; ++messagesRequest.current
     setThreads([]); setPeer(null); setMsgs([]); setText(''); setNewTo(''); setTransport('auto')
+    setComposing(false)
     setBinary([])
     clearAttachments(); setSubject(''); setMmsCfg(null)
     setThreadsLoading(Boolean(id)); setMessagesLoading(false)
@@ -381,6 +383,23 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     } catch (e) { toast('Delete failed: ' + e.message) }
   }
 
+  // On a phone the list and the conversation are one screen at a time (see .u-messages-split).
+  // A new message has no peer yet, so the open pane is "a peer or composing". Opening it pushes
+  // a history entry, so the system back gesture returns to the list instead of leaving the page.
+  const paneOpen = Boolean(peer) || composing
+  const closePane = useCallback(() => {
+    setPeer(null); setMsgs([]); setMessagesLoading(false); setComposing(false)
+  }, [])
+  useEffect(() => {
+    if (!paneOpen || !window.matchMedia('(max-width: 760px)').matches) return undefined
+    window.history.pushState({ mddMessagesPane: true }, '')
+    window.addEventListener('popstate', closePane)
+    return () => {
+      window.removeEventListener('popstate', closePane)
+      if (window.history.state?.mddMessagesPane) window.history.back()
+    }
+  }, [paneOpen, closePane])
+
   if (initialLoading && !id) return <p role="status">{tr('Loading')}…</p>
   if (loadErrors?.instances && !id) return <p className="u-error">{tr('Loading failed')}</p>
   if (!id) return (
@@ -395,24 +414,27 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
-      <div className="card" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
-        <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]); setMessagesLoading(false) }}>+ {tr('New message')}</button>
+      <div className={`u-messages-split ${paneOpen ? 'in-conversation' : ''}`}>
+      <div className="card u-messages-list" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
+        <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]); setMessagesLoading(false); setComposing(true) }}>+ {tr('New message')}</button>
         {threads.length > 0 &&
           <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, color: '#ef4444', fontSize: 12 }}
             onClick={clearAll}>{tr('Clear all conversations')}</button>}
         <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, fontSize: 12 }}
           onClick={() => setShowMmsSettings(true)}>{tr('MMS settings')}</button>
         {threads.map((t) => (
-          <div key={t.peer} onClick={() => setPeer(t.peer)} className="hover-row"
-            style={{ padding: 10, borderRadius: 10, cursor: 'pointer', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8,
-              background: peer === t.peer ? 'var(--active)' : 'transparent' }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 14 }} className="mono">{t.peer}</div>
-              <div style={{ fontSize: 12, color: 'var(--text-mute)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          // The row is a button, not a div that happens to listen for clicks: a touch device
+          // delivers a click to an element that is actually interactive, and a keyboard can
+          // reach it. The delete button sits beside it rather than inside it, because a button
+          // within a button is not valid and behaves differently in every browser.
+          <div key={t.peer} className="hover-row u-thread-row"
+            style={{ background: peer === t.peer ? 'var(--active)' : 'transparent' }}>
+            <button type="button" className="u-thread-open" onClick={() => { setPeer(t.peer); setComposing(false) }}>
+              <span style={{ fontWeight: 600, fontSize: 14 }} className="mono">{t.peer}</span>
+              <span style={{ fontSize: 12, color: 'var(--text-mute)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {t.last_kind === 'mms' ? `[${tr('MMS')}]${t.last_body ? ' ' + t.last_body : ''}` : t.last_body}
-              </div>
-            </div>
+              </span>
+            </button>
             <button className="row-del" title="Delete conversation" aria-label={`Delete conversation with ${t.peer}`}
               onClick={(e) => deleteThread(t.peer, e)}>🗑</button>
           </div>
@@ -422,8 +444,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         <BinaryPayloads payloads={binary} tr={tr} />
       </div>
 
-      <div className="card" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
+      <div className="card u-messages-thread" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
         <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+          {paneOpen && <button className="btn btn-ghost u-messages-back" aria-label={tr('Back to conversations')}
+            onClick={closePane}>‹</button>}
           {peer ? <span className="mono" style={{ fontWeight: 600, flex: 1 }}>{peer}</span>
             : <input placeholder={tr('Recipient number e.g. +1...')} value={newTo} onChange={(e) => setNewTo(e.target.value)} style={{ maxWidth: 300, flex: 1 }} />}
           {peer && msgs.length > 0 && (

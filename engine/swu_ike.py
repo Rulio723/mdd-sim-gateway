@@ -2864,10 +2864,14 @@ class swu():
             self.exec_in_netns("ip addr add " + self.ip_address_list[0] + "/32 dev " + self.tun_device)
             #set host route, only  required if no netns
             if not self.netns_name:
-                if self.default_gateway is None:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.get_default_gateway_linux()[0])
+                # Behind a country exit the Engine sits on an internal network with no default
+                # route: IKE and ESP reach the ePDG through the SOCKS proxy on that network's own
+                # subnet, which the /1 tunnel routes below never cover, so there is nothing to pin.
+                gateway = self.default_gateway or (self.get_default_gateway_linux() or [None])[0]
+                if gateway:
+                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + gateway)
                 else:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.default_gateway)
+                    swu_log("no default route (proxied egress): ePDG host route not needed")
 
             # VoWiFi engine addition: on an IPv4 IMS PDN (e.g. Vodafone UK, cp_mode=v4) the two /1
             # routes below make the tunnel the default route for ALL IPv4. That blackholes every
@@ -3007,8 +3011,10 @@ class swu():
       
 
     def get_default_source_address(self):
-    
-        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+        gateway = get_default_gateway_linux()
+        if not gateway:
+            return None
+        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
         output = str(proc.stdout.read())
         if 'addr:' in output:
             addr = output.split('addr:')[1].split()[0]
@@ -6001,8 +6007,13 @@ def get_default_gateway_linux():
             return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16))), fields[0]
 
 def get_default_source_address():
-
-    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+    # Evaluated eagerly as the -s default, even when -s is given. A container Engine behind a
+    # country exit sits on an internal Docker network with no default route, and this used to
+    # raise TypeError before the entrypoint's -s could apply, so the line never started.
+    gateway = get_default_gateway_linux()
+    if not gateway:
+        return None
+    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
     output = str(proc.stdout.read())
     if 'addr:' in output:
         addr = output.split('addr:')[1].split()[0]
@@ -6805,6 +6816,8 @@ def main():
                              iccid=_foreign, expected=_want_iccid)
             exit(1)
 
+    if not options.source_addr:
+        parser.error("no IKE source address: pass -s, the host has no default route to derive one")
     a = swu(options.source_addr,destination_addr,options.apn,modem,options.gateway_ip_address,options.mcc,options.mnc,options.imsi,options.netns)
 
     if options.imsi == DEFAULT_IMSI: a.get_identity()

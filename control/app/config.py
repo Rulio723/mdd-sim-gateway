@@ -23,6 +23,13 @@ import yaml
 DATA_DIR = os.environ.get("MDD_DATA", os.path.join(os.getcwd(), "data"))
 CONFIG_PATH = os.path.join(DATA_DIR, "config.yaml")
 _lock = threading.RLock()
+# libyaml parses config.yaml an order of magnitude faster than the pure-Python loader. Same
+# safe schema; fall back where PyYAML was built without it.
+_SafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+# (path, inode, size, mtime_ns) of the file behind the cached load(), and the merged result.
+# Every settings read, line lookup and device listing used to parse the whole file again:
+# on a Raspberry Pi with the device page open that was ~70 % of Control's CPU.
+_loaded: tuple | None = None
 
 # Product safety boundary. This is intentionally a source-level limit rather than an environment
 # variable: operators must not be able to turn the gateway into a bulk-SIM service by changing
@@ -306,11 +313,23 @@ def _ensure():
     os.chmod(CONFIG_PATH, 0o600)
 
 
+def _file_key() -> tuple:
+    st = os.stat(CONFIG_PATH)
+    return (CONFIG_PATH, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def load() -> dict:
+    """The merged configuration. Callers get their own copy and may mutate it freely."""
+    global _loaded
     with _lock:
         _ensure()
+        # Taken before reading: a write that lands in between changes the key, so the next
+        # call parses again instead of serving the older content under the newer key.
+        file_key = _file_key()
+        if _loaded is not None and _loaded[0] == file_key:
+            return deepcopy(_loaded[1])
         with open(CONFIG_PATH) as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.load(f, Loader=_SafeLoader) or {}
         # merge defaults (shallow for settings)
         out = deepcopy(DEFAULTS)
         out["settings"].update(data.get("settings", {}))
@@ -530,6 +549,7 @@ def load() -> dict:
             # the product never provisions standalone SIP accounts.
             (inst.setdefault("sip", {}))["external"] = []
         out["internal"] = data.get("internal", {})
+        _loaded = (file_key, deepcopy(out))
         return out
 
 
@@ -542,7 +562,9 @@ def esim_settings() -> dict:
 
 
 def save(data: dict):
+    global _loaded
     with _lock:
+        _loaded = None
         _private_dir(DATA_DIR)
         tmp = CONFIG_PATH + ".tmp"
         with _private_text_writer(tmp) as f:

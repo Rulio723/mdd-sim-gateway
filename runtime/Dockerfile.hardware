@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=mdd-sim-gateway/control:v1.12.0-rc8
+ARG BASE_IMAGE=mdd-sim-gateway/control:v1.12.0-rc11
 FROM ${BASE_IMAGE} AS pcsc-build
 
 ARG PCSC_VERSION=2.3.3
@@ -109,7 +109,11 @@ LABEL io.mdd-sim-gateway.component="hardware" \
 # re-enumerate (about 80s on a DS1621+ with an EC25). Failures during the start
 # period do not count and the first success ends it, so a generous value costs a
 # fast start nothing.
-HEALTHCHECK --interval=10s --timeout=3s --start-period=180s --retries=3 \
+# Each check is a docker exec that starts a fresh Python: on a Raspberry Pi the three
+# containers' checks cost about a fifth of a core at 10 s. The first check now comes
+# 30 s after start. --start-interval would keep starts fast, but Docker before 25
+# rejects it at build time, and install.sh builds this image with the host's Docker.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=180s --retries=3 \
     CMD python -c 'import json,time; d=json.load(open("/run/mdd-hardware/status.json")); assert d["version"]==1 and time.time()-d["updated_at"]<15 and "reconcile_error" not in d and d["modem_count"]==d["hardware_count"] and d["ready_bridge_count"]+d.get("maintenance_bridge_count",0)+d.get("card_failed_bridge_count",0)>=d["hardware_count"]'
 
 ENTRYPOINT ["python", "-m", "runtime.hardware"]

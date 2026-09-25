@@ -383,6 +383,22 @@ label:has(>.u-toggle) { display:flex; align-items:center; gap:10px; min-height:3
  .u-proxy-row,.u-proxy-row:has(.u-proxy-auth) { grid-template-columns:minmax(160px,210px) minmax(0,1fr) auto; }.u-proxy-secondary { grid-column:2; }.u-proxy-auth { grid-column:2; }.u-proxy-actions { grid-column:3; grid-row:1 / span 2; align-self:center; flex-direction:column; }
  .u-settings-grid { grid-template-columns:1fr; }
 }
+.u-thread-row { display:flex; align-items:center; gap:8px; margin-bottom:4px; padding:10px; border-radius:10px; }
+.u-thread-open { flex:1; min-width:0; display:flex; flex-direction:column; align-items:flex-start; gap:2px; border:0; padding:0; background:transparent; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+.u-thread-open>span { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+/* Messages is two panes side by side on a desktop. The widths used to be an inline style, which
+   no media query can reach -- so on a phone the conversation list and the conversation shared a
+   440px screen and neither was usable. Below 760px they become one screen at a time: the list,
+   or the conversation with a way back to it. */
+.u-messages-split { display:grid; grid-template-columns:280px minmax(0,1fr); grid-template-rows:minmax(0,1fr); gap:16px; flex:1; min-height:0; }
+.u-messages-back { display:none; flex:0 0 auto; padding:2px 10px; font-size:20px; line-height:1; }
+@media(max-width:760px){
+ .u-messages-split { grid-template-columns:minmax(0,1fr); }
+ .u-messages-split.in-conversation .u-messages-list { display:none; }
+ .u-messages-split:not(.in-conversation) .u-messages-thread { display:none; }
+ .u-messages-back { display:inline-flex; }
+}
 @media(max-width:560px){
  .u-main>header p { display:none; }.u-content { padding:12px; }.u-metrics,.u-device-grid,.u-form-grid,.u-details.cols,.u-notifications-page>.u-tabs+.u-device-grid { grid-template-columns:1fr; }.u-section-title { align-items:stretch; flex-direction:column; }.u-add-exit { flex:0; width:100%; }.u-country-picker { min-width:0; }.u-capability { align-items:flex-start; }.u-cap-actions { flex-direction:column; align-items:flex-end; }.u-card-foot { justify-content:stretch; }.u-card-foot .btn { flex:1; padding-left:6px; padding-right:6px; }.u-hardware-action,.u-hardware-danger,.u-line-delete,.u-saved-lines { grid-template-columns:1fr; align-items:stretch; }.u-hardware-action .btn,.u-line-delete .btn { justify-self:start; }.u-toast { top:12px; width:calc(100vw - 24px); max-width:none; }.u-update-note { align-items:stretch; flex-direction:column; }.u-update-note .btn { align-self:flex-start; }.u-modal-actions .btn { flex:1 1 auto; }
  .u-proxy-toolbar { justify-content:space-between; }.u-icon-button span { display:none; }.u-proxy-type-grid { grid-template-columns:1fr; }.u-proxy-type { min-height:82px; }.u-proxy-modal { padding:17px; }

@@ -141,6 +141,69 @@ class ContainerComposeOrderTests(unittest.TestCase):
         self.assertTrue(all("--no-deps" in command for command in commands))
 
 
+class SettleServicesTests(unittest.TestCase):
+    """A Hardware container on the DS1621+ took 22 s to exit after SIGKILL. Docker's stop gave
+    up first, Compose aborted mid-recreate, and the rollback hit a name conflict."""
+
+    @staticmethod
+    def container(name, running_states):
+        item = Mock()
+        item.name = name
+        states = iter(running_states)
+        item.attrs = {"State": {"Running": True}}
+
+        def reload():
+            item.attrs = {"State": {"Running": next(states)}}
+
+        item.reload.side_effect = reload
+        return item
+
+    def test_a_slow_container_is_waited_for_instead_of_failing_the_update(self):
+        slow = self.container("mdd-sim-gateway-hardware", [True, True, False])
+        slow.stop.side_effect = mdd_container_update.docker.errors.APIError(
+            "tried to kill container, but did not receive an exit event")
+        client = Mock()
+        client.containers.list.return_value = [slow]
+        with patch.object(mdd_container_update.time, "sleep"):
+            mdd_container_update.settle_services(client, ("hardware",))
+        self.assertEqual(slow.reload.call_count, 3)
+        client.containers.list.assert_called_once_with(all=True, filters={"label": [
+            "com.docker.compose.project=mdd-sim-gateway",
+            "com.docker.compose.service=hardware"]})
+
+    def test_temporaries_left_by_a_failed_recreate_are_removed(self):
+        leftover = self.container("69e1b009d23a_mdd-sim-gateway-hardware", [])
+        current = self.container("mdd-sim-gateway-hardware", [False])
+        client = Mock()
+        client.containers.list.return_value = [leftover, current]
+        mdd_container_update.settle_services(client, ("hardware",))
+        leftover.remove.assert_called_once_with(force=True)
+        leftover.stop.assert_not_called()
+        current.remove.assert_not_called()
+
+    def test_a_container_that_never_exits_fails_with_its_name(self):
+        stuck = self.container("mdd-sim-gateway-hardware", [True] * 1000)
+        client = Mock()
+        client.containers.list.return_value = [stuck]
+        clock = iter(range(0, 10000, 10))
+        with patch.object(mdd_container_update.time, "sleep"), \
+                patch.object(mdd_container_update.time, "monotonic",
+                             side_effect=lambda: next(clock)), \
+                self.assertRaisesRegex(mdd_container_update.mdd_update.UpdateError,
+                                       "mdd-sim-gateway-hardware did not exit"):
+            mdd_container_update.settle_services(client, ("hardware",))
+
+    def test_compose_up_settles_each_group_before_starting_it(self):
+        events = []
+        with patch.object(mdd_container_update, "settle_services",
+                          side_effect=lambda _client, services: events.append(services)), \
+                patch.object(mdd_container_update, "run",
+                             side_effect=lambda command, **_: events.append(command[-1])):
+            mdd_container_update.compose_up(Path("/data/docker-compose.yml"),
+                                            lambda _c: None, Mock())
+        self.assertEqual(events, [("hardware", "egress"), "egress", ("control",), "control"])
+
+
 class ComposeEnvironmentTests(unittest.TestCase):
     def test_the_control_image_environment_never_reaches_compose_interpolation(self):
         """The Control image sets MDD_HTTP_PORT=8443 for its own listener; the Compose file
@@ -242,7 +305,7 @@ class ContainerUpdateRollbackTests(unittest.TestCase):
     def test_failed_base_recreation_restores_the_original_compose(self):
         attempts = []
 
-        def compose_up_stub(_compose, wait):
+        def compose_up_stub(_compose, wait, _client=None):
             # The first start (new release) fails; the rollback start waits like the real one.
             attempts.append(1)
             if len(attempts) == 1:
@@ -351,7 +414,7 @@ class ContainerUpdateRollbackTests(unittest.TestCase):
                     patch("control.app.operations.create_local_backup",
                           return_value={"name": "backup.tar.gz"}), \
                     patch.object(mdd_container_update, "compose_up",
-                                 side_effect=lambda compose, _wait: composes.append(
+                                 side_effect=lambda compose, _wait, _client=None: composes.append(
                                      compose.read_text())), \
                     patch.object(mdd_container_update, "roll_engines") as rolled, \
                     patch.object(mdd_container_update, "wait_container"):

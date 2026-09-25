@@ -192,12 +192,18 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   // events. One includes the detailed OK reason while the other may omit it. Render one
   // canonical healthy message so those feeds cannot make the text flicker every few seconds.
   const cellular = device.cellular || {}
+  const unsupported = kind === 'vowifi' && vowifiUnsupported(device)
+  // For a carrier without Wi-Fi Calling the device snapshot explains why, while live line
+  // events report the stopped line ("Stopped."); the two alternated every few seconds. The
+  // carrier's answer is the one that tells the user something, so it wins while the line is off.
+  const unsupportedReason = unsupported && c.actual === 'off'
+    ? (device.capabilities?.vowifi?.support?.reason || '') : ''
   const detail = c.actual === 'on'
     ? (kind === 'vowifi' ? t('Working — connected to the carrier over Wi-Fi.')
       : kind === 'cellular' ? [t('Mobile data connected'), cellular.operator, cellular.ip].filter(Boolean).join(' · ')
       : t('cap.help.on'))
+    : unsupportedReason ? t(unsupportedReason)
     : (c.reason ? t(c.reason) : t(`cap.help.${c.actual}`))
-  const unsupported = kind === 'vowifi' && vowifiUnsupported(device)
   const badgeState = capabilityBadgeState(device, kind, displayedState)
   // A draft line starts by itself once these are filled in. IMEI belongs to the reader
   // (Hardware tab); every other field belongs to the SIM (SIM tab).
@@ -391,7 +397,7 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
     <section className="u-page"><div className="u-page-heading"><div><h2>{deviceTitle(d, devices.indexOf(d))}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
       {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast} onSetup={openSetup}/><LineActivity device={d}/><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the 4G switch only connects or disconnects mobile data.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
-      {tab==='cellular' && <div className="card u-panel"><h3>{t('4G network')}</h3>{d.cellular ? <div className="u-details cols"><div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div><div className="u-detail"><span>{t('Operator')}</span><b>{d.cellular.operator || t('Not connected')}</b></div><div className="u-detail"><span>APN</span><b>{d.cellular.apn || t('Automatic')}</b></div><div className="u-detail"><span>{t('IP address')}</span><b>{d.cellular.ip || t('Waiting')}</b></div><div className="u-detail"><span>{t('Signal')}</span><b>{d.cellular.signal == null ? t('Waiting') : `${d.cellular.signal}%`}</b></div><div className="u-detail"><span>{t('Traffic')}</span><b>↓ {formatBytes(d.cellular.rx_bytes)} · ↑ {formatBytes(d.cellular.tx_bytes)}</b></div><div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div><div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div></div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on 4G to let the per-device ModemManager backend establish a data bearer.')} />}<ModemImsPanel key={d.id} device={d} showToast={showToast}/></div>}
+      {tab==='cellular' && <div className="card u-panel"><h3>{t('4G network')}</h3>{d.cellular ? <div className="u-details cols"><div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div><div className="u-detail"><span>{t('Operator')}</span><b>{d.cellular.operator || t('Not connected')}</b></div><div className="u-detail"><span>APN</span><b>{d.cellular.apn || t('Automatic')}</b></div><div className="u-detail"><span>{t('IP address')}</span><b>{d.cellular.ip || t('Waiting')}</b></div><div className="u-detail"><span>{t('Signal')}</span><b>{d.cellular.signal == null ? t('Waiting') : `${d.cellular.signal}%`}</b></div><div className="u-detail"><span>{t('Traffic')}</span><b>↓ {formatBytes(d.cellular.rx_bytes)} · ↑ {formatBytes(d.cellular.tx_bytes)}</b></div><div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div><div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div></div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on 4G to let the per-device ModemManager backend establish a data bearer.')} />}<ModemImsPanel key={d.id} device={d} showToast={showToast}/><ModemVoiceAudioPanel key={`${d.id}:voice`} device={d}/></div>}
       {tab==='vowifi' && <div className="card u-panel"><h3>VoWiFi</h3><CountryExitControl device={d} refresh={refresh} showToast={showToast}/><LineActivity device={d}/><VowifiHistory instanceId={d.instance_id} subscribe={subscribe}/><div className="u-details cols"><div className="u-detail"><span>ePDG / IKE</span><b>{typeof d.vowifi?.epdg === 'object' ? (d.vowifi.epdg.ike_reason || (d.vowifi.epdg.pcscf ? t('Tunnel connected') : t('Waiting'))) : (d.vowifi?.epdg || d.status?.state || t('Not connected'))}</b></div><div className="u-detail"><span>IMS / SIP</span><b>{d.vowifi?.ims || d.status?.label || t('Not connected')}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t)} /></b></div><div className="u-detail"><span>{t('Data channel rekey')}</span><b>{(d.vowifi?.rekey_minutes ?? 30) === 0 ? t(d.vowifi?.accept_epdg_rekey ? 'Initiated by carrier' : 'Off') : `${d.vowifi?.rekey_minutes ?? 30} ${t('minutes')}`}</b></div><div className="u-detail"><span>{t('Control channel rekey')}</span><b>{(d.vowifi?.ike_rekey_minutes ?? 150) === 0 ? t('Off') : `${d.vowifi?.ike_rekey_minutes ?? 150} ${t('minutes')}`}</b></div></div>{!!d.egress?.pinned_node && d.egress.pinned_node !== d.egress.node && !!exitChangeReason(d.egress, t, language) && <p className="u-note u-proxy-node-text"><ProxyNodeName text={exitChangeReason(d.egress, t, language)} /></p>}<p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
       {tab==='hardware' && <HardwarePanel device={d} refreshDevices={refreshDevices} showToast={showToast} focusImei={focusImei} onSetup={openSetup}/>}
     </section></div>
@@ -400,6 +406,35 @@ export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, 
 // The modem's own VoLTE/IMS on the cellular network — separate from the VoWiFi line. Carriers
 // with no circuit-switched fallback on LTE (China Telecom, for one) carry 4G calls and texts
 // only over IMS, so with it off every text fails and callers hear "switched off".
+// Whether cellular call audio can reach the gateway at all. Read-only: answering a cellular call
+// works on most modems, but auto-answer, recording and browser calls need the audio too, and
+// some customised firmware (a DJI EG25-G) connects calls that stay silent in both directions.
+function ModemVoiceAudioPanel({ device }) {
+  const { t } = useI18n()
+  const [voice, setVoice] = useState(null)
+  useEffect(() => {
+    if (device.present === false) return
+    let live = true
+    api.getDeviceVoiceAudio(device.id).then(value => { if (live) setVoice(value) })
+      .catch(e => { if (live) setVoice({ status: 'unknown', reason: e.message }) })
+    return () => { live = false }
+  }, [device.id, device.present])
+  if (!voice) return null
+  const state = voice.status === 'supported' ? 'on' : voice.status === 'unsupported' ? 'unsupported' : 'off'
+  const transports = (voice.transports || []).map(item => t(`voice.transport.${item}`)).join(t('list separator'))
+  return <div className="u-note" style={{ marginTop: 12 }}>
+    <div className="u-capability compact">
+      <div><b>{t('Cellular call audio')}</b>
+        <div className="u-cap-detail">{voice.status === 'supported'
+          ? t('This modem can hand call audio to the gateway ({transports}). Cellular auto-answer and recording are not available yet.', { transports })
+          : t(voice.reason || 'Unknown')}</div>
+        {voice.firmware && <div className="u-cap-detail">{t('Firmware')}: {voice.firmware}</div>}
+      </div>
+      <div className="u-cap-actions"><Badge state={state}>{voice.status === 'supported' ? t('Supported') : voice.status === 'unsupported' ? t('cap.unsupported') : t('Unknown')}</Badge></div>
+    </div>
+  </div>
+}
+
 function ModemImsPanel({ device, showToast }) {
   const { t } = useI18n()
   const [ims, setIms] = useState(null)

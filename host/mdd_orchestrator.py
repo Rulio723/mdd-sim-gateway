@@ -36,6 +36,13 @@ try:
 except ImportError:  # pragma: no cover - installer provides PyYAML
     yaml = None
 
+
+def load_yaml_text(text: str) -> dict:
+    """Parse with libyaml when PyYAML has it: the same safe schema, far less CPU. The country
+    egress re-reads a subscription of hundreds of nodes every few seconds."""
+    loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    return yaml.load(text, Loader=loader) or {}
+
 # 0x8C7B (35963) is vpcd's own default port, which the distribution package hands to its
 # "Virtual PCD" reader. Two pcscd readers cannot listen on one port, so sharing that base
 # made the modem readers and the packaged reader fight over it — directory order decided
@@ -1936,7 +1943,7 @@ class Orchestrator:
     def reconcile_timezone(self):
         """Apply the validated WebUI timezone to the host without changing its hostname."""
         try:
-            document = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+            document = load_yaml_text((self.data / "config.yaml").read_text())
             timezone = str((document.get("settings") or {}).get("timezone") or "").strip()
         except Exception:
             return
@@ -1979,7 +1986,18 @@ class Orchestrator:
                     raise
         if yaml is None:
             raise RuntimeError("PyYAML is required for subscription mode")
-        return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
+        # The cache only changes on a refresh (every refresh_minutes), but this runs on every
+        # reconcile pass. Keep the parsed document until the file changes; hand out a copy so
+        # the proxy builders can never edit the cached one.
+        stat = cache.stat()
+        key = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        parsed = getattr(self, "_subscription_docs", None)
+        if parsed is None:
+            parsed = self._subscription_docs = {}
+        entry = parsed.get(str(cache))
+        if entry is None or entry[0] != key:
+            entry = parsed[str(cache)] = (key, load_yaml_text(cache.read_text(encoding="utf-8")))
+        return deepcopy(entry[1])
 
     def xray_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
         """Register one loopback-only Xray endpoint and return its sing-box detour."""
@@ -2932,6 +2950,21 @@ class Orchestrator:
                  "it collides with this gateway's per-modem virtual readers")
         return True
 
+    @staticmethod
+    def reader_config_unreadable(config_path: Path) -> bool:
+        """Whether an unprivileged pcscd would be unable to read the reader definitions.
+
+        This service runs with UMask=0077, so a freshly created definition file is 0600
+        root. pcscd running as root never noticed; distributions whose pcscd.service drops
+        to its own user (Ubuntu 26.04) silently skip the file and no modem reader appears.
+        Files written by earlier releases keep that mode, and their content already matches,
+        so the mode has to be checked on its own for an upgrade to repair them.
+        """
+        try:
+            return (config_path.stat().st_mode & 0o044) != 0o044
+        except OSError:
+            return False
+
     def reconcile_hardware(self, desired: dict, desired_devices: dict,
                            through_modemmanager=False) -> dict:
         hardware = (desired.get("hardware") or {})
@@ -2985,10 +3018,12 @@ class Orchestrator:
         legacy_config = config_path.with_name("vowifi-modems")
         legacy_present = legacy_config.exists() and legacy_config != config_path
         distro_disabled = self.disable_distro_vpcd_reader(config_path)
-        if reader_config != self.last_reader_config or distro_disabled:
+        unreadable = self.reader_config_unreadable(config_path)
+        if reader_config != self.last_reader_config or distro_disabled or unreadable:
             if not self.dry_run:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 config_path.write_text(reader_config, encoding="utf-8")
+                os.chmod(config_path, 0o644)
                 if legacy_present:
                     legacy_config.unlink(missing_ok=True)
                 (self.root / "pcsc-maintenance").write_text(str(int(time.time())), encoding="ascii")
@@ -3099,7 +3134,7 @@ class Orchestrator:
             # hardware lives beside proxy in settings; desired v1 publishers may omit it.
             if not desired.get("hardware"):
                 try:
-                    conf = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+                    conf = load_yaml_text((self.data / "config.yaml").read_text())
                     desired["hardware"] = (conf.get("settings") or {}).get("hardware") or {}
                 except Exception:
                     pass

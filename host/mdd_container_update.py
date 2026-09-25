@@ -195,7 +195,49 @@ def compose_location(compose: Path) -> tuple[Path, Path]:
     return compose, compose.parent
 
 
-def compose_up(compose: Path, wait) -> None:
+# How long a base container may take to exit once asked to stop. Docker's own stop gives up
+# about ten seconds after SIGKILL, and Compose then aborts the recreate.
+STOP_SECONDS = 120
+
+
+def settle_services(client, services) -> None:
+    """Stop the named base services ourselves and wait until they have really exited.
+
+    On the DS1621+ a Hardware container once took 32 s to exit, 22 s of them after SIGKILL
+    (a process stuck in the kernel on modem I/O). Docker reported "tried to kill container,
+    but did not receive an exit event", Compose aborted with the new container left under a
+    temporary `<id>_` name, and the rollback then failed because the old container still held
+    the service name. Waiting here, and removing temporaries a failed recreate left behind,
+    lets Compose find only stopped containers, which it replaces without killing anything.
+    """
+    for service in services:
+        name = f"mdd-sim-gateway-{service}"
+        found = client.containers.list(all=True, filters={"label": [
+            "com.docker.compose.project=mdd-sim-gateway",
+            f"com.docker.compose.service={service}"]})
+        for container in found:
+            if container.name != name:
+                container.remove(force=True)
+                continue
+            try:
+                container.stop(timeout=30)
+            except docker.errors.APIError:
+                pass  # the deadline below decides whether it actually exited
+            deadline = time.monotonic() + STOP_SECONDS
+            while True:
+                try:
+                    container.reload()
+                except docker.errors.NotFound:
+                    break
+                if not (container.attrs.get("State") or {}).get("Running"):
+                    break
+                if time.monotonic() >= deadline:
+                    raise mdd_update.UpdateError(
+                        f"{name} did not exit within {STOP_SECONDS} s of being stopped")
+                time.sleep(2)
+
+
+def compose_up(compose: Path, wait, client=None) -> None:
     """Recreate the base services in dependency order, waiting on this helper's clock.
 
     Control declares `depends_on: {condition: service_healthy}` on Hardware, and Compose
@@ -212,9 +254,13 @@ def compose_up(compose: Path, wait) -> None:
                "--project-directory", str(project_dir),
                "up", "-d", "--no-build", "--force-recreate", "--no-deps"]
     environment = compose_environment()
+    if client is not None:
+        settle_services(client, ("hardware", "egress"))
     run([*command, "hardware", "egress"], cwd=project_dir, timeout=600, env=environment)
     wait("hardware")
     wait("egress")
+    if client is not None:
+        settle_services(client, ("control",))
     run([*command, "control"], cwd=project_dir, timeout=600, env=environment)
 
 
@@ -382,7 +428,7 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
             wait_container(client, f"mdd-sim-gateway-{component}", image_ids[component],
                            timeout=WAIT_SECONDS.get(component, 180))
 
-        compose_up(compose, wait_new)
+        compose_up(compose, wait_new, client)
         wait_new("control")
         roll_engines(client, image_ids["engine"], status)
         # Release validation: `touch <data>/update/fail-after-switch` makes the next update
@@ -411,7 +457,7 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
                                    old_base_ids[component],
                                    timeout=WAIT_SECONDS.get(component, 180))
 
-                compose_up(compose, wait_old)
+                compose_up(compose, wait_old, client)
                 wait_old("control")
                 for name, old_image_id in old_engine_ids.items():
                     try:

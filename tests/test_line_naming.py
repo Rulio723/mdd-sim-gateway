@@ -147,6 +147,37 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
         restart.assert_not_called()
         publish.assert_called_once_with()
 
+    async def test_a_webui_rename_with_a_padded_mnc_and_live_reader_does_not_restart(self):
+        """Seen on the NAS with rc9: renaming line 4 also saved mnc "15" -> "015" (the form pads
+        it) and reader_index 5 -> 1 (the list shows the live index), and the line restarted."""
+        with TempConfig() as cfg_temp:
+            before = cfg_temp.add("4", "234-15-6315", mcc="234", mnc="15", reader_index=5,
+                                  reader_port="1-3.4.1")
+            with patch.object(main.engine, "is_running", return_value=True), \
+                    patch.object(main, "_reader_index_for_instance", return_value=1), \
+                    patch.object(main, "_reader_port_for_instance", return_value="1-3.4.1"), \
+                    patch.object(main, "_start_engine_checked") as restart, \
+                    patch.object(main.egress, "publish"):
+                renamed = await main.api_instance_upsert(
+                    {**before, "name": "voxi-THB", "mnc": "015", "reader_index": 1})
+
+        self.assertFalse(renamed["applied"])
+        restart.assert_not_called()
+
+    def test_a_reader_index_other_than_the_live_one_is_still_an_edit(self):
+        before = {"id": "4", "name": "a", "reader_index": 5}
+        self.assertFalse(main._only_instance_name_changed(
+            before, {**before, "name": "b", "reader_index": 2}, {"reader_index": 1}))
+        self.assertFalse(main._only_instance_name_changed(
+            before, {**before, "name": "b", "reader_index": 1}, {}))
+
+    def test_a_different_mnc_is_still_an_edit(self):
+        before = {"id": "4", "name": "a", "mcc": "234", "mnc": "15"}
+        self.assertTrue(main._only_instance_name_changed(
+            before, {**before, "name": "b", "mnc": "015"}))
+        self.assertFalse(main._only_instance_name_changed(
+            before, {**before, "name": "b", "mnc": "10"}))
+
     def test_an_operational_edit_is_not_treated_as_a_rename(self):
         before = {"id": "1", "name": "Old name", "proxy_country": "gb"}
         self.assertFalse(main._only_instance_name_changed(

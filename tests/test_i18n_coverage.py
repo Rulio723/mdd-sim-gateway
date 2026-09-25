@@ -68,6 +68,13 @@ class BackendStringCoverageTests(unittest.TestCase):
         self.assertTrue(translated("VoWiFi is enabled but no configured line is running",
                                    zh_block()))
 
+    def test_every_modem_voice_reason_is_translated(self):
+        from control.app import modem_voice
+        block = zh_block()
+        missing = [key for key, text in modem_voice.REASONS.items()
+                   if not translated(text, block)]
+        self.assertEqual(missing, [], f"untranslated call-audio reasons: {missing}")
+
     def test_every_status_label_is_translated(self):
         block = zh_block()
         missing = [code for code, text in status_mod.LABELS.items()

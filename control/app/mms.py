@@ -300,12 +300,42 @@ def create_outgoing(instance: str, recipients: list[str], text: str, attachments
     return store.get_message(rec["id"])
 
 
-def send(inst: dict, message_id: int, *, client=None, runner=subprocess.run) -> dict:
+# Waits before submitting again after an attempt that cannot have reached the MMSC whole.
+SEND_RETRY_DELAYS = (3, 10)
+
+
+def _submit(inst: dict, settings: dict, client, runner, request: bytes, message_id: int,
+            sleep) -> "mms_transport.HttpResponse":
+    """POST an m-send-req, again on a fresh connection while an attempt failed before the
+    MMSC could have received all of it. The modem's MMSC socket occasionally refuses a chunk
+    part way through an upload; the same message sent a moment later goes through."""
+    for attempt in range(len(SEND_RETRY_DELAYS) + 1):
+        try:
+            with _exchange(inst, settings, client, runner) as exchange:
+                return exchange.request(
+                    "POST", settings["mmsc"], body=request,
+                    headers=_request_headers(settings, mms_transport.MMS_CONTENT_TYPE),
+                    timeout=max(180.0, len(request) / 100.0))
+        except mms_transport.MmsTransportError as exc:
+            if not (exc.unsent and exc.retryable and not exc.after_send) \
+                    or attempt == len(SEND_RETRY_DELAYS):
+                raise
+            delay = SEND_RETRY_DELAYS[attempt]
+            log.info("MMS %s did not reach the MMSC whole (%s); submitting again in %s s",
+                     message_id, exc, delay)
+            sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def send(inst: dict, message_id: int, *, client=None, runner=subprocess.run,
+         sleep=time.sleep) -> dict:
     """Submit one stored outgoing MMS to the MMSC.
 
     The result is "sent" once the MMSC accepts it (m-send-conf OK), "failed" when it refuses
     or nothing reached it, and "unknown" when the request went out but no answer came back --
-    never retried automatically, since a second submission would deliver a second MMS.
+    never retried automatically, since a second submission would deliver a second MMS. An
+    attempt that stopped before the MMSC could have received the whole request is retried
+    (SEND_RETRY_DELAYS) before the MMS is marked failed.
     """
     row = store.mms_for_download(message_id)
     if not row or row["direction"] != "out":
@@ -319,11 +349,7 @@ def send(inst: dict, message_id: int, *, client=None, runner=subprocess.run) -> 
         if too_big:
             store.set_mms_state(message_id, "failed", error=too_big, message_status="failed")
             return {"ok": False, "status": "failed", "error": too_big}
-        with _exchange(inst, settings, client, runner) as client:
-            response = client.request(
-                "POST", settings["mmsc"], body=request,
-                headers=_request_headers(settings, mms_transport.MMS_CONTENT_TYPE),
-                timeout=max(180.0, len(request) / 100.0))
+        response = _submit(inst, settings, client, runner, request, message_id, sleep)
         if response.status != 200:
             raise mms_transport.MmsTransportError(f"the MMSC answered HTTP {response.status}",
                                                   after_send=True)

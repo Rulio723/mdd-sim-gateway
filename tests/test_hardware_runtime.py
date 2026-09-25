@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from runtime.hardware import HardwareSupervisor, kernel_objects
 
@@ -430,6 +430,270 @@ class HardwareRuntimeTests(unittest.TestCase):
         app.command.assert_called_once_with(
             "mmcli", "-m", "/org/freedesktop/ModemManager1/Modem/0", "--reset")
         app.terminate_qmi_proxy.assert_called_once_with()
+
+    def unclaimed_modem_app(self):
+        """A supervisor whose one modem is present but has no ModemManager object."""
+        app = HardwareSupervisor()
+        app.assert_networkmanager_isolated = Mock()
+        app.desired_devices = Mock(return_value={
+            "modem-a": {"cellular_enabled": True, "vowifi_enabled": True,
+                        "flight_mode": False}})
+        app.modem_snapshot = Mock(return_value={
+            "available": False, "registration": "unknown", "data_active": False})
+        app.command = Mock(return_value=Mock(returncode=0, stdout=""))
+        app.ensure_modem_data = Mock(return_value=False)
+        app.disconnect_modem_data = Mock(return_value=False)
+        app.log = Mock()
+        return app
+
+    def pass_at(self, app, now, port_class):
+        with patch("runtime.hardware.Path.glob", return_value=[]), \
+                patch("runtime.hardware.time.monotonic", return_value=now), \
+                patch("runtime.hardware.ATPort", port_class):
+            app.reconcile_cellular([{"id": "modem-a", "tty": "/dev/ttyUSB2"}], [])
+
+    @staticmethod
+    def fake_port():
+        port_class = MagicMock()
+        port = port_class.return_value.__enter__.return_value
+        port.read.return_value = b"\r\nOK\r\n"
+        return port_class, port
+
+    def test_unclaimed_modem_is_left_alone_while_modemmanager_may_still_probe_it(self):
+        app = self.unclaimed_modem_app()
+        port_class, _port = self.fake_port()
+
+        self.pass_at(app, 5.0, port_class)
+        self.pass_at(app, 5.0 + 119, port_class)
+
+        port_class.assert_not_called()
+        self.assertEqual(app.unclaimed_since, {"modem-a": 5.0})
+
+    def test_modem_modemmanager_gave_up_on_is_reset_through_its_at_port(self):
+        """The EC25 whose QMI port timed out at enumeration: no object, 4G never came up."""
+        app = self.unclaimed_modem_app()
+        port_class, port = self.fake_port()
+        app.forget_mmcli_details = Mock()
+
+        self.pass_at(app, 5.0, port_class)
+        self.pass_at(app, 5.0 + 120, port_class)
+
+        port_class.assert_called_once()
+        self.assertEqual(port_class.call_args.args[0], "/dev/ttyUSB2")
+        self.assertFalse(port_class.call_args.kwargs["exclusive"])
+        port.write.assert_called_once_with(b"AT+CFUN=1,1\r")
+        app.forget_mmcli_details.assert_called()
+        # The reset re-enumerates the modem; there is nothing to configure on this pass.
+        app.ensure_modem_data.assert_called_once()
+
+    def test_unclaimed_modem_reset_is_rate_limited(self):
+        app = self.unclaimed_modem_app()
+        port_class, port = self.fake_port()
+
+        self.pass_at(app, 5.0, port_class)
+        self.pass_at(app, 125.0, port_class)
+        # Still unclaimed after the reset: the grace period elapses again, but the last
+        # reset was under five minutes ago.
+        self.pass_at(app, 250.0, port_class)
+        self.pass_at(app, 424.0, port_class)
+        self.assertEqual(port.write.call_count, 1)
+
+        self.pass_at(app, 425.0, port_class)
+        self.assertEqual(port.write.call_count, 2)
+
+    def test_grace_clock_clears_once_modemmanager_claims_the_modem(self):
+        app = self.unclaimed_modem_app()
+        port_class, _port = self.fake_port()
+
+        self.pass_at(app, 5.0, port_class)
+        self.assertIn("modem-a", app.unclaimed_since)
+
+        app.modem_snapshot.return_value = {
+            "available": True, "mm_object": "/org/freedesktop/ModemManager1/Modem/0",
+            "network_interface": "wwan0", "radio_enabled": True,
+            "registration": "home", "data_active": True}
+        self.pass_at(app, 60.0, port_class)
+        self.assertNotIn("modem-a", app.unclaimed_since)
+
+        # Losing the object again starts a new grace period rather than resuming the old one.
+        app.modem_snapshot.return_value = {
+            "available": False, "registration": "unknown", "data_active": False}
+        self.pass_at(app, 130.0, port_class)
+        port_class.assert_not_called()
+        self.assertEqual(app.unclaimed_since, {"modem-a": 130.0})
+
+    def test_grace_clock_clears_when_the_modem_disappears(self):
+        app = self.unclaimed_modem_app()
+        port_class, _port = self.fake_port()
+
+        self.pass_at(app, 5.0, port_class)
+        with patch("runtime.hardware.Path.glob", return_value=[]):
+            app.reconcile_cellular([], [])
+        self.assertEqual(app.unclaimed_since, {})
+
+    def test_a_serial_error_during_the_reset_does_not_escape_reconcile(self):
+        import serial
+
+        app = self.unclaimed_modem_app()
+        for error in (serial.SerialException("could not open port /dev/ttyUSB2"),
+                      OSError(71, "Protocol error"), RuntimeError("unexpected")):
+            with self.subTest(error=type(error).__name__):
+                app.unclaimed_since.clear()
+                app.unclaimed_reset_at.clear()
+                app.log.reset_mock()
+                port_class = Mock(side_effect=error)
+
+                self.pass_at(app, 5.0, port_class)
+                self.pass_at(app, 125.0, port_class)
+
+                port_class.assert_called_once()
+                self.assertIn("failed", app.log.call_args.args[0])
+                # A failed attempt still counts against the rate limit.
+                self.pass_at(app, 250.0, port_class)
+                port_class.assert_called_once()
+
+    def test_a_port_that_vanishes_after_the_write_still_counts_as_a_reset(self):
+        """CFUN=1,1 drops the modem off the bus, which can fail the read or the close."""
+        app = self.unclaimed_modem_app()
+        app.forget_mmcli_details = Mock()
+        port_class, port = self.fake_port()
+        port.read.side_effect = OSError(5, "Input/output error")
+
+        self.pass_at(app, 5.0, port_class)
+        self.pass_at(app, 125.0, port_class)
+
+        port.write.assert_called_once_with(b"AT+CFUN=1,1\r")
+        app.forget_mmcli_details.assert_called()
+        self.assertIn("sent", app.log.call_args.args[0])
+
+    def test_at_port_tolerates_missing_modem_control_lines(self):
+        import errno
+        import serial
+
+        from runtime.hardware import ATPort
+
+        for code in (errno.EPROTO, errno.ENOTTY):
+            with patch.object(serial.Serial, "_update_dtr_state",
+                              side_effect=OSError(code, "control")), \
+                    patch.object(serial.Serial, "_update_rts_state",
+                                 side_effect=OSError(code, "control")):
+                port = ATPort.__new__(ATPort)
+                port._update_dtr_state()
+                port._update_rts_state()
+        with patch.object(serial.Serial, "_update_dtr_state",
+                          side_effect=OSError(errno.EIO, "io")):
+            with self.assertRaises(OSError):
+                ATPort.__new__(ATPort)._update_dtr_state()
+
+
+
+class ModemProfileTests(unittest.TestCase):
+    """The container read modem profiles from config.json, a file Control never writes, so
+    every modem was named "Cellular modem" where the native install showed its model."""
+
+    def test_without_a_config_the_built_in_profile_names_the_dji_module(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = HardwareSupervisor(data_path=Path(temp))
+            self.assertEqual(app.modem_profiles(), [("2c7c", "0125", 2, "DJI/Quectel EC25")])
+
+    def test_profiles_and_names_come_from_config_yaml(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            (data / "config.yaml").write_text(
+                "hardware:\n  modem_profiles:\n"
+                "  - {name: Quectel EG25-G, vid: 2C7C, pid: '0125', at_interface: 3}\n"
+                "  - {vid: 1e0e, pid: '9001'}\n")
+            app = HardwareSupervisor(data_path=data)
+            self.assertEqual(app.modem_profiles(), [("2c7c", "0125", 3, "Quectel EG25-G"),
+                                                    ("1e0e", "9001", 2, "")])
+
+    def test_an_unreadable_config_keeps_the_built_in_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            (data / "config.yaml").write_text("hardware: [unterminated\n")
+            app = HardwareSupervisor(data_path=data)
+            self.assertEqual(app.modem_profiles()[0][3], "DJI/Quectel EC25")
+
+    def test_the_config_is_parsed_again_only_after_it_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            path = data / "config.yaml"
+            path.write_text("hardware:\n  modem_profiles: [{name: A, vid: '1', pid: '2'}]\n")
+            app = HardwareSupervisor(data_path=data)
+            with patch("runtime.hardware.yaml.load", wraps=__import__("yaml").load) as load:
+                app.modem_profiles()
+                app.modem_profiles()
+                self.assertEqual(load.call_count, 1)
+                path.write_text("hardware:\n  modem_profiles: [{name: Bee, vid: '1', pid: '2'}]\n")
+                self.assertEqual(app.modem_profiles()[0][3], "Bee")
+                self.assertEqual(load.call_count, 2)
+
+
+class AdaptiveCadenceTests(unittest.TestCase):
+    """A pass forks mmcli/nmcli per modem. At a fixed 3 s cadence that was about a fifth of a
+    Raspberry Pi core for a modem nobody was touching."""
+
+    def run_wait(self, app, signatures):
+        clock = [0.0]
+        with patch("runtime.hardware.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("runtime.hardware.time.sleep",
+                      side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                patch.object(app, "wake_signature", side_effect=signatures):
+            app.wait_for_next_pass()
+        return clock[0]
+
+    def test_a_settled_plane_waits_the_idle_interval(self):
+        from runtime import hardware
+        app = HardwareSupervisor(interval=3.0)
+        app.settled = True
+        waited = self.run_wait(app, lambda: "same")
+        self.assertGreaterEqual(waited, hardware.IDLE_INTERVAL - 0.11)
+        self.assertLess(waited, hardware.IDLE_INTERVAL + 0.2)
+
+    def test_a_change_wakes_the_next_pass_at_once(self):
+        app = HardwareSupervisor(interval=3.0)
+        app.settled = True
+        calls = iter(["before", "before", "after"])
+        waited = self.run_wait(app, lambda: next(calls, "after"))
+        self.assertLess(waited, 1.2)
+
+    def test_work_in_flight_keeps_the_fast_cadence(self):
+        app = HardwareSupervisor(interval=3.0)
+        app.settled = False
+        signature = Mock(return_value="same")
+        clock = [0.0]
+        with patch("runtime.hardware.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("runtime.hardware.time.sleep",
+                      side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                patch.object(app, "wake_signature", signature):
+            app.wait_for_next_pass()
+        self.assertLess(clock[0], 3.2)
+        signature.assert_not_called()
+
+    def test_stopping_ends_the_wait(self):
+        app = HardwareSupervisor(interval=3.0)
+        app.settled = True
+        app.stop = True
+        self.assertEqual(self.run_wait(app, lambda: "same"), 0.0)
+
+    def test_the_signature_sees_a_new_kernel_device_and_a_bridge_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = HardwareSupervisor(data_path=Path(temp))
+            process = Mock(); process.poll.return_value = None
+            app.bridges = {"modem-a": process}
+            with patch("runtime.hardware.kernel_objects", return_value={("tty", "ttyUSB2")}):
+                before = app.wake_signature()
+            with patch("runtime.hardware.kernel_objects",
+                       return_value={("tty", "ttyUSB2"), ("tty", "ttyUSB3")}):
+                self.assertNotEqual(app.wake_signature(), before)
+            process.poll.return_value = 1
+            with patch("runtime.hardware.kernel_objects", return_value={("tty", "ttyUSB2")}):
+                self.assertNotEqual(app.wake_signature(), before)
+
+    def test_the_idle_interval_leaves_room_for_the_health_check(self):
+        from runtime import hardware
+        # Dockerfile.hardware fails the check when status.json is older than 15 s.
+        self.assertLessEqual(hardware.IDLE_INTERVAL + 5, 15)
 
 
 if __name__ == "__main__":

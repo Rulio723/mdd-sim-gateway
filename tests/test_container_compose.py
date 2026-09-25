@@ -78,7 +78,10 @@ class ContainerComposeTests(unittest.TestCase):
         self.assertIn("host/mdd_container_update.py", dockerfile)
         self.assertIn("docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose",
                       dockerfile)
-        self.assertIn("HEALTHCHECK --interval=10s", dockerfile)
+        self.assertIn("HEALTHCHECK --interval=30s", dockerfile)
+        # Docker before 25 fails the whole build on this flag; install.sh builds with the
+        # host's Docker (Debian 12 ships 20.10, DSM 24).
+        self.assertNotRegex(dockerfile, r"HEALTHCHECK[^\n]*--start-interval")
 
     def test_an_operator_owned_data_directory_can_be_used(self):
         """A folder created in File Station belongs to the operator's account with mode
