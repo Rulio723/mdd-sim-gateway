@@ -97,6 +97,31 @@ class ContainerDownloadRouteTests(unittest.TestCase):
 
 
 class ContainerComposeOrderTests(unittest.TestCase):
+    def test_compose_runs_from_the_host_path_so_the_nas_can_manage_the_containers(self):
+        """Run from /data, Compose labelled the containers `/data/compose.yaml`, a path that
+        does not exist on the NAS, and Container Manager sent every stop or delete for
+        container "undefined"."""
+        commands = []
+        with tempfile.TemporaryDirectory() as host:
+            (Path(host) / "compose.yaml").write_text("services: {}\n")
+            with patch.dict(os.environ, {"MDD_HOST_DATA": host}), \
+                    patch.object(mdd_container_update, "run",
+                                 side_effect=lambda command, **kwargs: commands.append(
+                                     (command, kwargs["cwd"]))):
+                mdd_container_update.compose_up(Path("/data/compose.yaml"), lambda _c: None)
+        for command, cwd in commands:
+            self.assertEqual(command[command.index("-f") + 1], f"{host}/compose.yaml")
+            self.assertEqual(command[command.index("--project-directory") + 1], host)
+            self.assertEqual(str(cwd), host)
+
+    def test_an_old_launcher_without_the_host_mount_still_works(self):
+        commands = []
+        with patch.dict(os.environ, {"MDD_HOST_DATA": "/does/not/exist"}), \
+                patch.object(mdd_container_update, "run",
+                             side_effect=lambda command, **kwargs: commands.append(command)):
+            mdd_container_update.compose_up(Path("/data/compose.yaml"), lambda _c: None)
+        self.assertEqual(commands[0][commands[0].index("-f") + 1], "/data/compose.yaml")
+
     def test_control_starts_only_after_our_own_wait_for_hardware(self):
         """Compose's service_healthy gate gave up on the first unhealthy report, which a
         Hardware start recovering a stale QMI session always produces."""
@@ -186,7 +211,11 @@ class ContainerUpdateLaunchTests(unittest.TestCase):
             create = client.containers.create.call_args
             self.assertEqual(create.args[0], "sha256:control")
             self.assertEqual(create.kwargs["network"], "mdd-uplink")
-            self.assertEqual(create.kwargs["volumes"]["/volume1/docker/mdd"]["bind"], "/data")
+            volumes = create.kwargs["volumes"]
+            self.assertIn("/volume1/docker/mdd:/data:rw", volumes)
+            # Also at its host path, so Compose labels match Container Manager's.
+            self.assertIn("/volume1/docker/mdd:/volume1/docker/mdd:rw", volumes)
+            self.assertEqual(create.kwargs["environment"]["MDD_HOST_DATA"], "/volume1/docker/mdd")
             self.assertIn("/app/host/mdd_container_update.py", create.kwargs["command"])
             client.networks.get.assert_called_once_with("mdd-engine")
             network.connect.assert_called_once_with(helper)

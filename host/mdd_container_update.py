@@ -179,6 +179,22 @@ def compose_environment() -> dict:
     return {name: os.environ[name] for name in COMPOSE_ENVIRONMENT if name in os.environ}
 
 
+def compose_location(compose: Path) -> tuple[Path, Path]:
+    """The Compose file and project directory as the Docker host names them.
+
+    Compose stamps every container with its project directory and file path, and Synology
+    Container Manager uses those labels to tie containers to a project. Run from this
+    helper's /data mount they read `/data/compose.yaml`, a path that exists nowhere on the
+    NAS: the containers still showed the project name, but every stop or delete in the UI
+    was sent for container "undefined", and the operator had to clean up over SSH. The
+    launcher also mounts the data directory at its own host path; use it when present.
+    """
+    host = os.environ.get("MDD_HOST_DATA", "").strip()
+    if host.startswith("/") and (Path(host) / compose.name).is_file():
+        return Path(host) / compose.name, Path(host)
+    return compose, compose.parent
+
+
 def compose_up(compose: Path, wait) -> None:
     """Recreate the base services in dependency order, waiting on this helper's clock.
 
@@ -191,13 +207,15 @@ def compose_up(compose: Path, wait) -> None:
     wait(), whose deadline is long enough for that recovery, including when rolling back
     to an image whose own grace period is still the short one.
     """
-    command = ["docker", "compose", "-p", "mdd-sim-gateway", "-f", str(compose),
+    compose_file, project_dir = compose_location(compose)
+    command = ["docker", "compose", "-p", "mdd-sim-gateway", "-f", str(compose_file),
+               "--project-directory", str(project_dir),
                "up", "-d", "--no-build", "--force-recreate", "--no-deps"]
     environment = compose_environment()
-    run([*command, "hardware", "egress"], cwd=compose.parent, timeout=600, env=environment)
+    run([*command, "hardware", "egress"], cwd=project_dir, timeout=600, env=environment)
     wait("hardware")
     wait("egress")
-    run([*command, "control"], cwd=compose.parent, timeout=600, env=environment)
+    run([*command, "control"], cwd=project_dir, timeout=600, env=environment)
 
 
 def docker_root_free_bytes(client) -> int:

@@ -127,17 +127,10 @@ Hardware 以显式 capability 运行 NetworkManager，只允许它管理 `wwan*`
 不需要安装 PC/SC 服务。DSM 必须先提供匹配内核的串口和 QMI 驱动；当前 DS1621+ 验证版本见
 `synology-v1000-7.4-modules.json`。
 
-对清单中的 DS1621+ / DSM 7.4.1-90080，可将已经构建并核验的模块安装为 DSM
-启动脚本：
-
-```sh
-python tools/container-runtime/install_synology_modules.py \
-  --host USER@NAS --port SSH_PORT --identity /path/to/key
-```
-
+对清单中的 DS1621+ / DSM 7.4.1-90080，使用随 Release 发布的驱动包安装（见部署指南第 2 节）。
+本地重建驱动包：`sh tools/drivers/build-synology-pack.sh dist`（Linux x86_64，需要写 `/work`）。
 加载器每次启动都检查架构、内核、DSM build、平台标记和全部模块 SHA256；任一项不符
-即拒绝加载。`--uninstall` 删除下次启动的加载器和持久文件，不强行卸载正在使用的模块。
-DSM 升级后必须重新构建和验证，不能绕过版本检查。
+即拒绝加载。DSM 升级后必须重新构建和验证，不能绕过版本检查。
 
 ## 晚上插入设备后
 
@@ -169,7 +162,7 @@ docker compose -f runtime/compose.yaml up -d --no-build
 固定为对应 Release 标签。群晖用户可以把该 YAML 直接粘贴到 Container Manager 新项目，
 把文件开头标出的示例 LAN 地址改成自己的 NAS 地址，按需修改数据目录、管理端口和 NAS
 域名映射后启动；不需要额外的 `.env` 或应用安装脚本。只有宿主没有生成所需设备节点时，
-才需要在宿主单独安装完全匹配的驱动；当前 Release 还没有提供可安装的驱动资产。
+才需要在宿主单独安装完全匹配的驱动；DS1621+ 的驱动包随 Release 发布。
 
 常驻容器为 Control、Hardware、Egress，加每条已启用线路一个 Engine，即 `3 + N`。
 Control 只发布管理端口；Hardware 和 Egress 不发布宿主端口。Engine 的国家 SOCKS

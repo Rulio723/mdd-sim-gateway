@@ -443,6 +443,28 @@ class HardwareSupervisor:
         return match.group(1).strip() if match else ""
 
     @staticmethod
+    def normalize_iccid(value):
+        """Same rule as host/mdd_orchestrator.py (not shipped in this image): mmcli
+        renders an unreadable property as "--", which must mean unknown, not an ICCID."""
+        text = str(value or "").strip()
+        if not text or text.casefold() in {"--", "unknown", "none", "n/a"}:
+            return ""
+        digits = re.sub(r"\D", "", text)
+        return digits if digits.startswith("89") and 18 <= len(digits) <= 20 else ""
+
+    @staticmethod
+    def normalize_msisdn(value):
+        """Same rule as host/mdd_orchestrator.py: never persist a driver placeholder."""
+        text = str(value or "").strip()
+        if not text or text in {"--", "unknown", "none"}:
+            return ""
+        if not re.fullmatch(r"\+?[0-9 ()-]+", text):
+            return ""
+        number = ("+" if text.startswith("+") else "") + re.sub(r"\D", "", text)
+        digits = number.lstrip("+")
+        return number if 5 <= len(digits) <= 20 else ""
+
+    @staticmethod
     def cellular_profile_name(device_id):
         digest = hashlib.sha256(device_id.encode("utf-8")).hexdigest()[:12]
         return f"mdd-cell-{digest}"
@@ -580,6 +602,20 @@ class HardwareSupervisor:
             r"modem\.generic\.ports\.value\[\d+\]\s*:\s*([^ ]+) \(([^)]+)\)", text)
         network_port = next((name for name, kind in ports if kind == "net"), "")
         signal = self._kv(text, "modem.generic.signal-quality.value")
+        own_numbers = re.findall(
+            r"^modem\.generic\.own-numbers\.value\[\d+\]\s*:\s*(.*?)\s*$",
+            text, re.MULTILINE)
+        msisdn = next((number for raw in own_numbers
+                       if (number := self.normalize_msisdn(raw))), "")
+        # The control plane decides "SIM inserted" from the VPCD reader or from this ICCID.
+        # Without it, any bridge failure made a registered modem read as having no SIM.
+        sim_iccid = ""
+        sim_object = self._kv(text, "modem.generic.sim")
+        if sim_object and sim_object not in {"--", "/"}:
+            sim_detail = self.mmcli_keyvalue("-i", sim_object)
+            if sim_detail.returncode == 0:
+                sim_iccid = self.normalize_iccid(
+                    self._kv(sim_detail.stdout or "", "sim.properties.iccid"))
         snapshot = {
             "available": True, "mm_object": obj, "powered": power == "on",
             "radio_enabled": power == "on" and state not in {
@@ -592,6 +628,8 @@ class HardwareSupervisor:
             "data_active": state == "connected", "apn": "", "ip": "",
             "rx_bytes": 0, "tx_bytes": 0,
             "profile": self.cellular_profile_name(modem["id"]),
+            # Sensitive; support bundles redact both by key.
+            "msisdn": msisdn, "sim_iccid": sim_iccid,
         }
         bearer_paths = re.findall(
             r"modem\.generic\.bearers\.value\[\d+\]\s*:\s*(\S+)", text)
@@ -758,7 +796,7 @@ class HardwareSupervisor:
         self.cellular_states = {key: value for key, value in self.cellular_states.items()
                                 if key in live}
 
-    def publish_control_state(self, discovered, ready_ids):
+    def publish_control_state(self, discovered, ready_ids, bridge_errors=None):
         """Publish the subset of the host-orchestrator contract this container owns.
 
         NetworkManager is restricted to modem interfaces and every GSM profile is
@@ -788,6 +826,15 @@ class HardwareSupervisor:
                 "usb_path": modem["usb_path"], "vid": modem["vid"], "pid": modem["pid"],
             }
             assignments[device_id] = assignment
+            bridge_error = (bridge_errors or {}).get(device_id, "") if not ready else ""
+            if bridge_error:
+                # Name the card problem instead of "starting": the page otherwise showed a
+                # registered modem with a working bearer as stuck starting, forever.
+                error = f"SIM card access failed: {bridge_error}"
+            elif ready and cellular.get("available"):
+                error = ""
+            else:
+                error = "Cellular modem is starting"
             devices[device_id] = {
                 "id": device_id, **assignment, "present": True,
                 "desired": wanted,
@@ -800,10 +847,9 @@ class HardwareSupervisor:
                     "cellular_supported": True,
                 },
                 "cellular": cellular,
-                "transitioning": (not ready or target_data != bool(
+                "transitioning": ((not ready and not bridge_error) or target_data != bool(
                     cellular.get("data_active"))),
-                "error": "" if ready and cellular.get("available") else
-                         "Cellular modem is starting",
+                "error": error,
             }
         now = int(time.time())
         atomic_json(root / "hardware-state.json", {
@@ -883,8 +929,10 @@ class HardwareSupervisor:
                 "metadata_age_seconds": max(0, now - updated) if updated else None,
                 "imei_valid": len(imei) == 15,
                 "iccid_valid": iccid.startswith("89") and 18 <= len(iccid) <= 22,
-                "channels_ready": (identity.get("channel_status") == "ready"
-                                   and requested > 0 and allocated == requested),
+                # Every requested slot is served, on its own channel or a shared one.
+                "channels_ready": (identity.get("channel_status") == "ready" and requested > 0
+                                   and allocated > 0 and nonnegative_int(
+                                       identity.get("slots_served", allocated)) == requested),
                 "log_tail": log_tail,
             }
         try:
@@ -932,6 +980,7 @@ class HardwareSupervisor:
         self.migrate_device_ids(discovered)
         self.reconcile_cellular(discovered, modems)
         ready_ids = set()
+        bridge_errors = {}
         for modem in discovered:
             process = self.bridges.get(modem["id"])
             try:
@@ -943,6 +992,11 @@ class HardwareSupervisor:
                     and metadata.get("bridge_pid") == process.pid
                     and metadata.get("channel_status") == "ready"):
                 ready_ids.add(modem["id"])
+            elif metadata.get("channel_status") == "error":
+                # The bridge reached the card and the card refused it. That is a fact about
+                # this SIM, not a hardware plane still coming up; retrying will not change it.
+                bridge_errors[modem["id"]] = str(
+                    metadata.get("channel_error") or "SIM logical channel allocation failed")
         self.finish_bridge_restart_requests({modem["id"] for modem in discovered})
         ready_bridges = len(ready_ids)
         maintenance_ids = {
@@ -958,12 +1012,15 @@ class HardwareSupervisor:
             "bridge_count": sum(process.poll() is None for process in self.bridges.values()),
             "ready_bridge_count": ready_bridges,
             "maintenance_bridge_count": len(maintenance_ids),
+            # Counted as settled by the health check: one unusable SIM must not hold the
+            # whole stack (Control waits on this container being healthy) hostage.
+            "card_failed_bridge_count": len(bridge_errors),
             "pcsc_reader_count": len(discovered) * 4,
             "logical_channel_count": len(discovered) * VPCD_SLOTS,
             "networkmanager_active": True,
             "kernel_objects": [f"{subsystem}/{name}" for subsystem, name in sorted(current)],
         })
-        self.publish_control_state(discovered, ready_ids)
+        self.publish_control_state(discovered, ready_ids, bridge_errors)
         if (self._diagnostics_at is None
                 or time.monotonic() - self._diagnostics_at >= DIAGNOSTICS_INTERVAL):
             self._diagnostics_at = time.monotonic()

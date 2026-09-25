@@ -49,3 +49,11 @@ python3 tools/validate_nas_catalog.py
 | `unsupported` | 已确认当前组合无法安全支持，并记录原因 |
 
 只有 `release-ready` 记录可以被产品界面展示为可安装驱动。其他状态只能用于诊断和收集信息。
+
+## 已发布的驱动包
+
+| 组合 | Release 资产 |
+| --- | --- |
+| DS1621+ / DSM 7.4.1-90080 / 4.4.302+ / x86_64 | `mdd-driver-synology-ds1621plus-dsm7.4.1-90080-k4.4.302plus-x86_64.tar.gz` |
+
+驱动包的构建输入全部固定在 `runtime/synology-v1000-7.4-modules.json`，由 `tools/drivers/build-synology-pack.sh` 在 CI 中重新构建；任一模块与实机验证值不一致即构建失败。安装步骤见[全容器部署指南](../docs/CONTAINER_DEPLOYMENT.md)第 2 节。

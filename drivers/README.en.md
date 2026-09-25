@@ -55,3 +55,11 @@ toolchain and matching kernel sources, with all of the following reviewed:
 
 Only `release-ready` records may be presented by the product as installable drivers. Other states
 are diagnostic and evidence-collection records.
+
+## Published driver packs
+
+| Combination | Release asset |
+| --- | --- |
+| DS1621+ / DSM 7.4.1-90080 / 4.4.302+ / x86_64 | `mdd-driver-synology-ds1621plus-dsm7.4.1-90080-k4.4.302plus-x86_64.tar.gz` |
+
+Every build input is pinned in `runtime/synology-v1000-7.4-modules.json`; CI rebuilds the pack with `tools/drivers/build-synology-pack.sh` and fails if any module differs from the one validated on hardware. Installation is described in section 2 of the [full container deployment guide](../docs/CONTAINER_DEPLOYMENT.en.md).

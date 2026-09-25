@@ -8,6 +8,11 @@ from control.app import config, main
 
 class AutoProvisionTests(unittest.TestCase):
     def setUp(self):
+        # Promotion asks DNS whether the carrier publishes an ePDG; never from a unit test.
+        lookup = patch.object(main.vowifi_support, "lookup", return_value="error")
+        lookup.start()
+        self.addCleanup(lookup.stop)
+        main.vowifi_support._cache.clear()
         self.draft = {
             "id": "2", "name": "234-33", "provisioning_state": "draft",
             "enabled": False, "imsi": "234330123456789", "mcc": "234", "mnc": "33",
@@ -44,6 +49,34 @@ class AutoProvisionTests(unittest.TestCase):
         self.assertEqual(result["imei_source_device_id"], "test")
         self.assertFalse(result["debug"]["asterisk"])
         self.assertEqual(len(result["imeisv"]), 16)
+
+    @patch.object(main.egress, "publish")
+    @patch.object(main.cfg, "upsert_instance")
+    @patch.object(main, "_hardware_imei_for_card")
+    def test_a_carrier_without_vowifi_is_provisioned_with_vowifi_off(
+            self, hardware_imei, upsert, _publish):
+        """A China Telecom SIM got a line that could only fail on ePDG DNS and marked a
+        modem with working 4G as needing attention. Phones hide the switch instead."""
+        hardware_imei.return_value = ("490154203237518", "test", "modem")
+        upsert.side_effect = lambda value, **kwargs: value
+        draft = {**self.draft, "imsi": "460110123456789", "mcc": "460", "mnc": "11"}
+        card = {**self.card, "imsi": draft["imsi"], "mcc": "460", "mnc": "11"}
+
+        result = main._auto_promote_card_draft(draft, card, [card])
+
+        self.assertEqual(result["provisioning_state"], "ready")
+        self.assertFalse(result["enabled"])
+
+    @patch.object(main.egress, "publish")
+    @patch.object(main.cfg, "upsert_instance")
+    @patch.object(main, "_hardware_imei_for_card")
+    def test_a_carrier_that_publishes_no_epdg_is_provisioned_with_vowifi_off(
+            self, hardware_imei, upsert, _publish):
+        hardware_imei.return_value = ("490154203237518", "test", "modem")
+        upsert.side_effect = lambda value, **kwargs: value
+        with patch.object(main.vowifi_support, "lookup", return_value="nxdomain"):
+            result = main._auto_promote_card_draft(self.draft, self.card, [self.card])
+        self.assertFalse(result["enabled"])
 
     @patch.object(main.cfg, "upsert_instance")
     @patch.object(main, "_hardware_imei_for_card")

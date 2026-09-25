@@ -15,13 +15,19 @@
     "vermagic": "4.4.302+ SMP mod_unload"
   },
   "validation": {
-    "status": "driver-verified",
-    "date": "2026-09-24",
+    "status": "release-ready",
+    "date": "2026-09-25",
     "deployment": "full-container",
-    "notes": "VoWiFi, IMS registration, cellular data, hotplug, PC/SC and eSIM listing were validated. The formal SPK asset is not published yet."
+    "notes": "VoWiFi, IMS registration, cellular data, hotplug, PC/SC and eSIM listing were validated. The driver pack is rebuilt in CI from Synology's public toolkit and unmodified Linux v4.4.302 sources, reproduces the validated modules byte for byte, and was installed from the pack on the same NAS."
   },
   "host_native": false,
-  "required_modules": ["mii", "cdc-wdm", "qmi_wwan", "usb_wwan", "option"],
+  "required_modules": [
+    "mii",
+    "cdc-wdm",
+    "qmi_wwan",
+    "usb_wwan",
+    "option"
+  ],
   "tested_usb": [
     {
       "vid": "2c7c",
@@ -36,10 +42,15 @@
       "result": "working"
     }
   ],
-  "expected_nodes": ["ttyUSB", "cdc-wdm", "wwan", "usb-bus"],
+  "expected_nodes": [
+    "ttyUSB",
+    "cdc-wdm",
+    "wwan",
+    "usb-bus"
+  ],
   "driver_pack": {
-    "status": "packaging-pending",
-    "asset": null,
-    "sha256": null
+    "status": "published",
+    "asset": "mdd-driver-synology-ds1621plus-dsm7.4.1-90080-k4.4.302plus-x86_64.tar.gz",
+    "sha256": "cd3d9bb41eae532f542af9cae051cb7834d481fd0a64e6a5ba12e2872e2f85b8"
   }
 }

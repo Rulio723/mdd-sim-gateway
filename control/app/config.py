@@ -27,7 +27,15 @@ _lock = threading.RLock()
 # Product safety boundary. This is intentionally a source-level limit rather than an environment
 # variable: operators must not be able to turn the gateway into a bulk-SIM service by changing
 # deployment configuration.
-MAX_SIM_LINES = 5
+MAX_SIM_LINES = 10
+
+# Values added by the instances API for display only. They may ride back on a complete WebUI
+# form, but they are not part of the desired line configuration and must never reach config.yaml.
+# Keep this list shared with the save/restart diff so removing pollution written by an older
+# release does not itself look like an operational edit and rebuild a running line.
+RUNTIME_ONLY_INSTANCE_FIELDS = frozenset({
+    "status", "has_pin", "proxy_country_effective",
+})
 
 # SIP User-Agent a line presents to the IMS core. The product identifies itself honestly by
 # default; a line may override it because some carriers gate IMS registration on a User-Agent
@@ -758,9 +766,11 @@ def upsert_instance(inst: dict, unique_name: bool = False) -> dict:
 def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
     data = load()
     iid = str(inst["id"])
-    # Runtime-only fields sometimes ride along on the instance object (the API returns
-    # instances with a computed `status` and `has_pin`); never persist them to config.
-    inst = {k: v for k, v in inst.items() if k not in ("status", "has_pin")}
+    # Runtime-only fields sometimes ride along on the instance object returned by the API;
+    # never persist them to config. `proxy_country_effective` is particularly important here:
+    # it is computed from MCC/default routing and feeding it back used to make a display-name
+    # edit look operational, unnecessarily rebuilding the running engine.
+    inst = {k: v for k, v in inst.items() if k not in RUNTIME_ONLY_INSTANCE_FIELDS}
     existing = data["instances"].get(iid, {})
     if not existing and len(data["instances"]) >= MAX_SIM_LINES:
         raise LineLimitError(
@@ -789,6 +799,10 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
         if existing.get("pin"):
             inst["pin"] = existing["pin"]
     merged = {**existing, **inst}
+    # Self-heal documents polluted by an older release. The restart diff also ignores these
+    # keys, so this cleanup remains metadata-only when the operator merely renames a line.
+    for key in RUNTIME_ONLY_INSTANCE_FIELDS:
+        merged.pop(key, None)
     # Production Asterisk debug can expose complete SIP messages and subscriber identities.
     # Diagnostic SIP logging is enabled briefly at runtime by the dedicated number-learning
     # flow instead; it must never be persisted on a line.

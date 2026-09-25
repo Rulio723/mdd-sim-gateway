@@ -3,7 +3,7 @@
 本文定义 issue #108 完成后的正式发布形态。目标是让普通 Linux、树莓派和 NAS 使用
 同一套容器镜像，同时把必须依赖宿主内核的部分限制为可审计的可选驱动包。
 
-## 0. 实现状态（截至 v1.12.0-rc5）
+## 0. 实现状态（截至 v1.12.0-rc8）
 
 本文描述的是**目标形态**，不是当前代码的能力。发布或撰写用户文档前请先看这一节。
 
@@ -15,11 +15,15 @@
   失败时恢复上一份 Compose、基础镜像和 Engine（`host/mdd_container_update.py`）。
 - §7 中的 Compose 权限断言与非 privileged 检查（`tests/test_container_compose.py`）。
 
+- §3 中 DS1621+ 的驱动包：随每个 Release 发布并纳入 `SHA256SUMS`。CI 用
+  `tools/drivers/build-synology-pack.sh` 从固定输入（群晖公开工具链、未修改的 Linux v4.4.302
+  源码）重建，任一模块与实机验证值不同即失败；打包可复现，兼容目录固定其 SHA-256。
+
 **尚未实现**，不得在用户文档或发布说明中描述为可用：
 
-- §4 驱动目录与下载全部内容。`drivers/catalog/` 目前只有供人工查阅和 CI 校验的记录，
-  没有任何运行时消费者；`--driver-bundle` 与 `MDD_DRIVER_INDEX_URL` 不存在。Release 也
-  尚未发布驱动目录或驱动包资产。
+- §4 的驱动目录作为 Release 资产和自动下载。`drivers/catalog/` 仍只供人工查阅和 CI 校验，
+  没有运行时消费者；`--driver-bundle` 与 `MDD_DRIVER_INDEX_URL` 不存在。驱动包是 tar.gz，
+  按部署指南用一次 SSH 手动安装，不是 SPK。
 - §5 第 3–5 步的启动硬件预检，以及 `host-native` / `driver_required` 状态。代码中不存在
   这两个状态，WebUI 也不展示兼容键。当前实际行为是：缺少设备节点时 Hardware 容器保持
   unhealthy，Control 因 `depends_on` 不会启动。

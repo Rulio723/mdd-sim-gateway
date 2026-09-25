@@ -2,6 +2,71 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.12.0-rc8] - 2026-09-25
+
+Eighth release candidate. The automatic update channel stays on 1.9.5.
+
+### Added
+
+- A device's 4G tab has a Modem VoLTE / IMS switch for Quectel modules. China Telecom and other
+  carriers without circuit-switched fallback carry 4G calls and texts only over the modem's own IMS;
+  turning it on enables MBN auto-selection and IMS, then restarts the modem. A cellular text the
+  network refuses with `WmsMessageDeliveryFailure` now points to that switch.
+- The gateway knows when a carrier offers no Wi-Fi Calling, from a carrier table (mainland China
+  for now) and whether the carrier's standard ePDG name exists in public DNS. A new SIM from such a
+  carrier gets its line created with VoWiFi off, 4G and SMS still work, and the page offers
+  **Try anyway**; a manual try that cannot resolve the ePDG stops at once instead of retrying.
+
+### Changed
+
+- Up to ten SIM lines instead of five.
+- The device list shows one badge per capability (4G and VoWiFi) instead of a single VoWiFi badge,
+  and the 4G row describes the mobile data connection rather than reusing the VoWiFi sentence.
+
+### Fixed
+
+- SIMs that grant only one supplementary logical channel, such as some China Unicom USIMs, made the
+  SIM bridge exit and restart forever, left the full-container Hardware unhealthy, and showed "No
+  SIM inserted". The bridge now shares whatever channels the card grants, replaying each slot's
+  selection when a channel changes hands; cards that grant three channels behave as before.
+
+## [1.12.0-rc7] - 2026-09-25
+
+Seventh release candidate. The automatic update channel stays on 1.9.5.
+
+### Added
+
+- The Synology DS1621+ modem driver pack is published with every Release
+  (`mdd-driver-synology-ds1621plus-dsm7.4.1-90080-k4.4.302plus-x86_64.tar.gz`) and covered by
+  `SHA256SUMS`. It is rebuilt in CI from Synology's public v1000 DSM 7.4 toolkit and unmodified
+  Linux v4.4.302 sources, and the build fails unless every module is byte-identical to the ones
+  validated on hardware. The pack installs with one SSH session, checks the exact DSM build before
+  writing anything, and includes the GPL-2.0 source and licence.
+
+### Changed
+
+- The README and deployment guide present the full-container deployment as available on any Linux
+  host with Docker Compose, with Synology as one case, and warn about the ModemManager service that
+  stock distributions enable by default.
+
+## [1.12.0-rc6] - 2026-09-25
+
+Sixth release candidate. The automatic update channel stays on 1.9.5.
+
+### Fixed
+
+- Renaming a line restarted it. The SIM tab sent back `proxy_country_effective`, a value the
+  lines API computes for display, and saving it looked like a configuration change. It is no
+  longer sent or stored; copies written by earlier releases are removed on the next save
+  without counting as a change.
+- After a one-click update, Synology Container Manager could not stop or delete the MDD
+  containers ("container undefined does not exist"). The update helper ran Compose from its
+  own `/data` mount, so the containers were labelled with a project path that does not exist
+  on the NAS. It now runs Compose from the data directory's host path, producing the same
+  labels as Container Manager. This takes effect from updates performed by rc6; containers
+  created by an earlier helper keep the old labels until the project is built again in
+  Container Manager.
+
 ## [1.12.0-rc5] - 2026-09-25
 
 Fifth release candidate. The rc3 -> rc4 rollback drill passed on a DS1621+: every container

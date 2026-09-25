@@ -29,14 +29,17 @@ Before deployment, prepare:
 - at least 6 GiB of free space for the first pull and one rollback image generation;
 - a dedicated persistent directory, such as `/volume1/docker/mdd-sim-gateway` on Synology;
 - an unused HTTPS host port; the default is `10443`;
-- a fixed NAS LAN address or a stable LAN DNS name;
+- a fixed LAN address or stable LAN DNS name for the host;
 - host USB enumeration under `/dev/bus/usb`. Cellular modems also need their serial, QMI/MBIM and
   network-interface device nodes.
 
 Do not install host pcscd, ModemManager or NetworkManager first. The Hardware container owns those
 user-space services in full-container mode; a host copy can claim the USB device before it does.
+Ubuntu and some other distributions enable ModemManager by default; disable it before deploying:
+`sudo systemctl disable --now ModemManager`. The host must run Linux: Docker Desktop (macOS/Windows)
+cannot hand USB devices to containers, and rootless Docker is not supported.
 
-## 2. Decide whether the NAS needs a driver
+## 2. Decide whether the host needs a driver
 
 Plug in the modem or reader before deployment. A modem normally exposes nodes similar to:
 
@@ -55,10 +58,25 @@ never starts. This release does **not** ship an automatic driver preflight statu
 above yourself to establish which nodes are absent, then compare that against the
 [NAS compatibility and driver catalogue](../drivers/README.en.md) by hand. A driver must match the
 exact NAS vendor, model, CPU platform, architecture, complete OS build and kernel release; never
-install a package built for a similar model or OS version. The single catalogue entry that exists
-today (DS1621+, DSM 7.4.1-90080, kernel 4.4.302+) is `driver-verified` with its driver pack still
-`packaging-pending`, so **no installable driver asset is published in any Release yet**. Until an
-entry reaches `release-ready`, do not load an unknown `.ko` or `.spk`.
+install a package built for a similar model or OS version, and never load an unknown `.ko` or `.spk`.
+
+**DS1621+ (DSM 7.4.1-90080, kernel 4.4.302+)** has a formal driver pack, published with every Release
+as `mdd-driver-synology-ds1621plus-dsm7.4.1-90080-k4.4.302plus-x86_64.tar.gz` and covered by the Release `SHA256SUMS`. CI rebuilds it from Synology's public toolkit and
+unmodified Linux v4.4.302 sources, byte for byte identical to the modules validated on hardware.
+Installing it takes one SSH session:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing     # in the directory holding the pack
+tar -xzf mdd-driver-synology-ds1621plus-dsm7.4.1-90080-k4.4.302plus-x86_64.tar.gz
+cd mdd-driver-synology-ds1621plus-dsm7.4.1-90080-k4.4.302plus-x86_64
+sudo sh install.sh
+```
+
+The installer checks architecture, kernel, DSM build, platform and module checksums before touching
+anything, and the boot hook repeats those checks at every start; after a DSM update that no longer
+matches it loads nothing until a pack for the new build exists. Remove it with `sudo sh uninstall.sh`
+from the pack. After installing, replug the modem or reboot and confirm the device nodes above appear
+before creating the project.
 
 ## 3. Create the Synology project in the UI
 

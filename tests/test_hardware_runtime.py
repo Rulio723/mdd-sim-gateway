@@ -178,6 +178,49 @@ class HardwareRuntimeTests(unittest.TestCase):
                                    "hardware-state.json").read_text())
             self.assertIn(modem["id"], hardware["assignments"])
 
+    def test_a_card_the_bridge_cannot_use_is_named_not_left_starting(self):
+        """A registered modem with a working bearer showed "Cellular modem is starting"
+        forever when the card refused the bridge's logical channels."""
+        with tempfile.TemporaryDirectory() as temp:
+            app = HardwareSupervisor(data_path=Path(temp))
+            modem = {"id": "2c7c-0125-port", "tty": "/dev/ttyUSB2",
+                     "usb_path": "1-3", "vid": "2c7c", "pid": "0125"}
+            app.cellular_states = {modem["id"]: {"available": True, "data_active": False}}
+            app.publish_control_state([modem], set(), {
+                modem["id"]: "MANAGE CHANNEL OPEN failed: 006a81"})
+            observed = json.loads((Path(temp) / "orchestrator" / "devices-status.json")
+                                  .read_text())["devices"][modem["id"]]
+            self.assertIn("006a81", observed["error"])
+            self.assertNotIn("starting", observed["error"])
+            self.assertFalse(observed["transitioning"])
+            self.assertFalse(observed["actual"]["vowifi_bridge_active"])
+
+    def test_snapshot_reports_the_sim_iccid_and_number(self):
+        """Control shows "no SIM" unless the VPCD reader or this ICCID says otherwise, so a
+        container build without it lost the SIM whenever the bridge was down."""
+        obj = "/org/freedesktop/ModemManager1/Modem/1"
+        modem_detail = ("modem.generic.state : registered\n"
+                        "modem.generic.power-state : on\n"
+                        "modem.generic.sim : /org/freedesktop/ModemManager1/SIM/1\n"
+                        "modem.generic.own-numbers.value[1] : +86 130 0000 0000\n"
+                        "modem.generic.ports.value[1] : ttyUSB2 (at)\n")
+        sim_detail = "sim.properties.iccid : 89860100000000000000\n"
+        app = HardwareSupervisor()
+
+        def command(*args):
+            if args[:2] == ("mmcli", "-i"):
+                return Mock(returncode=0, stdout=sim_detail)
+            return Mock(returncode=0, stdout=modem_detail)
+
+        app.command = command
+        snapshot = app.modem_snapshot({"id": "modem-a", "tty": "/dev/ttyUSB2"}, [obj])
+        self.assertEqual(snapshot["sim_iccid"], "89860100000000000000")
+        self.assertEqual(snapshot["msisdn"], "+8613000000000")
+
+    def test_an_unreadable_iccid_is_unknown_not_an_identity(self):
+        self.assertEqual(HardwareSupervisor.normalize_iccid("--"), "")
+        self.assertEqual(HardwareSupervisor.normalize_iccid("1234"), "")
+
     def test_container_hardware_publishes_redacted_support_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp:
             data = Path(temp)

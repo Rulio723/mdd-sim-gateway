@@ -9,11 +9,11 @@
   <a href="#quick-install">Quick install</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="docs/INSTALL.md">Installation</a> ·
-  <a href="docs/CONTAINER_DEPLOYMENT.en.md">NAS/container deployment</a> ·
+  <a href="docs/CONTAINER_DEPLOYMENT.en.md">Container deployment</a> ·
   <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">Discussions</a>
 </p>
 
-MDD Sim Gateway is a self-hosted multi-SIM communications gateway. It installs directly on Debian, Ubuntu and Armbian ARM64 hosts, or runs entirely in containers on a Synology or other NAS. It brings cellular modems, USB smart-card readers, IMS, EAP-AKA, eSIM, ModemManager and sing-box into one bilingual Web console.
+MDD Sim Gateway is a self-hosted multi-SIM communications gateway. It installs directly on Debian, Ubuntu and Armbian ARM64 hosts, or runs entirely in containers on any Linux host with Docker Compose, including a Synology or other NAS. It brings cellular modems, USB smart-card readers, IMS, EAP-AKA, eSIM, ModemManager and sing-box into one bilingual Web console.
 
 | Real SIM authentication | Calls and SMS | Multi-modem control | Isolated country exits |
 |---|---|---|---|
@@ -31,11 +31,11 @@ There are two ways to deploy. Both provide the same features; choose by host:
 
 | | Host install | Full-container deployment |
 |---|---|---|
-| For | Raspberry Pi and other Debian / Ubuntu / Armbian ARM64 hosts | Synology and other NAS, or any Linux that runs Docker Compose |
+| For | Raspberry Pi and other Debian / Ubuntu / Armbian ARM64 hosts | Any amd64/arm64 Linux that runs Docker Compose, including Synology and other NAS |
 | Installed on the host | systemd services; the installer provisions pcscd, ModemManager and NetworkManager | Nothing besides Docker; every service runs in a container |
 | Resident containers | One Engine per line | Control, Hardware and Egress, plus one Engine per line |
 | Country exits | A TUN and ePDG routes per country | A SOCKS5 listener per country; the host routing table and DNS are untouched |
-| Console | `https://<gateway-address>:8443` | `https://<nas-address>:10443` |
+| Console | `https://<gateway-address>:8443` | `https://<host-address>:10443` |
 | Status | Stable | Release candidate (v1.12.0-rc), validated on a Synology DS1621+ |
 
 ### Option 1: host install
@@ -61,29 +61,37 @@ sudo ./install.sh install
 
 When installation completes, open `https://<gateway-address>:8443` and create the administrator account immediately on a trusted LAN or VPN. See [Installation](docs/INSTALL.md) for prerequisites, the full install process and upgrades.
 
-### Option 2: full-container deployment (NAS / Docker Compose)
+### Option 2: full-container deployment (Docker Compose)
 
-No install script over SSH, and no pcscd, ModemManager or similar services on the host.
+Nothing but Docker is installed on the host, and no install script is run. The host must run Linux:
+Docker Desktop (macOS/Windows) cannot hand USB devices to containers, and rootless Docker is not
+supported.
 
 1. **Check that the host sees the modem.** After plugging it in, the host should show
    `/dev/ttyUSB*`, `/dev/cdc-wdm*` and a `wwan*` interface; a standard PC/SC reader only needs to
-   appear under `/dev/bus/usb`. Missing nodes mean the host lacks a kernel driver, and no Release
-   ships an installable driver package yet — see the
-   [NAS compatibility and driver catalogue](drivers/README.en.md).
+   appear under `/dev/bus/usb`. Mainstream distribution kernels normally include the drivers;
+   trimmed kernels such as Synology's may not. A DS1621+ can use the driver pack published with each
+   Release — see the [compatibility and driver catalogue](drivers/README.en.md). If the host already runs
+   ModemManager (enabled by default on Ubuntu and others), stop it first, or it will compete with
+   the containers for the modem.
 2. **Download the Compose file.** Get `mdd-sim-gateway-compose-vX.Y.Z.yaml` from
    [Releases](https://github.com/MddIdd/mdd-sim-gateway/releases); its four images are pinned to that
    version.
-3. **Edit the two values marked at the top.** Set `MDD_ADVERTISE_ADDR` to the NAS LAN address (the
-   media address for browser calls), and change the data directory if it is not
-   `/volume1/docker/mdd-sim-gateway`. The console port defaults to `10443`.
-4. **Create the project.** On Synology, create a project in Container Manager and paste the YAML;
-   elsewhere, save it as `docker-compose.yml` in the data directory and run `docker compose up -d`.
-5. **Open `https://<nas-address>:10443`** and create the administrator account immediately.
+3. **Edit the two values marked at the top.** Set `MDD_ADVERTISE_ADDR` to the host's LAN address (the
+   media address for browser calls), and set the data directory to your real path —
+   `/volume1/docker/mdd-sim-gateway` in the file is the Synology example. The console port defaults
+   to `10443`.
+4. **Start it.** On an ordinary Linux host, save the file as `docker-compose.yml` in the data
+   directory and run `docker compose up -d` there; on Synology, create a project in Container Manager
+   and paste the YAML.
+5. **Open `https://<host-address>:10443`** and create the administrator account immediately.
 
 When Hardware starts or is recreated it may reset the modem once and take a minute or two to become
 healthy; that is expected. The four images take about 1.3 GB per generation once unpacked, and a one-click update keeps
 two generations side by side, so leave at least 6 GiB for Docker storage. Updates, rollback and
-troubleshooting are in the [full container deployment guide](docs/CONTAINER_DEPLOYMENT.en.md).
+troubleshooting are in the [full container deployment guide](docs/CONTAINER_DEPLOYMENT.en.md). So far
+it has been validated on a Synology DS1621+; results from other hosts are recorded in the
+[compatibility catalogue](drivers/README.en.md).
 
 > This software directly controls cellular radios, SIMs, network routes and IMS. Carrier support for Wi-Fi Calling still depends on the plan, region, device identity and network policy.
 
@@ -176,7 +184,7 @@ See [installation](docs/INSTALL.md), [architecture](docs/ARCHITECTURE.md),
 
 ## Responsible use
 
-> **Compliance warning:** This software is only for use by the verified subscriber of a number where the carrier expressly permits that use. Do not use it for fraud, bulk or nuisance calling, marketing, verification-code collection, renting numbers or lines, call forwarding for others, concealing the controller's location, or providing telecommunications services to third parties. Users must follow local law, subscriber identity rules, and carrier terms. This project grants no telecom licence or carrier authorisation. MDD Sim Gateway stores and runs at most **five SIM lines** and provides neither standalone SIP accounts nor Telegram commands for calls, SMS, or hangup. Technical restrictions do not make any particular use lawful.
+> **Compliance warning:** This software is only for use by the verified subscriber of a number where the carrier expressly permits that use. Do not use it for fraud, bulk or nuisance calling, marketing, verification-code collection, renting numbers or lines, call forwarding for others, concealing the controller's location, or providing telecommunications services to third parties. Users must follow local law, subscriber identity rules, and carrier terms. This project grants no telecom licence or carrier authorisation. MDD Sim Gateway stores and runs at most **ten SIM lines** and provides neither standalone SIP accounts nor Telegram commands for calls, SMS, or hangup. Technical restrictions do not make any particular use lawful.
 
 ## Community and feedback
 

@@ -34,7 +34,7 @@ from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd, mms,
-               mms_media, mms_transport, softphone_ws)
+               mms_media, mms_transport, softphone_ws, modem_ims, vowifi_support)
 from .version import VERSION
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -1113,9 +1113,18 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
             "reader_index": int(card_info.get("index") or inst.get("reader_index") or 0),
             "reader_port": str(card_info.get("reader_port") or inst.get("reader_port") or ""),
         })
+    # A phone hides the Wi-Fi Calling switch for a carrier that does not offer it. Doing the
+    # same here keeps cellular working without a line that can only fail; the device page
+    # says why and the switch still lets the user try.
+    support = vowifi_support.for_instance({"mcc": mcc, "mnc": mnc, "epdg": inst.get("epdg")},
+                                          probe_now=True)
+    if support["status"] == vowifi_support.UNSUPPORTED:
+        update["enabled"] = False
     promoted = cfg.upsert_instance(update, unique_name=generated_name)
     egress.publish()
-    log.info("hotplug draft %s auto-provisioned for MCC %s", inst["id"], mcc)
+    log.info("hotplug draft %s auto-provisioned for MCC %s%s", inst["id"], mcc,
+             f" (VoWiFi left off: {support['source']})"
+             if support["status"] == vowifi_support.UNSUPPORTED else "")
     return promoted
 
 
@@ -2586,6 +2595,22 @@ def apply_health(iid, inst, st, container_id: str | None = None):
         h["retry_count"] = 0
         st["retry"] = {"count": 0, "max": rmax}
         return st
+    if state == "EPDG_UNRESOLVED":
+        support = vowifi_support.for_instance(inst)
+        if support["source"] == "carrier_table":
+            # The user chose to try a carrier that does not offer Wi-Fi Calling. Retrying on
+            # a timer only repeats the same DNS answer; stop and say why. Only the carrier
+            # table is trusted this far: a missing DNS answer can also be an outage.
+            h["frozen_code"] = st["reason_code"]
+            h["frozen_reason"] = support["reason"]
+            h["next_retry_at"] = None
+            _record_lifecycle(iid, "recovery_cancelled", "carrier_unsupported",
+                              retry_count=h.get("retry_count"), card_present=True)
+            asyncio.create_task(asyncio.to_thread(
+                engine.capture_and_stop, iid, inst, "health-freeze:carrier_unsupported",
+                container_id))
+            asyncio.create_task(hub.drop_ami(str(iid)))
+            return _frozen(h, st, rmax)
     if state == "PIN_PROBLEM":
         # wrong/blocked PIN won't recover by retrying — surface immediately.
         h["frozen_code"] = st["reason_code"]
@@ -3367,7 +3392,9 @@ def _modem_active_slot_capacity(hardware_id: str, sibling_count: int) -> int:
     identity = (_device_identities().get(hardware_id)
                 or _modem_identity_for_reader(f"VoWiFi Modem {hardware_id} 00 00")
                 or {})
-    raw = (identity.get("channel_allocated")
+    # A card with too few channels still serves every slot on a shared one.
+    raw = (identity.get("slots_served")
+           or identity.get("channel_allocated")
            or identity.get("channel_capacity")
            or identity.get("slots")
            or sibling_count)
@@ -4135,6 +4162,11 @@ async def _unified_devices() -> list[dict]:
                       "flight_mode": False})
         cell_desired = bool(wanted.get("cellular_enabled"))
         vowifi_desired = bool(wanted.get("vowifi_enabled"))
+        if inst and not is_native_reader:
+            # A modem's switch is device-wide, but the line it would start can be disabled on
+            # its own (a carrier without VoWiFi is provisioned that way). Showing the switch on
+            # over a disabled line read as "enabled but no line is running" forever.
+            vowifi_desired = vowifi_desired and bool(inst.get("enabled", True))
         flight_desired = bool(wanted.get("flight_mode"))
         line_status = _cached_line_status(inst) if inst else None
         running = bool(inst) and (line_status or {}).get("state") != "STOPPED"
@@ -4149,6 +4181,12 @@ async def _unified_devices() -> list[dict]:
         elif is_draft:
             vowifi.update(available=False,
                           reason="Automatic setup is waiting for SIM or hardware information")
+        support_source = inst or native_card or {}
+        vowifi["support"] = vowifi_support.for_instance(
+            support_source if support_source.get("mcc") else {})
+        if (vowifi["support"]["status"] == vowifi_support.UNSUPPORTED
+                and vowifi.get("actual") == "off" and not vowifi.get("reason")):
+            vowifi["reason"] = vowifi["support"]["reason"]
 
         actual_state = observed.get("actual") or {}
         # Published by the orchestrator when this gateway is configured VoWiFi-only
@@ -4471,6 +4509,44 @@ async def api_device_cellular(device_id: str):
         raise HTTPException(404, "no such physical device")
     return {"device_id": device_id, "capability": device["capabilities"]["cellular"],
             "cellular": device.get("cellular")}
+
+
+def _device_modem_path(device_id: str) -> str:
+    """The live ModemManager object of a present modem, or ""."""
+    _desired, observed, _assignments = _device_sources()
+    item = (observed.get("devices") or {}).get(device_id) or {}
+    if not item.get("present"):
+        return ""
+    return str((item.get("cellular") or {}).get("mm_object") or item.get("mm_object") or "")
+
+
+@app.get("/api/devices/{device_id}/ims")
+async def api_device_ims(device_id: str):
+    path = _device_modem_path(device_id)
+    if not path:
+        return {"supported": False, "reason": "The modem is not available."}
+    return await asyncio.to_thread(modem_ims.status, path)
+
+
+@app.put("/api/devices/{device_id}/ims")
+async def api_device_ims_set(device_id: str, body: dict):
+    enabled = (body or {}).get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be boolean")
+    async with capability_lock:
+        path = _device_modem_path(device_id)
+        if not path:
+            raise HTTPException(409, "The modem is not available.")
+        current = await asyncio.to_thread(modem_ims.status, path)
+        if not current.get("supported"):
+            raise HTTPException(409, current.get("reason") or "IMS is not supported")
+        result = await asyncio.to_thread(modem_ims.set_enabled, path, enabled)
+    if not result.get("ok"):
+        raise HTTPException(502, result.get("error") or "the modem rejected the change")
+    log.info("modem %s: VoLTE/IMS %s; modem restarting", device_id,
+             "enabled" if enabled else "disabled")
+    await hub.broadcast({"type": "capability", "device": device_id, "ims": enabled})
+    return result
 
 
 @app.post("/api/devices/{device_id}/diagnostics")
@@ -5238,8 +5314,9 @@ def _only_instance_name_changed(before: dict | None, after: dict) -> bool:
     """
     if before is None or before == after:
         return False
-    before_runtime = {key: value for key, value in before.items() if key != "name"}
-    after_runtime = {key: value for key, value in after.items() if key != "name"}
+    ignored = cfg.RUNTIME_ONLY_INSTANCE_FIELDS | {"name"}
+    before_runtime = {key: value for key, value in before.items() if key not in ignored}
+    after_runtime = {key: value for key, value in after.items() if key not in ignored}
     return before_runtime == after_runtime
 
 
@@ -6403,7 +6480,7 @@ def api_keepalive_save(iid: str, body: dict):
 
 @app.get("/api/keepalive/summary")
 async def api_keepalive_summary():
-    """One aggregate for the whole page: at most five lines, so a per-line fan-out of four
+    """One aggregate for the whole page: at most ten lines, so a per-line fan-out of four
     requests each would be pure overhead."""
     now = int(time.time())
     rows = []

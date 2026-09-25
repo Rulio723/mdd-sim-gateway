@@ -1388,8 +1388,10 @@ class Orchestrator:
                 "metadata_age_seconds": max(0, now - updated_at) if updated_at else None,
                 "imei_valid": len(imei) == 15,
                 "iccid_valid": iccid.startswith("89") and 19 <= len(iccid) <= 22,
-                "channels_ready": (metadata.get("channel_status") == "ready"
-                                   and requested > 0 and allocated == requested),
+                # Every requested slot is served, on its own channel or a shared one.
+                "channels_ready": (metadata.get("channel_status") == "ready" and requested > 0
+                                   and allocated > 0 and nonnegative_int(
+                                       metadata.get("slots_served", allocated)) == requested),
             }
 
         atomic_json(self.host_diagnostics_path, {

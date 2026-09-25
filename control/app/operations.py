@@ -531,7 +531,7 @@ def launch_container_update() -> dict:
         request_path.unlink(missing_ok=True)
         return {"ok": False, **result}
     host_data = os.environ.get("MDD_HOST_DATA", "").strip()
-    if not host_data.startswith("/"):
+    if not host_data.startswith("/") or ":" in host_data:
         result = {"state": "failed", "phase": "launch",
                   "error": "MDD_HOST_DATA must be an absolute host path",
                   "updated_at": int(time.time())}
@@ -568,9 +568,13 @@ def launch_container_update() -> dict:
         helper = client.containers.create(
             control.image.id, command=command, entrypoint=["python"], detach=True,
             auto_remove=True, healthcheck={"test": ["NONE"]},
-            volumes={host_data: {"bind": "/data", "mode": "rw"},
-                     "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
-            environment={"MDD_DATA": "/data", "PYTHONDONTWRITEBYTECODE": "1"},
+            # The data directory also appears at its own host path, so Compose can be run
+            # from there and label the containers the way Container Manager does (see
+            # mdd_container_update.compose_location).
+            volumes=[f"{host_data}:/data:rw", f"{host_data}:{host_data}:rw",
+                     "/var/run/docker.sock:/var/run/docker.sock:rw"],
+            environment={"MDD_DATA": "/data", "MDD_HOST_DATA": host_data,
+                         "PYTHONDONTWRITEBYTECODE": "1"},
             labels={"io.mdd-sim-gateway.managed": "true",
                     "io.mdd-sim-gateway.component": "update-helper"},
             name=f"mdd-sim-gateway-update-{time.time_ns()}",

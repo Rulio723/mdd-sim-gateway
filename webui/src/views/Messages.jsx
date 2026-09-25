@@ -501,6 +501,14 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
                     <div style={{ fontSize: 10.5, color: '#ef4444', marginTop: 1,
                       textAlign: m.direction === 'out' ? 'right' : 'left', maxWidth: 280 }}>{m.error}</div>
                   )}
+                  {failed && m.transport === 'cellular' && /WmsMessageDeliveryFailure/.test(m.error || '') && (
+                    // The QMI name says only that the network refused the text. On VoLTE-only
+                    // carriers that is almost always the modem's IMS being off.
+                    <div style={{ fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2,
+                      textAlign: m.direction === 'out' ? 'right' : 'left', maxWidth: 280 }}>
+                      {tr('The network refused this text. Carriers such as China Telecom carry 4G texts only over VoLTE/IMS; turn on Modem VoLTE / IMS on the device\'s 4G tab.')}
+                    </div>
+                  )}
                   {uncertain && m.error && (
                     <div style={{ fontSize: 10.5, color: '#f59e0b', marginTop: 1,
                       textAlign: m.direction === 'out' ? 'right' : 'left', maxWidth: 280 }}>{m.error}</div>
