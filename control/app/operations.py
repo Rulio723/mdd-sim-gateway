@@ -318,6 +318,18 @@ def asterisk_problem_lines(text: str) -> str:
     return redact_log("\n".join(out)) if out else ""
 
 
+def _update_download(relative: Path) -> bool:
+    """A release archive the container updater is downloading into <data>/update.
+
+    The updater takes its backup after downloading, while the four image archives (~500 MB)
+    still sit in its staging directory, so every backup carried them: a Raspberry Pi's SD card
+    lost 500 MB per update until the next update refused for lack of space. They are
+    re-downloadable Release assets, not gateway data.
+    """
+    parts = relative.parts
+    return len(parts) >= 2 and parts[0] == "update" and parts[1].startswith("container-update.")
+
+
 def create_local_backup(system_name: str = "gateway") -> dict:
     """Create a root-local recovery archive. It is intentionally not returned over HTTP.
 
@@ -350,6 +362,8 @@ def create_local_backup(system_name: str = "gateway") -> dict:
                 if not path.is_file() or target_dir in path.parents:
                     continue
                 relative = str(path.relative_to(root))
+                if _update_download(path.relative_to(root)):
+                    continue
                 if snapshot and (relative in skipped or mms_root in path.parents):
                     continue
                 archive.add(path, arcname=relative, recursive=False)
