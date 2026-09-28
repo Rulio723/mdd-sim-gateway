@@ -188,7 +188,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       if (editedNumber) body.msisdn_source = String(form.msisdn || '').trim() ? 'manual' : ''
       // Strip runtime-only fields that ride along on the instance object from /api/instances
       // (they are computed per-request, not config — never persist them).
-      delete body.status; delete body.has_pin; delete body.proxy_country_effective
+      delete body.status; delete body.has_pin; delete body.proxy_country_effective; delete body.sip_carrier_defaults
       // Never send an empty PIN — the stored PIN (tied to this IMSI) must survive edits to
       // unrelated fields. `pin` state is only set when the user re-enters/verifies a PIN
       // here; only then do we forward it to update the saved credential.
@@ -423,6 +423,27 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />
             {t('Add ;user=phone to telephone-number SIP requests')}
           </label>
+          {(() => {
+            // A setting the line leaves unset follows the carrier profile, so show that value.
+            const carrier = form.sip_carrier_defaults || {}
+            const enabled = form.sip.invite_uri_params_enable ?? !!carrier.invite_uri_params_enable
+            return <>
+              <label style={{ marginTop: 8 }}>
+                <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={enabled}
+                  onChange={(e) => updSip({ invite_uri_params_enable: e.target.checked })} />
+                {t('Add parameters to the request URI of outgoing calls')}
+              </label>
+              {enabled && <Field label={t('Request URI parameters')}>
+                <input className="mono" maxLength={128}
+                  value={form.sip.invite_uri_params ?? carrier.invite_uri_params ?? ''}
+                  onChange={(e) => updSip({ invite_uri_params: e.target.value })}
+                  placeholder="user=phone" />
+                <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 2 }}>
+                  {t('Outgoing calls only; SMS is not affected. Separate several parameters with ;.')}
+                </div>
+              </Field>}
+            </>
+          })()}
         </details>
 
         <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>

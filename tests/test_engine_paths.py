@@ -6,7 +6,7 @@ import unittest
 from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 def _docker_errors():
@@ -161,7 +161,7 @@ class EnginePathTests(unittest.TestCase):
                 patch.object(engine.egress, "ensure_line", return_value={}), \
                 patch.object(engine.cfg, "write_instance_json"):
             engine.start({"id": "sim1"}, {})
-        client.networks.get.assert_called_once_with("mdd-uplink")
+        self.assertIn(call("mdd-uplink"), client.networks.get.call_args_list)
         uplink.connect.assert_called_once_with(container)
 
     def test_proxy_line_never_joins_direct_uplink(self):
@@ -185,7 +185,9 @@ class EnginePathTests(unittest.TestCase):
                     "transport": "socks5", "proxy_url": "socks5://mdd-egress:22157"}), \
                 patch.object(engine.cfg, "write_instance_json"):
             engine.start({"id": "sim1"}, {})
-        client.networks.get.assert_not_called()
+        # The Engine network is looked up (is it internal?), the uplink never.
+        self.assertNotIn(call("mdd-uplink"), client.networks.get.call_args_list)
+        client.networks.get.return_value.connect.assert_not_called()
 
     def test_proxy_dns_failure_keeps_existing_engine(self):
         engine = self.engine_module()

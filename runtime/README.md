@@ -120,8 +120,8 @@ python tools/container-runtime/build_remote_hardware_overlay.py \
 
 源码压缩包始终按 Dockerfile 中的 SHA256 校验。`compose.hardware-lab.yaml`
 使用共享 pcscd volume；Control 与 Engine 后续挂载同一 volume 即可访问虚拟卡。
-Hardware 以显式 capability 运行 NetworkManager，只允许它管理 `wwan*` 与
-`cdc-wdm*`；启动时发现任何其他接口被认领即停止。GSM profile 始终为
+Hardware 以显式 capability 运行 NetworkManager，只允许它管理 `ww*`（`wwan0`，或
+`wws27u1i4` 这类可预测命名）与 `cdc-wdm*`；启动时发现任何其他接口被认领即停止。GSM profile 始终为
 `connection.autoconnect=no`、IPv4/IPv6 `never-default=yes`，因此不会替换 NAS 默认
 出口。实体 USB 读卡器直接由 Hardware 内的 pcscd 和带项目修复的 libccid 管理，宿主
 不需要安装 PC/SC 服务。DSM 必须先提供匹配内核的串口和 QMI 驱动；当前 DS1621+ 验证版本见

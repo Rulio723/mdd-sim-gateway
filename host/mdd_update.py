@@ -629,6 +629,58 @@ def perform_release_image_install(repo: Path, data: Path, version: str, repo_nam
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def load_relay_image(artifact: Path, version: str) -> str:
+    """Load the media relay asset: upstream coturn, unmodified, so it carries no MDD labels.
+    The checksum (covered by the release archive's) proves what it is; check the tag and the
+    architecture it was loaded under."""
+    image = f"mdd-sim-gateway/relay:v{version}"
+    loaded = subprocess.run(["docker", "load", "--input", str(artifact)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if loaded.returncode:
+        raise UpdateError(f"could not load Release relay image: {loaded.stderr.strip()}")
+    checked = subprocess.run(["docker", "image", "inspect", image, "--format",
+                              "{{.Architecture}}"],
+                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    actual = checked.stdout.strip() if checked.returncode == 0 else ""
+    if actual != host_arch():
+        raise UpdateError(f"Release relay image identity mismatch: {actual or 'unreadable'}")
+    return image
+
+
+def perform_relay_image_install(repo: Path, data: Path, version: str, repo_name: str,
+                                network_path: Path | None = None) -> str:
+    """Download and import the media relay image named by an official release source archive
+    (relay media mode only; control/app/media.py falls back to registries without one)."""
+    if not VERSION_RE.fullmatch(version):
+        raise UpdateError(f"invalid target version: {version!r}")
+    if not REPOSITORY_RE.fullmatch(repo_name):
+        raise UpdateError(f"invalid repository: {repo_name!r}")
+    manifest = repo / ENGINE_HANDOFF_MANIFEST
+    if not manifest.is_file():
+        raise UpdateError("release has no image asset manifest")
+    name = f"mdd-sim-gateway-relay-v{version}-{host_arch()}.tar.gz"
+    network = read_network_config(network_path) if network_path else {}
+    fallback_proxy = str(network.get("proxy_url") or os.environ.get("HTTPS_PROXY")
+                         or os.environ.get("https_proxy") or "")
+    clean_routes = validated_download_routes(
+        fallback_proxy,
+        route=str(network.get("route") or ("library" if fallback_proxy else "direct")),
+        route_name=str(network.get("route_name") or ""),
+        routes=network.get("routes") if isinstance(network.get("routes"), list) else None)
+    update_dir = data / "update"
+    update_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="relay-image.", dir=str(update_dir)))
+    try:
+        archive = staging / name
+        fetch_release_asset(
+            f"https://github.com/{repo_name}/releases/download/v{version}/{name}",
+            archive, name, clean_routes, phase="relay_image")
+        verify_release_file(archive, manifest, f"{host_arch()} relay image")
+        return load_relay_image(archive, version)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def perform(repo: Path, data: Path, version: str, repo_name: str, status: Status,
             proxy_url: str = "", *, route: str = "direct", route_name: str = "",
             asset_sizes: dict | None = None, routes: list[dict] | None = None):
@@ -776,6 +828,7 @@ def main():
     parser.add_argument("--network-config", type=Path)
     parser.add_argument("--engine-handoff", action="store_true")
     parser.add_argument("--install-images", action="store_true")
+    parser.add_argument("--install-relay-image", action="store_true")
     parser.add_argument("--install-mode", choices=("local", "docker", "container"),
                         default="local")
     args = parser.parse_args()
@@ -786,6 +839,15 @@ def main():
     if args.engine_handoff:
         try:
             image = perform_engine_handoff(
+                args.repo.resolve(), data, args.version, args.repository, network_path)
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(1)
+        print(image)
+        return
+    if args.install_relay_image:
+        try:
+            image = perform_relay_image_install(
                 args.repo.resolve(), data, args.version, args.repository, network_path)
         except Exception as exc:
             print(str(exc), file=sys.stderr)

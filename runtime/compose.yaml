@@ -36,6 +36,10 @@ services:
       MDD_ADVERTISE_ADDR: ${MDD_ADVERTISE_ADDR:?set the NAS LAN address}
       MDD_HTTP_PORT: 8443
       MDD_RTP_BASE: ${MDD_RTP_BASE:-30000}
+      # MMS picture conversion: how many pictures at once (default: the CPUs) and how much
+      # memory, in MB, it may use (default: worked out from mem_limit). Empty means default.
+      MDD_MMS_CONVERT_WORKERS: ${MDD_MMS_CONVERT_WORKERS:-}
+      MDD_MMS_CONVERT_MEMORY: ${MDD_MMS_CONVERT_MEMORY:-}
       MDD_CONTAINER_STACK: "1"
       MDD_CONTROL_CONTAINER: mdd-sim-gateway-control
       MDD_HARDWARE_CONTAINER: mdd-sim-gateway-hardware

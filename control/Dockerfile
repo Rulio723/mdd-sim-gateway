@@ -113,6 +113,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && printf '/usr/lib64\n' > /etc/ld.so.conf.d/mdd-pcsc.conf \
     && ldconfig \
     && rm -rf /var/lib/apt/lists/*
+# The control plane starts without Pillow or pi-heif on purpose -- MMS picture conversion then
+# simply stops -- so an image whose wheels install but do not load must fail here instead.
+RUN python -c "import PIL.Image, pi_heif"
 
 WORKDIR /app/control
 

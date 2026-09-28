@@ -10,6 +10,7 @@ images pass their architecture/component/version checks.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -36,6 +37,85 @@ MANAGED = "io.mdd-sim-gateway.managed"
 COMPONENT = "io.mdd-sim-gateway.component"
 VERSION = "org.opencontainers.image.version"
 COMPOSE_NAMES = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+
+GIB = 1024 * 1024 * 1024
+MIB = 1024 * 1024
+# How much larger an image is in Docker's store than its Release archive. Measured on the
+# v1.13.0-rc1 arm64 assets: engine 152 MB -> 918 MB, control 131 -> 774, hardware 139 -> 824,
+# egress 82 -> 512, so about six times; layers shared with the running release make it less.
+IMAGE_EXPANSION = 6
+STAGING_MARGIN = 512 * MIB
+IMAGE_STORE_MARGIN = 1 * GIB
+# When the Release did not report its asset sizes. This used to be a flat 6 GiB, sized for
+# images before they were slimmed, which refused a Raspberry Pi with over 5 GiB free.
+FALLBACK_REQUIRED = 4 * GIB
+# Stable aliases the host install and the Settings page treat as current; never pruned here.
+PROTECTED_TAGS = {"mdd-sim-gateway/engine:latest", "mdd-sim-gateway/control:latest",
+                  "mdd-sim-gateway/engine-base:trusted"}
+IMAGE_PREFIXES = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
+
+
+def space_required(sizes: dict, names: list[str]) -> tuple[int, int]:
+    """(bytes the staging directory needs, bytes Docker's image store needs) for this update.
+
+    Every archive is downloaded before the first is loaded, so staging holds all of them at
+    once. The image store then receives each image unpacked while its archive is still on disk,
+    which is the same filesystem on a Pi or a NAS, so the store is asked for both.
+    """
+    archive_sizes = [sizes.get(name) for name in names]
+    if not all(isinstance(size, int) and size > 0 for size in archive_sizes):
+        return FALLBACK_REQUIRED, FALLBACK_REQUIRED
+    archives = sum(archive_sizes)
+    return (archives + STAGING_MARGIN,
+            archives * (IMAGE_EXPANSION + 1) + IMAGE_STORE_MARGIN)
+
+
+def _gib(value: int) -> str:
+    return f"{value / GIB:.1f} GiB"
+
+
+def _managed_image(image) -> bool:
+    tags = [str(tag) for tag in (getattr(image, "tags", None) or [])]
+    labels = (((getattr(image, "attrs", None) or {}).get("Config") or {}).get("Labels") or {})
+    return labels.get(MANAGED) == "true" or any(tag.startswith(IMAGE_PREFIXES) for tag in tags)
+
+
+def previous_image_ids(project: Path) -> set[str]:
+    """Image IDs of the installed release, from update/installed-images.json."""
+    try:
+        installed = json.loads((project / "update" / "installed-images.json").read_text(
+            encoding="utf-8"))
+        images = installed.get("images") if isinstance(installed, dict) else None
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(images, dict):
+        return set()
+    return {str(item.get("image_id")) for item in images.values()
+            if isinstance(item, dict) and item.get("image_id")}
+
+
+def prune_superseded_images(client, keep_ids: set[str]) -> int:
+    """After a successful update, delete MDD images older than the release just replaced.
+
+    The new release and the one it replaced (the rollback) stay, as does anything a container
+    uses and the stable host-install aliases. Without this every release left its images
+    behind: a Pi still held the release candidates of the version before last. Best effort --
+    a failure is reported and never fails an update that has already succeeded.
+    """
+    removed = 0
+    try:
+        keep = {str(image_id) for image_id in keep_ids if image_id}
+        keep.update(str(container.image.id) for container in client.containers.list(all=True)
+                    if getattr(container, "image", None) is not None)
+        for image in client.images.list(all=True):
+            tags = set(image.tags or [])
+            if tags & PROTECTED_TAGS or str(image.id) in keep or not _managed_image(image):
+                continue
+            client.images.remove(str(image.id), force=True, noprune=False)
+            removed += 1
+    except Exception as exc:  # noqa: BLE001 - reported, never fails the update
+        print(f"superseded images not removed: {exc}", file=sys.stderr)
+    return removed
 
 
 def host_arch() -> str:
@@ -328,6 +408,53 @@ def roll_engines(client, target_image_id: str, status: mdd_update.Status) -> Non
         wait_container(client, name, target_image_id, timeout=240)
 
 
+RELAY_CONTAINER = "mdd-sim-gateway-relay"
+
+
+def relay_mode(project: Path) -> bool:
+    """Whether this gateway carries call media through the relay (control/app/media.py)."""
+    try:
+        state = json.loads((project / "media" / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(state, dict) and state.get("mode") == "relay"
+
+
+def fetch_relay_image(base_url: str, version: str, arch: str, sums: Path, routes: list,
+                      active: int, sizes: dict, staging: Path) -> int:
+    """Load this release's relay image beside the one in use. It is optional and outside the
+    rollback transaction: failing leaves the relay on the image it runs, and the new Control
+    moves it over once the image is here (or fetched from a registry)."""
+    name = f"mdd-sim-gateway-relay-v{version}-{arch}.tar.gz"
+    archive = staging / name
+    try:
+        active = mdd_update.fetch_release_asset(
+            f"{base_url}/{name}", archive, name, routes, active,
+            asset_sizes=sizes, phase="relay_image")
+        mdd_update.verify_release_file(archive, sums, f"{arch} relay image")
+        mdd_update.load_relay_image(archive, version)
+    except Exception as exc:  # noqa: BLE001 - reported, never fails the update
+        print(f"media relay image not updated: {exc}", file=sys.stderr)
+    finally:
+        archive.unlink(missing_ok=True)
+    return active
+
+
+def remove_relay(client) -> None:
+    """After a rollback: the Control rolled back to may not know relay mode, and would leave
+    the relay's port open with nothing behind it. One that does recreates it within a minute.
+    Best effort: it must never turn a successful rollback into a failed one."""
+    try:
+        relay = client.containers.get(RELAY_CONTAINER)
+        labels = (relay.attrs.get("Config") or {}).get("Labels") or {}
+        if labels.get(MANAGED) == "true" and labels.get(COMPONENT) == "relay":
+            relay.remove(force=True, v=True)
+    except docker.errors.NotFound:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"could not remove the media relay after rollback: {exc}", file=sys.stderr)
+
+
 def perform(project: Path, version: str, repository: str, network_path: Path,
             status: mdd_update.Status) -> None:
     staging = Path(tempfile.mkdtemp(prefix="container-update.", dir=str(project / "update")))
@@ -339,6 +466,9 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
     old_engine_ids = {}
     try:
         compose = find_compose(project)
+        # The release being replaced, read before it is overwritten below. Its images are the
+        # rollback, including an Engine no line happened to be running at update time.
+        previous_ids = previous_image_ids(project)
         request_network = mdd_update.read_network_config(network_path)
         fallback = str(request_network.get("proxy_url") or "")
         routes = mdd_update.validated_download_routes(
@@ -349,17 +479,25 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
             if isinstance(request_network.get("routes"), list) else None)
         sizes = request_network.get("asset_sizes") if isinstance(
             request_network.get("asset_sizes"), dict) else {}
-        if shutil.disk_usage(project / "update").free < 6 * 1024 * 1024 * 1024:
-            raise mdd_update.UpdateError(
-                "not enough persistent disk space for a transactional container update")
         arch = host_arch()
         names = {component: f"mdd-sim-gateway-{component}-v{version}-{arch}.tar.gz"
                  for component in COMPONENTS}
+        needed = list(names.values())
+        if relay_mode(project):
+            needed.append(f"mdd-sim-gateway-relay-v{version}-{arch}.tar.gz")
+        staging_needed, store_needed = space_required(sizes, needed)
+        staging_free = shutil.disk_usage(project / "update").free
+        if staging_free < staging_needed:
+            raise mdd_update.UpdateError(
+                "not enough persistent disk space for a transactional container update: "
+                f"needs {_gib(staging_needed)}, {_gib(staging_free)} free")
         base_url = f"https://github.com/{repository}/releases/download/v{version}"
         client = docker.from_env()
-        if docker_root_free_bytes(client) < 6 * 1024 * 1024 * 1024:
+        store_free = docker_root_free_bytes(client)
+        if store_free < store_needed:
             raise mdd_update.UpdateError(
-                "not enough Docker image-store space for a transactional container update")
+                "not enough Docker image-store space for a transactional container update: "
+                f"needs {_gib(store_needed)}, {_gib(store_free)} free")
         old_base_ids = {
             component: client.containers.get(f"mdd-sim-gateway-{component}").image.id
             for component in BASE_COMPONENTS
@@ -397,6 +535,9 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
             run(["docker", "load", "--input", str(archives[component])], timeout=1800)
             image_ids[component] = verify_and_tag_image(
                 client, component, version, repository, targets[component])
+        if relay_mode(project):
+            active = fetch_relay_image(base_url, version, arch, sums, routes, active, sizes,
+                                       staging)
         verified_images = {
             component: {"reference": targets[component], "image_id": image_ids[component],
                         "archive_sha256": archive_digests[component]}
@@ -443,6 +584,9 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
         mdd_update.atomic_json(project / "update" / "installed-images.json", {
             "version": version, "architecture": arch, "installed_at": int(time.time()),
             "images": verified_images})
+        # One generation back is the rollback; anything older is only taking space.
+        prune_superseded_images(client, {*image_ids.values(), *old_base_ids.values(),
+                                         *old_engine_ids.values(), *previous_ids})
         status.publish("success", "done", backup=saved.get("name", ""),
                        elapsed_seconds=int(time.time()) - status.started)
     except Exception as exc:
@@ -471,6 +615,7 @@ def perform(project: Path, version: str, repository: str, network_path: Path,
                         pass
                     recreate_engine(client, name)
                     wait_container(client, name, old_image_id, timeout=240)
+                remove_relay(client)
                 rollback_ok = True
             except Exception as rollback_exc:  # preserve both causes in the private status
                 rollback_error = str(rollback_exc)[:1000]

@@ -63,6 +63,13 @@ COPY VERSION /app/VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends curl libcurl4t64 \
     && rm -rf /var/lib/apt/lists/* \
     && printf '/usr/lib64\n' > /etc/ld.so.conf.d/mdd-pcsc.conf && ldconfig
+# The released set, plus whatever the current code has added to it (prebuilt wheels only: the
+# pins already in the base image are satisfied and nothing is compiled). The control plane
+# starts without Pillow or pi-heif, so an overlay whose wheels do not load must fail here.
+COPY control/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --only-binary=:all: -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt \
+    && python -c "import PIL.Image, pi_heif"
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ARG MDD_VERSION=dev

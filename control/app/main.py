@@ -12,13 +12,13 @@ import asyncio
 import base64
 import glob
 import hashlib
-import hmac
 import ipaddress
 import json
 import logging
 import os
 import random
 import re
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -29,12 +29,14 @@ import docker
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette import formparsers as starlette_formparsers
 
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd, mms,
-               mms_media, mms_transport, softphone_ws, modem_ims, vowifi_support, modem_voice)
+               mms_media, mms_staging, mms_transport, softphone_ws, modem_ims, vowifi_support,
+               modem_voice, gate, line_offline, contacts, media, clients, authz)
 from .version import VERSION
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -492,6 +494,8 @@ class Hub:
         # Shared with the acknowledgement endpoint. The poller owns condition lifecycle;
         # the API only marks currently visible items handled.
         self.host_alert_state: dict | None = None
+        # Per-line outage clock for the offline notification; loaded on the first pass.
+        self.line_offline_state: dict[str, dict] | None = None
 
     def cards_list(self) -> list[dict]:
         """Reader/card entries sorted by current PC/SC index (the UI display order)."""
@@ -596,8 +600,11 @@ class Hub:
     async def broadcast(self, msg: dict):
         dead = []
         for ws in list(self.clients):
+            view = authz.event_for(gate.current(ws), msg)
+            if view is None:
+                continue
             try:
-                await ws.send_json(msg)
+                await ws.send_json(view)
             except Exception:
                 dead.append(ws)
         for ws in dead:
@@ -1616,6 +1623,107 @@ def _status_poll_delay(instances: list[dict]) -> float:
             else STATUS_POLL_HEALTHY_SECONDS)
 
 
+MEDIA_SUPERVISE_SECONDS = 30
+MEDIA_CONVERGE_SECONDS = 15
+
+
+MEDIA_RETRY_FIRST_SECONDS = 60
+MEDIA_RETRY_MAX_SECONDS = 600
+# iid -> {"at": monotonic time of the next attempt, "failures": consecutive failures}
+_media_retry: dict[str, dict] = {}
+
+
+async def _media_converge_once() -> bool:
+    """Rebuild one running line whose container was made for the other media mode. One per
+    pass, so the lines re-register one after another instead of all at once. True if a line
+    was rebuilt.
+
+    A line that cannot be rebuilt (its exit is down, the uplink network is missing, the line
+    limit refuses it) fails before its old container is touched, so it would be picked again
+    on every pass and hold up every line after it. It backs off on its own instead, and the
+    pass moves on to the next line."""
+    wanted = media.mode()
+    now = time.monotonic()
+    for inst in cfg.list_instances():
+        iid = str(inst.get("id") or "")
+        if not iid:
+            continue
+        current = await asyncio.to_thread(engine.media_mode_of, iid)
+        if current is None or current == wanted:
+            _media_retry.pop(iid, None)
+            continue
+        retry = _media_retry.get(iid) or {}
+        if now < retry.get("at", 0.0):
+            continue
+        log.info("line %s: rebuilding for %s media mode", iid, wanted)
+        _record_lifecycle(iid, "media_mode_rebuild", reason_code=wanted)
+        try:
+            await asyncio.to_thread(_start_engine_checked, cfg.get_instance(iid) or inst,
+                                    cfg.get_settings(),
+                                    os.environ.get("MDD_DEV_MOUNTS", "") == "1", "media_mode")
+        except Exception as exc:  # noqa: BLE001 - this line waits, the others go on
+            _media_back_off(iid, retry, now, exc)
+            continue
+        # The old container is gone only now; its AMI connection goes with it.
+        await hub.drop_ami(iid)
+        hub.reset_health(iid, "configuration_restart")
+        started = await asyncio.to_thread(engine.media_mode_of, iid)
+        if started is not None and started != wanted:
+            # Started, but not in the wanted mode: relay-pending, because the media network
+            # could not be prepared. That start succeeded, so without this the line would be
+            # rebuilt, and made to register again, on every pass for as long as the cause
+            # lasts. It waits like a failure instead.
+            _media_back_off(iid, retry, now, f"started as {started}")
+        else:
+            _media_retry.pop(iid, None)
+        return True
+    return False
+
+
+def _media_back_off(iid: str, retry: dict, now: float, reason) -> None:
+    failures = int(retry.get("failures", 0)) + 1
+    delay = min(MEDIA_RETRY_MAX_SECONDS, MEDIA_RETRY_FIRST_SECONDS * 2 ** (failures - 1))
+    _media_retry[iid] = {"at": now + delay, "failures": failures}
+    log.warning("line %s: not in the recorded media mode, retrying in %ds: %s",
+                iid, delay, reason)
+
+
+async def media_supervisor():
+    """Keep the relay running in relay mode and move running lines to the recorded mode.
+
+    The mode is switched outside this process (python -m app.media), so it is read from its
+    file on every pass rather than cached. A change to that file is acted on at the next pass
+    instead of waiting for the next periodic check, so the relay counts as ready within
+    MEDIA_CONVERGE_SECONDS of a switch."""
+    last_supervise = 0.0
+    last_state_mtime = None
+    while True:
+        try:
+            try:
+                state_mtime = os.stat(media._state_path()).st_mtime
+            except OSError:
+                state_mtime = None
+            if (state_mtime != last_state_mtime
+                    or time.monotonic() - last_supervise >= MEDIA_SUPERVISE_SECONDS):
+                last_supervise = time.monotonic()
+                last_state_mtime = state_mtime
+                await asyncio.to_thread(media.supervise)
+                await asyncio.to_thread(engine.reconcile_rtp_forward)
+            await _media_converge_once()
+        except Exception as exc:  # noqa: BLE001 - supervision must never stop
+            log.warning("media supervision failed: %s", exc)
+        await asyncio.sleep(MEDIA_CONVERGE_SECONDS)
+
+
+def _line_media_report(iid: str) -> dict:
+    """The engine's own report on its media interface (engine/entrypoint.sh), relay mode."""
+    return engine.read_run_json(iid, "media.json") or {}
+
+
+def _line_media_state(iid: str) -> str:
+    return str(_line_media_report(iid).get("state") or "starting")
+
+
 async def status_poller():
     last_prune = 0.0
     while True:
@@ -1628,6 +1736,7 @@ async def status_poller():
             await sync_modem_msisdns()
             await asyncio.gather(*(_poll_instance_status(inst)
                                    for inst in instances))
+            await _check_line_offline(instances)
             if time.monotonic() - last_prune >= LINE_HISTORY_PRUNE_INTERVAL_SECONDS:
                 last_prune = time.monotonic()
                 await asyncio.to_thread(store.prune_line_states,
@@ -1638,6 +1747,117 @@ async def status_poller():
             await asyncio.wait_for(hub.status_wakeup.wait(), timeout=_status_poll_delay(instances))
         except asyncio.TimeoutError:
             pass
+
+
+def _line_offline_observation(inst: dict) -> tuple[str | None, str]:
+    """Classify a line's latest sample for the offline notification.
+
+    Driven by the user's intent rather than by the status label: an enabled line whose
+    container is not running reads STOPPED, which the timeline files as "off", but nobody
+    asked for it to be off and it is exactly the kind of silent outage this exists to report.
+    """
+    iid = str(inst["id"])
+    if not inst.get("enabled", True) or inst.get("provisioning_state") == "draft":
+        return line_offline.IGNORE, ""
+    st = hub.status_cache.get(iid)
+    if not st:
+        return None, ""
+    state = str(st.get("state") or "").upper()
+    if state == "OK":
+        return line_offline.UP, ""
+    if _line_state_kind(st) is None:
+        return None, ""
+    allowed, blocked = _line_auto_start_allowed(inst)
+    if not allowed and blocked != "no_card":
+        return line_offline.IGNORE, ""
+    return line_offline.DOWN, line_offline.reason_text(state, str(st.get("reason_code") or ""))
+
+
+def _line_offline_state_path() -> str:
+    return os.path.join(cfg.DATA_DIR, "line-offline-state.json")
+
+
+def _load_line_offline_state() -> dict[str, dict]:
+    try:
+        with open(_line_offline_state_path(), encoding="utf-8") as handle:
+            return line_offline.restore(json.load(handle))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_line_offline_state(state: dict) -> None:
+    path = _line_offline_state_path()
+    try:
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(temporary, path)
+    except OSError as exc:
+        log.debug("cannot persist line offline state: %r", exc)
+
+
+def _line_offline_clock(wall: float) -> str:
+    return datetime.fromtimestamp(wall, _local_tz()).strftime("%m-%d %H:%M")
+
+
+async def _check_line_offline(instances: list[dict]) -> None:
+    """Announce lines that stayed offline past the threshold, and their recovery."""
+    try:
+        if hub.line_offline_state is None:
+            hub.line_offline_state = await asyncio.to_thread(_load_line_offline_state)
+        settings = cfg.get_settings()
+        observations = {str(inst["id"]): _line_offline_observation(inst) for inst in instances}
+        went_offline, recovered, changed = line_offline.evaluate(
+            hub.line_offline_state, observations, line_offline.threshold_seconds(settings),
+            time.time(), time.monotonic())
+        if changed:
+            await asyncio.to_thread(_save_line_offline_state,
+                                    line_offline.persistable(hub.line_offline_state))
+        by_id = {str(inst["id"]): inst for inst in instances}
+        for event, entries in ((notify_push.EV_LINE_OFFLINE, went_offline),
+                               (notify_push.EV_LINE_RECOVERED, recovered)):
+            if entries:
+                _announce_line_offline(settings, event, entries, by_id)
+    except Exception as exc:  # noqa - a notification must never stall status sampling
+        log.debug("line offline check failed: %r", exc)
+
+
+def _announce_line_offline(settings: dict, event: str, entries: list[dict],
+                           by_id: dict[str, dict]) -> None:
+    offline = event == notify_push.EV_LINE_OFFLINE
+    for entry in entries:
+        log.warning("line %s %s %.0fs offline", entry["instance"],
+                    "has been" if offline else "recovered after", entry["duration"])
+
+    def describe(entry: dict) -> str:
+        head = (f"已离线 {line_offline.format_duration(entry['duration'])}"
+                f"（自 {_line_offline_clock(entry['since'])} 起）")
+        return f"{head}。\n{entry['reason']}" if offline and entry.get("reason") else f"{head}。"
+
+    if len(entries) == 1:
+        entry = entries[0]
+        inst = by_id.get(entry["instance"]) or {"id": entry["instance"]}
+        tail = ("网关仍在自动重试，恢复后会再通知。" if offline
+                else "线路已重新注册，可以正常收发短信和通话。")
+        text = f"{describe(entry)}\n{tail}"
+        source = inst.get("msisdn") or ""
+        target, match = inst, None
+    else:
+        # Lines that drop together share a cause — the uplink, the exit, the power — and one
+        # message says so better than a burst of identical ones. Feishu bots routed by line
+        # still receive it when any of their lines is among them.
+        names = []
+        for entry in entries:
+            inst = by_id.get(entry["instance"]) or {}
+            name = inst.get("name") or f"线路 {entry['instance']}"
+            names.append(f"• {name}：{describe(entry).replace(chr(10), ' ')}")
+        tail = ("多条线路同时离线，通常是网络、出口或供电问题。网关仍在自动重试。" if offline
+                else "以上线路已重新注册。")
+        text = "\n".join([*names, "", tail])
+        target = {"id": "", "name": f"{len(entries)} 条线路"}
+        source, match = "", [entry["instance"] for entry in entries]
+    asyncio.create_task(asyncio.to_thread(
+        notify_push.dispatch, settings, event, target, source, text, match))
 
 
 HOST_ALERT_POLL_SECONDS = 60.0
@@ -1767,8 +1987,9 @@ def _mms_push_text(rec: dict) -> str:
     return summary
 
 
-# How often the MMS worker looks for attachment files an interrupted save or deletion left.
-MMS_SWEEP_SECONDS = 6 * 3600
+# How often the MMS worker looks for attachment files an interrupted save or deletion left,
+# and for uploads of a message that was never sent.
+MMS_SWEEP_SECONDS = 3600
 
 
 async def mms_worker():
@@ -1790,8 +2011,11 @@ async def mms_worker():
                 removed = await asyncio.to_thread(store.sweep_mms_orphans)
                 if removed:
                     log.info("removed %d unreferenced MMS file(s)", removed)
+                removed = await asyncio.to_thread(mms_staging.sweep)
+                if removed:
+                    log.info("removed %d abandoned MMS attachment upload(s)", removed)
             except Exception as exc:  # noqa
-                log.debug("MMS orphan sweep failed: %r", exc)
+                log.debug("MMS sweep failed: %r", exc)
         try:
             due = await asyncio.to_thread(store.due_mms_downloads)
         except Exception as exc:  # noqa
@@ -2782,6 +3006,7 @@ async def lifespan(app: FastAPI):
     segment_reaper = asyncio.create_task(sms_segment_reaper())
     mms_runner = asyncio.create_task(mms_worker())
     update_poller = asyncio.create_task(update_automation_poller())
+    media_task = asyncio.create_task(media_supervisor())
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
@@ -2792,10 +3017,12 @@ async def lifespan(app: FastAPI):
     segment_reaper.cancel()
     mms_runner.cancel()
     update_poller.cancel()
+    media_task.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
     await asyncio.gather(poller, monitor, sms_poller, host_poller,
-                         segment_reaper, mms_runner, update_poller, return_exceptions=True)
+                         segment_reaper, mms_runner, update_poller, media_task,
+                         return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
         await c.close()
@@ -2804,42 +3031,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="MDD Sim Gateway", lifespan=lifespan)
 
-_AUTH_PUBLIC = {"/api/auth/status", "/api/auth/setup", "/api/auth/login"}
-
-
-@app.middleware("http")
-async def require_admin_session(request: Request, call_next):
-    """Protect every management API and require CSRF on state changes.
-
-    The engine callback is authenticated separately with the per-install internal token.
-    Static assets remain public so the browser can render the login screen.
-    """
-    path = request.url.path
-    if not path.startswith("/api/") or path in _AUTH_PUBLIC:
-        return await call_next(request)
-    if path == "/api/engine/event":
-        expected = cfg.internal_event_token()
-        supplied = request.headers.get("x-mdd-engine-token", "")
-        if not expected or not hmac.compare_digest(supplied, expected):
-            return JSONResponse({"detail": "invalid engine token"}, status_code=401)
-        return await call_next(request)
-    current = auth.session(request.cookies.get(auth.SESSION_COOKIE))
-    if not current:
-        return JSONResponse({"detail": "authentication required"}, status_code=401)
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        supplied = request.headers.get("x-mdd-csrf-token", "")
-        if not hmac.compare_digest(supplied, current["csrf"]):
-            return JSONResponse({"detail": "invalid CSRF token"}, status_code=403)
-    request.state.admin_session = current
-    return await call_next(request)
+# Authentication for every API request and WebSocket handshake; see gate.py.
+app.add_middleware(gate.Gate)
 
 
 @app.get("/api/auth/status")
 def api_auth_status(request: Request):
-    current = auth.session(request.cookies.get(auth.SESSION_COOKIE))
-    return {"configured": auth.configured(), "authenticated": bool(current),
-            "username": auth.username(),
-            "csrf": current.get("csrf") if current else ""}
+    who = gate.current(request)
+    body = {"configured": auth.configured(), "authenticated": who.kind == "admin",
+            "username": auth.username(), "csrf": who.csrf,
+            # What this gateway offers a client app, which may be newer or older than it.
+            "api": 1, "features": ["client_tokens"]}
+    if who.kind == "client":
+        # A client that reaches this is signed in: its token was checked on the way.
+        body.update({"authenticated": True, "kind": "client", "client_id": who.client_id})
+    return body
 
 
 @app.post("/api/auth/setup")
@@ -2850,6 +3056,11 @@ def api_auth_setup(body: dict, request: Request):
         auth.setup(str(body.get("password") or ""), str(body.get("username") or "admin"))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Setting up again follows `install.sh reset-admin` -- typically because a phone or a
+    # password was lost -- so nothing signed in with the old account survives it.
+    clients.revoke_all()
+    gate.revoke_kind("session")
+    gate.revoke_kind("client")
     remember = bool(body.get("remember"))
     result = auth.login(str(body.get("username") or "admin"), str(body.get("password") or ""),
                         request.client.host if request.client else "", remember=remember)
@@ -2888,6 +3099,7 @@ def api_auth_login(body: dict, request: Request):
 @app.post("/api/auth/logout")
 def api_auth_logout(request: Request):
     auth.logout(request.cookies.get(auth.SESSION_COOKIE))
+    gate.revoke(gate.current(request).credential)
     response = JSONResponse({"ok": True})
     response.delete_cookie(auth.SESSION_COOKIE, path="/")
     return response
@@ -2900,20 +3112,67 @@ def api_auth_password(body: dict, request: Request):
                              str(body.get("new_password") or ""))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # A new password ends every sign-in made with the old one: browsers and client apps alike.
+    clients.revoke_all()
+    gate.revoke_kind("session")
+    gate.revoke_kind("client")
     response = JSONResponse({"ok": True, "reauthenticate": True})
     response.delete_cookie(auth.SESSION_COOKIE, path="/")
     return response
 
 
+@app.post("/api/auth/client/login")
+def api_auth_client_login(body: dict, request: Request):
+    """Sign a client app in with the administrator's credentials; it gets a bearer token.
+
+    The token is returned this once. Only its digest is stored, so it cannot be shown again."""
+    if not auth.configured():
+        raise HTTPException(409, "administrator setup is required")
+    peer = request.client.host if request.client else ""
+    retry = auth.throttled(peer)
+    if retry:
+        return JSONResponse({"detail": "too many attempts", "retry_after": retry},
+                            status_code=429, headers={"Retry-After": str(retry)})
+    if not auth.verify(str(body.get("username") or "admin"), str(body.get("password") or ""),
+                       peer):
+        raise HTTPException(401, "invalid username or password")
+    for evicted in clients.make_room():
+        gate.revoke(f"client:{evicted}")
+    try:
+        client, token = clients.register(str(body.get("name") or ""),
+                                         str(body.get("platform") or "other"),
+                                         str(body.get("app_version") or ""))
+    except clients.ClientError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"token": token, "client": client}
+
+
+@app.post("/api/auth/client/logout")
+def api_auth_client_logout(request: Request):
+    who = gate.current(request)
+    if who.kind != "client":
+        raise HTTPException(400, "only a client app signs itself out here")
+    clients.revoke(who.client_id)
+    gate.revoke(who.credential)
+    return {"ok": True}
+
+
+@app.get("/api/auth/clients")
+def api_auth_clients():
+    return {"clients": clients.list_clients()}
+
+
+@app.delete("/api/auth/clients/{client_id}")
+def api_auth_client_revoke(client_id: int):
+    if not clients.revoke(client_id):
+        raise HTTPException(404, "no such client")
+    gate.revoke(f"client:{client_id}")
+    return {"ok": True}
+
+
 def _audit_client(request: Request, settings: dict) -> str:
     peer = request.client.host if request.client else ""
-    trusted = (settings.get("security") or {}).get("trusted_proxies") or []
-    try:
-        address = ipaddress.ip_address(peer)
-        allowed = any(address in ipaddress.ip_network(str(item), strict=False) for item in trusted)
-    except ValueError:
-        allowed = False
-    if allowed:
+    if gate.trusted_proxy(peer, settings):
         forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
         try:
             return str(ipaddress.ip_address(forwarded))
@@ -2929,7 +3188,8 @@ async def audit_mutations(request: Request, call_next):
         settings = cfg.get_settings()
         _write_audit_record({"at": int(time.time()), "method": request.method,
                              "path": request.url.path, "status": response.status_code,
-                             "client": _audit_client(request, settings)}, settings)
+                             "client": _audit_client(request, settings),
+                             "actor": gate.current(request).label}, settings)
     return response
 
 
@@ -4216,6 +4476,21 @@ async def _unified_devices() -> list[dict]:
                     cell_actual = "off"
                 elif flight_desired:
                     cell_actual, cell_reason = "off", "Flight mode is enabled"
+                elif host_cell.get("state") == "failed":
+                    # ModemManager gave up on the modem; the orchestrator reboots it when
+                    # that can help. VoWiFi runs through the bridge regardless.
+                    failure = host_cell.get("failure") or {}
+                    cell_actual = "error"
+                    cell_reason = (
+                        "ModemManager could not start this modem. Check the SIM."
+                        if not failure.get("resettable", True) else
+                        "ModemManager could not start this modem, and it could not be "
+                        "rebooted. Reconnect the modem or restart the host."
+                        if failure.get("exhausted") and not failure.get("rebooted", 1) else
+                        "ModemManager could not start this modem, and rebooting it did not "
+                        "help. Reconnect the modem or restart the host."
+                        if failure.get("exhausted") else
+                        "ModemManager could not start this modem. It is being rebooted.")
                 elif radio_on and registered and host_cell.get("data_active"):
                     cell_actual = "on"
                 elif radio_on:
@@ -4315,6 +4590,8 @@ async def _unified_devices() -> list[dict]:
             "reader": card_info.get("name") or "", "instance_id": str(inst["id"]) if inst else None,
             "status": line_status,
             "logical_channels": logical_channels,
+            "custom_model": (None if is_native_reader
+                             else _custom_model_view(assignment, identity)),
             "sim": {"name": (((inst or {}).get("name")
                              or (cellular_view or {}).get("operator") or "SIM") if inst else ""),
                     "number": (inst or {}).get("msisdn") or "",
@@ -4375,6 +4652,126 @@ async def api_devices():
     # in the list yet. `discovering` lets the UI say so instead of reporting a confident zero.
     return {"devices": await _unified_devices(), "discovering": not hub.scanned,
             "shared": device_state.status().get("shared") or {}}
+
+
+# ------------------------------------------------------------ unrecognised USB modems
+# The host side (orchestrator or Hardware container) lists modem-like USB devices that match
+# no model and tests one on request; Control cannot see /sys and only relays.
+MODEM_PROBE_TIMEOUT = 60.0
+USB_CANDIDATES_MAX_AGE = 120.0
+
+
+def _orchestrator_path(*parts: str) -> str:
+    return os.path.join(cfg.DATA_DIR, "orchestrator", *parts)
+
+
+def _usb_candidates() -> list[dict]:
+    document = _read_json_file(_orchestrator_path("usb-candidates.json"))
+    try:
+        fresh = time.time() - float(document.get("updated_at") or 0) < USB_CANDIDATES_MAX_AGE
+    except (TypeError, ValueError):
+        fresh = False
+    candidates = document.get("candidates") if fresh else []
+    return [item for item in candidates or [] if isinstance(item, dict)]
+
+
+def _modem_profile_key(profile: dict) -> tuple[str, str]:
+    return (str(profile.get("vid") or "").lower(), str(profile.get("pid") or "").lower())
+
+
+def _custom_model_view(assignment: dict, identity: dict) -> dict | None:
+    """How the device page describes a model added through a probe, or None."""
+    key = _modem_profile_key(assignment)
+    profile = next((item for item in (cfg.get_settings().get("hardware") or {})
+                    .get("modem_profiles") or []
+                    if isinstance(item, dict) and item.get("source") == "probe"
+                    and _modem_profile_key(item) == key), None)
+    if not profile:
+        return None
+    # Saved without a SIM to test on: proven by the bridge opening its channels since.
+    verified = bool(profile.get("verified")) or identity.get("channel_status") == "ready"
+    return {"vid": key[0], "pid": key[1], "name": str(profile.get("name") or ""),
+            "verified": verified}
+
+
+def _write_modem_probe_request(candidate: dict) -> tuple[str, str]:
+    request_id = f"probe-{int(time.time() * 1000)}-{random.randrange(1_000_000):06d}"
+    request_dir = _orchestrator_path("modem-probe-requests")
+    os.makedirs(request_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(request_dir, f"{request_id}.json")
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump({"request_id": request_id, "usb_path": candidate["usb_path"],
+                   "vid": candidate["vid"], "pid": candidate["pid"],
+                   "requested_at": time.time()}, handle)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    return request_id, _orchestrator_path("modem-probe-status", f"{request_id}.json")
+
+
+def _save_probed_modem_profile(status: dict) -> dict:
+    hardware = dict(cfg.get_settings().get("hardware") or {})
+    key = (str(status["vid"]).lower(), str(status["pid"]).lower())
+    profiles = [item for item in hardware.get("modem_profiles") or []
+                if isinstance(item, dict) and _modem_profile_key(item) != key]
+    profile = {"name": str(status.get("name") or f"USB modem {key[0]}:{key[1]}")[:80],
+               "vid": key[0], "pid": key[1], "at_interface": int(status["at_interface"]),
+               "source": "probe", "verified": status.get("result") == "usable"}
+    hardware["modem_profiles"] = profiles + [profile]
+    cfg.update_settings({"hardware": hardware})
+    return profile
+
+
+@app.get("/api/hardware/usb-candidates")
+async def api_usb_candidates():
+    return {"candidates": [
+        {key: item.get(key) for key in ("usb_path", "vid", "pid", "manufacturer", "product")}
+        | {"serial_ports": len(item.get("interfaces") or {}),
+           "claimed_by_modemmanager": bool(item.get("mm_object"))}
+        for item in _usb_candidates()]}
+
+
+@app.post("/api/hardware/usb-candidates/{usb_path}/probe")
+async def api_probe_usb_candidate(usb_path: str):
+    """Test one unrecognised device and, if it can reach a SIM, add it as a model."""
+    candidate = next((item for item in _usb_candidates() if item.get("usb_path") == usb_path),
+                     None)
+    if candidate is None:
+        raise HTTPException(404, "this USB device is no longer listed")
+    request_id, status_path = await asyncio.to_thread(_write_modem_probe_request, candidate)
+    deadline = time.monotonic() + MODEM_PROBE_TIMEOUT
+    status: dict = {}
+    while time.monotonic() < deadline:
+        status = _read_json_file(status_path)
+        if status.get("request_id") == request_id and status.get("state") == "done":
+            break
+        await asyncio.sleep(.5)
+    else:
+        raise HTTPException(504, "the hardware service did not finish the test in time")
+    result = str(status.get("result") or "")
+    saved = None
+    if result in {"usable", "unverified"} and status.get("at_interface") is not None:
+        saved = await asyncio.to_thread(_save_probed_modem_profile, status)
+        egress.publish(settings=cfg.get_settings())
+    return {"result": result, "detail": status.get("detail") or "",
+            "steps": status.get("steps") or [], "saved": saved}
+
+
+@app.delete("/api/hardware/modem-profiles/{vid}/{pid}")
+async def api_delete_modem_profile(vid: str, pid: str):
+    """Remove a model added through a probe. Built-in models cannot be removed."""
+    key = (vid.lower(), pid.lower())
+    hardware = dict(cfg.get_settings().get("hardware") or {})
+    profiles = [item for item in hardware.get("modem_profiles") or [] if isinstance(item, dict)]
+    target = next((item for item in profiles if _modem_profile_key(item) == key), None)
+    if target is None:
+        raise HTTPException(404, "no such modem model")
+    if target.get("source") != "probe":
+        raise HTTPException(400, "built-in modem models cannot be removed")
+    hardware["modem_profiles"] = [item for item in profiles if item is not target]
+    cfg.update_settings({"hardware": hardware})
+    egress.publish(settings=cfg.get_settings())
+    return {"removed": {"vid": key[0], "pid": key[1]}}
 
 
 @app.post("/api/devices/{device_id}/sim/reread")
@@ -4781,6 +5178,12 @@ def api_put_settings(body: dict):
             raise HTTPException(400, "invalid new-device defaults")
         if any(not isinstance(value, bool) for value in defaults.values()):
             raise HTTPException(400, "new-device defaults must be boolean")
+    if "line_offline_notify_minutes" in body:
+        minutes = body.get("line_offline_notify_minutes")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) \
+                or not line_offline.MIN_MINUTES <= minutes <= line_offline.MAX_MINUTES:
+            raise HTTPException(400, f"offline notification delay must be "
+                                     f"{line_offline.MIN_MINUTES}-{line_offline.MAX_MINUTES} minutes")
     for channel in ("webhook", "telegram", "pushplus"):
         try:
             notify_push.validate_message_templates(body.get(channel) or {})
@@ -5097,7 +5500,7 @@ def api_host_alerts_clear():
 
 @app.get("/api/system/update/check")
 async def api_system_update_check(force: bool = False):
-    """Read-only release lookup. Requires an admin session (see _AUTH_PUBLIC).
+    """Read-only release lookup. Requires an admin session (see gate.PUBLIC_PATHS).
 
     The periodic UI poll uses the short in-process cache; only an explicit "Check for updates"
     click passes force=true, so repeated logins/reloads cannot burn GitHub's unauthenticated
@@ -5289,13 +5692,26 @@ async def api_support_bundle():
 
 # ----------------------------- instances -----------------------------
 @app.get("/api/instances")
-async def api_instances():
+async def api_instances(request: Request):
     out = []
+    client = gate.current(request).kind == "client"
     for inst in cfg.list_instances():
         st = _cached_line_status(inst)
+        if client:
+            # A client app lists lines to talk on; the line's configuration is not its business.
+            out.append({"id": inst["id"], "name": inst.get("name", ""),
+                        "msisdn": inst.get("msisdn", ""), "enabled": inst.get("enabled", True),
+                        "status": authz.status_for(gate.current(request), st)})
+            continue
         safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity")}
         safe["has_pin"] = bool(inst.get("pin"))
         safe["proxy_country_effective"] = egress.line_country(inst)
+        # What the carrier profile turns on when the line leaves a setting unset, so the form can
+        # show what is actually in effect. Only the switches: a PANI identity is not for display.
+        carrier = cfg.carrier_sip_defaults(str(inst.get("mcc") or ""), str(inst.get("mnc") or ""))
+        safe["sip_carrier_defaults"] = {key: carrier[key] for key in
+                                        (*cfg.CARRIER_SIP_FLAGS, *cfg.CARRIER_SIP_TEXT)
+                                        if key in carrier}
         # Report the reader index that PHYSICALLY holds this line's SIM right now (ICCID-matched
         # against the live monitor) instead of the stored one. PC/SC indices shift when readers
         # are unplugged, so a stored index can be stale and make the SIM-config "Detect card"
@@ -5608,11 +6024,11 @@ async def _stop_instance(iid: str, cancel_reason: str) -> dict:
 
 
 @app.get("/api/instances/{iid}/status")
-async def api_instance_status(iid: str):
+async def api_instance_status(iid: str, request: Request):
     inst = cfg.get_instance(iid)
     if not inst:
         raise HTTPException(404, "no such instance")
-    return _cached_line_status(inst)
+    return authz.status_for(gate.current(request), _cached_line_status(inst))
 
 
 def _availability_window(now: int, recorded_since: int | None) -> int:
@@ -5669,10 +6085,284 @@ async def api_instance_register(iid: str):
     return {"output": engine.exec_cli(iid, "pjsip send register volte_ims")}
 
 
+# ----------------------------- address book -----------------------------
+# What one screen of conversations can ask about at once. A larger request is a mistake, or an
+# attempt to read the whole book out through the resolver.
+CONTACT_RESOLVE_LIMIT = 500
+# A 5000-contact vCard export with notes is well under this; it is a ceiling on one request,
+# not a target.
+CONTACT_IMPORT_LIMIT = 4 * 1024 * 1024
+# The fields that travel beside the file. This is all starlette's max_part_size bounds -- a
+# file part is streamed to a spooled temporary file with no limit of its own -- so the file
+# itself is held to the declared body length instead, which is known before anything is read.
+CONTACT_FIELD_LIMIT = 64 * 1024
+
+
+def _owner(request: Request) -> int:
+    """Whose address book this request is about.
+
+    An address book belongs to whoever keeps it, not to the gateway, so the rows carry an
+    owner and every query names one instead of assuming it. This gateway has a single
+    administrator, so that is the answer for every request that gets this far -- the
+    administrator's browser, or a client app signed in with the administrator's credentials.
+    """
+    if gate.current(request).kind not in ("admin", "client"):
+        raise HTTPException(401, "authentication required")
+    return store.ADMIN_OWNER
+
+
+def _line_country(inst: dict) -> str:
+    """The country a number arriving on this line is written for.
+
+    The SIM's own country first: a VoWiFi line reaches its home network wherever the gateway's
+    traffic leaves the internet, and the home network writes a caller's number, and reads a
+    dialled one, by its own numbering plan. The operator's country-exit choice
+    (egress.line_country) answers only while the SIM has not said where it is from.
+    """
+    return egress.country_for_mcc(inst.get("mcc")) or egress.line_country(inst)
+
+
+def _contact_regions() -> tuple[str, ...]:
+    """The countries the gateway has lines in: those a number typed nationally is keyed for."""
+    return contacts.as_regions(_line_country(inst) for inst in cfg.list_instances())
+
+
+# The countries the stored per-country keys were last built for; None until the first
+# address-book request of this process has checked them.
+_contact_keys_for: tuple[str, ...] | None = None
+
+
+def _contact_regions_current() -> tuple[str, ...]:
+    """_contact_regions(), with the stored keys brought up to date for them first.
+
+    The answer changes as lines are added and as a SIM reports where it is, and a number typed
+    in national form was keyed for whatever the answer was then (store.contacts_rekey). It is
+    checked on every address-book request rather than on each configuration change: that costs
+    one comparison, and nothing outside the address book needs to know it exists.
+    """
+    global _contact_keys_for
+    regions = _contact_regions()
+    if regions != _contact_keys_for:
+        store.contacts_rekey(regions)
+        _contact_keys_for = regions
+    return regions
+
+
+class _ContactUploadTooLarge(Exception):
+    pass
+
+
+def _contact_upload(request: Request) -> Request:
+    """The request with its body held to one import's worth of bytes as it is read.
+
+    A declared Content-Length is only an early refusal: a chunked or HTTP/2 upload through a
+    reverse proxy may carry none, and nothing obliges the body to match it. So the bytes are
+    counted as they come off the connection, and reading stops at the first chunk past the
+    limit; starlette closes any temporary file it had begun.
+    """
+    limit = CONTACT_IMPORT_LIMIT + CONTACT_FIELD_LIMIT
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            raise HTTPException(400, "unreadable Content-Length") from None
+        if length > limit:
+            raise _ContactUploadTooLarge
+    received = 0
+
+    async def receive():
+        nonlocal received
+        message = await request.receive()
+        if message["type"] == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _ContactUploadTooLarge
+        return message
+
+    return Request(request.scope, receive)
+
+
+def _line_region(iid: str, regions: tuple[str, ...]) -> str:
+    """The country a number arriving on this line is national to, or "" when unknown.
+
+    Without a line there is still an answer when the gateway is in one country only.
+    """
+    if iid:
+        return _line_country(cfg.get_instance(str(iid)) or {})
+    return regions[0] if len(regions) == 1 else ""
+
+
+@app.get("/api/contacts")
+async def api_contacts(request: Request, query: str = "", limit: int = 1000):
+    owner = _owner(request)
+    regions = await asyncio.to_thread(_contact_regions_current)
+    items = await asyncio.to_thread(store.contacts_list, owner, query,
+                                    max(1, min(int(limit), 2000)), regions)
+    return {"contacts": items, "total": await asyncio.to_thread(store.contacts_count, owner)}
+
+
+@app.post("/api/contacts")
+async def api_contact_create(body: dict, request: Request):
+    try:
+        owner = _owner(request)
+        regions = await asyncio.to_thread(_contact_regions_current)
+        return {"contact": await asyncio.to_thread(store.contact_create, owner, body, regions)}
+    except contacts.ContactError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/contacts/{contact_id}")
+async def api_contact_update(contact_id: int, body: dict, request: Request):
+    try:
+        owner = _owner(request)
+        regions = await asyncio.to_thread(_contact_regions_current)
+        updated = await asyncio.to_thread(store.contact_update, owner, int(contact_id), body,
+                                          regions)
+    except contacts.ContactError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if updated is None:
+        raise HTTPException(404, "no such contact")
+    return {"contact": updated}
+
+
+@app.delete("/api/contacts/{contact_id}")
+async def api_contact_delete(contact_id: int, request: Request):
+    if not await asyncio.to_thread(store.contact_delete, _owner(request), int(contact_id)):
+        raise HTTPException(404, "no such contact")
+    return {"ok": True}
+
+
+@app.post("/api/contacts/resolve")
+async def api_contacts_resolve(body: dict, request: Request):
+    """Name the numbers on one screen at once, so a conversation list is one extra request.
+
+    `line` says which line they arrived on, because a number written in national form is
+    national to that line's country and to no other. Without it the gateway's country stands in
+    when it has lines in only one; otherwise only an international spelling can be recognised.
+    """
+    owner = _owner(request)
+    numbers = [str(n) for n in (body.get("numbers") or [])][:CONTACT_RESOLVE_LIMIT]
+    regions = await asyncio.to_thread(_contact_regions_current)   # keys current first
+    region = await asyncio.to_thread(_line_region, str(body.get("line") or ""), regions)
+    return {"contacts": await asyncio.to_thread(store.contacts_resolve, owner, numbers, region)}
+
+
+def _contact_file(raw: bytes, filename: str) -> tuple[list[dict], list[str]]:
+    # Phone exports are UTF-8 or a local code page; a byte that fits neither is replaced rather
+    # than failing the whole import, so one bad character cannot cost three hundred contacts.
+    return contacts.parse(raw.decode("utf-8", errors="replace"), filename)
+
+
+@app.post("/api/contacts/import")
+async def api_contacts_import(request: Request):
+    """Import a vCard or CSV export (multipart field "file", or a JSON body with "text")."""
+    owner = _owner(request)
+    too_large = HTTPException(413, f"the file is larger than {CONTACT_IMPORT_LIMIT // 1024} KB")
+    filename, raw = "", b""
+    try:
+        counted = _contact_upload(request)
+        if "multipart/form-data" in (request.headers.get("content-type") or ""):
+            try:
+                form = await counted.form(max_files=1, max_fields=8,
+                                          max_part_size=CONTACT_FIELD_LIMIT)
+            except _ContactUploadTooLarge:
+                raise
+            except Exception as exc:  # noqa
+                raise HTTPException(422, f"unreadable upload: {exc}") from None
+            try:
+                upload = form.get("file")
+                if not hasattr(upload, "read"):
+                    raise HTTPException(422, "no file")
+                filename = upload.filename or ""
+                raw = await upload.read(CONTACT_IMPORT_LIMIT + 1)
+            finally:
+                # A form parsed here rather than by FastAPI is not closed for us.
+                await form.close()
+        else:
+            try:
+                body = await counted.json()
+            except ValueError:
+                raise HTTPException(400, "the body is not JSON") from None
+            if not isinstance(body, dict):
+                raise HTTPException(400, "the body must be a JSON object")
+            filename = str(body.get("filename") or "")
+            raw = str(body.get("text") or "").encode("utf-8")
+    except _ContactUploadTooLarge:
+        raise too_large from None
+    if len(raw) > CONTACT_IMPORT_LIMIT:
+        raise too_large
+    try:
+        # Reading a file of this size takes long enough that it must not hold up the event loop,
+        # which carries every call and message on the gateway.
+        parsed, problems = await asyncio.to_thread(_contact_file, raw, filename)
+        regions = await asyncio.to_thread(_contact_regions_current)
+        result = await asyncio.to_thread(store.contacts_import, owner, parsed, regions)
+    except contacts.ContactError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**result, "read": len(parsed), "problems": problems[:50]}
+
+
+@app.get("/api/contacts/export")
+async def api_contacts_export(request: Request, format: str = "vcf"):
+    owner = _owner(request)
+    items = await asyncio.to_thread(store.contacts_list, owner, "",
+                                    contacts.MAX_CONTACTS_PER_OWNER)
+    if str(format).lower() in ("csv", "text/csv"):
+        body, media, name = contacts.to_csv(items), "text/csv; charset=utf-8", "contacts.csv"
+    else:
+        body, media, name = contacts.to_vcard(items), "text/vcard; charset=utf-8", "contacts.vcf"
+    return Response(content=body.encode("utf-8"), media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 # ----------------------------- SMS -----------------------------
 @app.get("/api/instances/{iid}/messages/threads")
 def api_threads(iid: str):
     return {"threads": store.list_threads(iid)}
+
+
+# Declared before /messages/{peer}: a path parameter would otherwise swallow "unread" and
+# answer with the conversation with somebody called that.
+@app.get("/api/instances/{iid}/messages/unread")
+async def api_messages_unread(iid: str, request: Request):
+    """Which conversations on this line have not been read, and how many messages each."""
+    owner = _owner(request)
+    counts = await asyncio.to_thread(store.unread_counts, owner, str(iid))
+    return {"unread": counts, "total": sum(counts.values())}
+
+
+@app.post("/api/instances/{iid}/messages/read")
+async def api_messages_read(iid: str, body: dict, request: Request):
+    """Mark one conversation read, or the whole line.
+
+    A client's first run marks the line read: an upgrade must not present years of history as
+    unread. Afterwards it marks each conversation as the person opens it.
+    """
+    owner = _owner(request)
+    message_id = body.get("message_id")
+    if message_id is not None:
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "message_id must be a message id") from None
+    if body.get("all"):
+        position = await asyncio.to_thread(store.mark_line_read, owner, str(iid), message_id)
+        return {"ok": True, "line": str(iid), "last_read_id": position}
+    peer = str(body.get("peer") or "").strip()
+    if not peer:
+        raise HTTPException(400, "provide peer or all")
+    position = await asyncio.to_thread(store.mark_thread_read, owner, str(iid), peer,
+                                       message_id)
+    return {"ok": True, "peer": peer, "last_read_id": position}
+
+
+@app.get("/api/messages/unread")
+async def api_messages_unread_total(request: Request):
+    """One number for a badge, across every line."""
+    owner = _owner(request)
+    lines = [str(inst.get("id")) for inst in cfg.list_instances()]
+    return {"total": await asyncio.to_thread(store.unread_total, owner, lines), "lines": lines}
 
 
 @app.get("/api/instances/{iid}/messages/binary")
@@ -5695,11 +6385,12 @@ def api_messages(iid: str, peer: str):
     return {"messages": store.list_messages(iid, peer)}
 
 
-@app.post("/api/instances/{iid}/mms/send")
-async def api_mms_send(iid: str, request: Request):
-    """Compose and submit an MMS. multipart/form-data: to (comma-separated), text, subject,
-    and any number of `attachments` files. Returns at once with the stored message; the
-    upload itself can take minutes over the modem and is reported over the websocket."""
+# Largest file accepted as picked: a camera original is often several megabytes and is
+# converted and shrunk here to fit the line's limit (mms.fit_attachments).
+MMS_UPLOAD_LIMIT = 25 * 1024 * 1024
+
+
+async def _mms_line(iid: str) -> tuple[dict, dict]:
     inst = await asyncio.to_thread(cfg.get_instance, iid)
     if not inst:
         raise HTTPException(404, "no such line")
@@ -5708,31 +6399,230 @@ async def api_mms_send(iid: str, request: Request):
         raise HTTPException(409, "MMS is turned off for this line")
     if not settings.get("configured"):
         raise HTTPException(409, "no MMSC is known for this line's carrier")
+    return inst, settings
+
+
+# Largest of the fields that travel with an attachment -- the text, subject and recipients.
+# This is all starlette's ``max_part_size`` bounds: a file part is streamed straight to a
+# spooled temporary file with no limit of its own, so passing the upload limit here raised the
+# ceiling on the fields and did nothing whatever for the files.
+MMS_FIELD_LIMIT = 256 * 1024
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+def _spool_upload(*args, **kwargs):
+    """Where starlette puts an uploaded file once it passes 1 MB: under the data directory.
+
+    starlette gives no way to choose, so tempfile's default applies -- /tmp, which in the
+    control container is a 32 MB tmpfs, less than one /mms/send request may carry, and shared
+    by every upload in flight. The files are unnamed (O_TMPFILE, or unlinked at once where that
+    is missing), so a process that dies leaves nothing behind."""
+    directory = os.path.join(store.DATA_DIR, "uploads")
+    os.makedirs(directory, exist_ok=True)
+    kwargs.setdefault("dir", directory)
+    return tempfile.SpooledTemporaryFile(*args, **kwargs)
+
+
+starlette_formparsers.SpooledTemporaryFile = _spool_upload
+
+
+def _limited_request(request: Request, limit: int) -> Request:
+    """The request with its body held to `limit` bytes as it is read.
+
+    A file part is measured only once it has been spooled to disk, which is too late to be a
+    limit, and a declared Content-Length is not one either: a chunked or HTTP/2 upload through
+    a reverse proxy may carry none, and nothing obliges the body to match it. So the bytes are
+    counted as the parser pulls them off the connection, and reading stops at the first chunk
+    that goes past the limit; starlette then closes the temporary files it had begun. A
+    declared length that is already too large is refused before anything is read."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            raise HTTPException(400, "unreadable Content-Length") from None
+        if length > limit:
+            raise _too_large(limit)
+    received = 0
+
+    async def receive():
+        nonlocal received
+        message = await request.receive()
+        if message["type"] == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _BodyTooLarge
+        return message
+
+    return Request(request.scope, receive)
+
+
+def _too_large(limit: int) -> HTTPException:
+    return HTTPException(413, f"the request is larger than {limit // (1024 * 1024)} MB")
+
+
+async def _mms_form(request: Request, *, files: int, limit: int):
+    limited = _limited_request(request, limit)
     try:
-        form = await request.form(max_files=20, max_fields=20,
-                                  max_part_size=int(settings["max_size"]) + 1024)
+        return await limited.form(max_files=files, max_fields=40,
+                                  max_part_size=MMS_FIELD_LIMIT)
+    except _BodyTooLarge:
+        raise _too_large(limit) from None
     except Exception as exc:  # noqa
         raise HTTPException(413 if "size" in str(exc).lower() else 422,
                             f"unreadable MMS form: {exc}") from None
-    recipients = mms.parse_recipients(form.get("to") or "")
-    text = str(form.get("text") or "")
-    subject = str(form.get("subject") or "").strip()[:80]
-    attachments = []
-    for upload in form.getlist("attachments"):
+
+
+async def _read_upload(upload) -> dict:
+    data = await upload.read(MMS_UPLOAD_LIMIT + 1)
+    if len(data) > MMS_UPLOAD_LIMIT:
+        raise HTTPException(413, f"{upload.filename or 'the file'} is larger than "
+                                 f"{MMS_UPLOAD_LIMIT // (1024 * 1024)} MB")
+    return {"name": upload.filename or "", "content_type": upload.content_type or "",
+            "data": data}
+
+
+def _recipient_list(value) -> list[str]:
+    return mms.parse_recipients(value or "")
+
+
+def _staged_ids(values) -> list[str]:
+    """The staged attachments a request names, refused when there are more than a line can
+    hold. Every id is loaded into memory to be fitted, so an unbounded list is a way to ask
+    the gateway to read the same 25 MB upload a thousand times over."""
+    ids = [str(i) for i in values or [] if str(i)]
+    if len(ids) > mms_staging.MAX_PER_LINE:
+        raise HTTPException(400, f"at most {mms_staging.MAX_PER_LINE} attachments can be sent "
+                                 f"in one request")
+    return ids
+
+
+@app.post("/api/instances/{iid}/mms/attachments")
+async def api_mms_attachment_add(iid: str, request: Request):
+    """Upload one attachment while composing (multipart field "file"). It is checked at once
+    -- a format the gateway will not send is refused here, not at sending time -- and kept
+    as the original until the MMS is sent or the attachment removed."""
+    await _mms_line(iid)
+    form = await _mms_form(request, files=1, limit=MMS_UPLOAD_LIMIT + MMS_FIELD_LIMIT)
+    try:
+        upload = form.get("file")
         if not hasattr(upload, "read"):
-            continue
-        data = await upload.read(int(settings["max_size"]) + 1)
-        attachments.append({"name": os.path.basename(upload.filename or "")[:80],
-                            "content_type": upload.content_type or "", "data": data})
-    problem = await asyncio.to_thread(mms.validate_outgoing, recipients, text, attachments,
-                                      settings, subject)
+            raise HTTPException(422, "no file")
+        item = await _read_upload(upload)
+    finally:
+        # A form parsed here rather than by FastAPI is not closed for us.
+        await form.close()
+    _checked, problem = await asyncio.to_thread(mms.check_attachments, [item], convert=True)
     if problem:
         raise HTTPException(422, problem)
-    rec = await asyncio.to_thread(mms.create_outgoing, iid, recipients, text, attachments,
-                                  subject)
-    await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-    asyncio.create_task(_send_mms_task(str(iid), int(rec["id"])))
-    return {"ok": True, "message": rec}
+    try:
+        meta = await asyncio.to_thread(mms_staging.stage, iid, item["name"],
+                                       item["content_type"], item["data"])
+    except OverflowError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"ok": True, "attachment": meta}
+
+
+@app.post("/api/instances/{iid}/mms/attachments/fit")
+async def api_mms_attachments_fit(iid: str, body: dict):
+    """What sending would carry: body {ids, text, subject, to, split}. Converts and shrinks the
+    staged attachments to fit the line's limit -- together in one message, or with `split`
+    each in its own -- and reports each one's size before and after, a preview version token,
+    and each message's packaged size (see mms.plan_messages). Sending fits again."""
+    _inst, settings = await _mms_line(iid)
+    body = body or {}
+    ids = _staged_ids(body.get("ids"))
+    try:
+        items = await asyncio.to_thread(mms_staging.load, iid, ids)
+    except KeyError as exc:
+        raise HTTPException(404, f"no such attachment: {exc.args[0]}") from None
+    messages, problem, summary = await asyncio.to_thread(
+        mms.plan_messages, items, str(body.get("text") or ""),
+        str(body.get("subject") or "").strip()[:80], _recipient_list(body.get("to")), settings,
+        split=bool(body.get("split")))
+    fitted = [part for message in messages for part in message["attachments"]]
+    for attachment_id, part, entry in zip(ids, fitted, summary.get("attachments") or []):
+        entry["id"] = attachment_id
+        entry["preview"] = await asyncio.to_thread(
+            mms_staging.save_fitted, iid, attachment_id, part["content_type"], part["data"])
+    return {"ok": problem is None, "problem": problem, **summary}
+
+
+@app.get("/api/instances/{iid}/mms/attachments/{aid}/preview")
+def api_mms_attachment_preview(iid: str, aid: str, v: str | None = None):
+    """A staged attachment as the composer shows it; `v` names a fitted version (the
+    "preview" token a fit returned), so a thumbnail never shows another mode's version."""
+    found = mms_staging.preview_file(iid, aid, v or None)
+    if not found:
+        raise HTTPException(404, "no such attachment")
+    path, content_type = found
+    if not mms_media.previewable(content_type) or not content_type.startswith("image/"):
+        raise HTTPException(415, "no preview for this attachment")
+    return FileResponse(path, media_type=content_type,
+                        headers={"X-Content-Type-Options": "nosniff",
+                                 "Content-Security-Policy": "sandbox; default-src 'none'",
+                                 # A version token names fixed content; without one the
+                                 # latest version is served, which a later fit replaces.
+                                 "Cache-Control": "private, max-age=3600" if v else "no-store"})
+
+
+@app.delete("/api/instances/{iid}/mms/attachments/{aid}")
+async def api_mms_attachment_remove(iid: str, aid: str):
+    await asyncio.to_thread(mms_staging.remove, iid, [aid])
+    return {"ok": True}
+
+
+@app.post("/api/instances/{iid}/mms/send")
+async def api_mms_send(iid: str, request: Request):
+    """Compose and submit MMS. multipart/form-data: to (comma-separated), text, subject, any
+    number of `attachment_ids` (uploaded with POST .../mms/attachments) and/or `attachments`
+    files, and `split` ("1" to send each attachment as its own MMS, the text and subject with
+    the first). Every attachment is converted and shrunk to fit the line's limit. Returns at
+    once with the stored messages ("message" is the first); the upload to the MMSC can take
+    minutes over the modem and is reported over the websocket."""
+    _inst, settings = await _mms_line(iid)
+    # Attachments sent directly, rather than staged first, are held to the same budget the
+    # staging area gives a line: one request can never carry more than the line may hold.
+    form = await _mms_form(request, files=mms_staging.MAX_PER_LINE,
+                           limit=mms_staging.MAX_BYTES_PER_LINE + MMS_FIELD_LIMIT)
+    try:
+        recipients = _recipient_list(form.get("to"))
+        text = str(form.get("text") or "")
+        subject = str(form.get("subject") or "").strip()[:80]
+        split = str(form.get("split") or "").lower() in ("1", "true", "yes")
+        staged_ids = _staged_ids(form.getlist("attachment_ids"))
+        try:
+            attachments = await asyncio.to_thread(mms_staging.load, iid, staged_ids)
+        except KeyError as exc:
+            raise HTTPException(404, f"no such attachment: {exc.args[0]}") from None
+        for upload in form.getlist("attachments"):
+            if hasattr(upload, "read"):
+                attachments.append(await _read_upload(upload))
+    finally:
+        await form.close()
+    messages, problem, _summary = await asyncio.to_thread(
+        mms.prepare_outgoing, recipients, text, attachments, settings, subject, split=split)
+    if problem:
+        raise HTTPException(422, problem)
+    records = []
+    for message in messages:
+        records.append(await asyncio.to_thread(
+            mms.create_outgoing, iid, recipients, message["text"], message["attachments"],
+            message["subject"]))
+    await asyncio.to_thread(mms_staging.remove, iid, staged_ids)
+    for rec in records:
+        await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
+    asyncio.create_task(_send_mms_sequence(str(iid), [int(r["id"]) for r in records]))
+    return {"ok": True, "message": records[0], "messages": records}
+
+
+async def _send_mms_sequence(iid: str, mids: list[int]) -> None:
+    """Submit several MMS one after another, so they reach the recipient in order."""
+    for mid in mids:
+        await _send_mms_task(iid, mid)
 
 
 async def _send_mms_task(iid: str, mid: int) -> None:
@@ -5799,7 +6689,7 @@ def _mms_settings_view(inst: dict) -> dict:
                                  if k != "password"}
     own = dict(inst.get("mms") or {})
     own["password_set"] = bool(own.pop("password", ""))
-    return {"effective": effective, "line": own}
+    return {"effective": effective, "line": own, "formats": mms.attachment_formats()}
 
 
 @app.get("/api/instances/{iid}/mms/settings")
@@ -6782,6 +7672,13 @@ def api_softphone(iid: str, request: Request):
     sip = inst.get("sip", {}) or {}
     wr = sip.get("webrtc", {}) or {}
     host = (request.headers.get("host") or "").split(":")[0] or request.url.hostname
+    # Media: nothing in direct mode (the engine's published RTP ports); in relay mode the TURN
+    # relay with fresh credentials, which clients re-read before every call. The relay is
+    # named by the host the client reached this API by, unless the operator set another.
+    media_prov = media.provisioning(str(iid), request.url.hostname or host)
+    if media_prov["media_mode"] == media.RELAY:
+        media_prov["relay_ready"] = bool(media_prov["relay_ready"]) and \
+            _line_media_state(str(iid)) == "ready"
     return {
         "enabled": bool(wr.get("enable", True)),
         "username": wr.get("username", "webrtc"),
@@ -6790,19 +7687,50 @@ def api_softphone(iid: str, request: Request):
         "ws_path": softphone_ws.path(iid),
         "host": host,
         "realm": cfg.ims_realm(inst["mcc"], inst["mnc"]),
+        **media_prov,
     }
+
+
+@app.get("/api/media")
+def api_media():
+    """The media mode and the relay's state, for display. The mode is switched by the
+    installer (install.sh media), since it rebuilds every line."""
+    state = media.load_state()
+    current = media.mode(state)
+    result = {"mode": current, "relay": media.relay_status()}
+    if current == media.RELAY:
+        lines, line_filters = {}, {}
+        for iid in (str(inst["id"]) for inst in cfg.list_instances()):
+            line_mode = engine.media_mode_of(iid)
+            if line_mode == media.RELAY_PENDING:
+                lines[iid] = "no_media_network"
+            elif line_mode == media.RELAY:
+                report = _line_media_report(iid)
+                lines[iid] = str(report.get("state") or "starting")
+                # What the engine actually loaded; absent from engines older than the
+                # iptables-legacy fallback, and while the line is still starting.
+                line_filters[iid] = str(report.get("filter") or "")
+        kind = media.recorded_filter(state)
+        result.update({
+            "port": state.get("port"),
+            "public_host": state.get("public_host") or "",
+            "public_port": state.get("public_port"),
+            "lines": lines,
+            # The engines' media filter, as probed when relay mode was enabled, and whether it
+            # tells the browser leg from the IMS leg (iptables-legacy goes by port only).
+            "filter": kind,
+            "filter_separates_legs": media.filter_separates_legs(kind),
+            "line_filters": line_filters,
+        })
+    return result
 
 
 @app.websocket("/api/instances/{iid}/softphone/ws")
 async def ws_softphone(ws: WebSocket, iid: str):
     """The browser softphone's SIP-over-WebSocket, relayed to the line's engine.
 
-    WebSocket handshakes bypass the HTTP middleware, so the session check is repeated here.
-    The session cookie is SameSite=Strict, so a cross-site page cannot open this socket as the
-    admin. Rejections close before accepting (the browser sees a failed handshake)."""
-    if not auth.session(ws.cookies.get(auth.SESSION_COOKIE)):
-        await ws.close(code=4401)
-        return
+    The session and the page's origin are checked by the gateway middleware before this runs
+    (gate.py). Rejections close before accepting (the browser sees a failed handshake)."""
     inst = cfg.get_instance(iid)
     webrtc = ((inst or {}).get("sip") or {}).get("webrtc") or {}
     if not inst or not webrtc.get("enable", True) or \
@@ -7672,21 +8600,8 @@ async def api_esim_notification_remove(
 # ----------------------------- WebSocket -----------------------------
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    # Accept before the application-level close so browsers receive code 4401 instead of
-    # treating the rejected handshake as an opaque HTTP 403 and reconnecting forever.
+    # Signed-out browsers are closed with 4401 by the gateway middleware (gate.py).
     await ws.accept()
-    if not auth.session(ws.cookies.get(auth.SESSION_COOKIE)):
-        if ws.query_params.get("auth_close") == "1":
-            await ws.close(code=4401)
-        else:
-            # A tab loaded before this fix does not understand 4401 and reconnects every two
-            # seconds after any close. Keep that unauthenticated legacy socket out of the hub
-            # but quietly open until the user reloads or closes the tab.
-            try:
-                await ws.receive_text()
-            except Exception:
-                pass
-        return
     hub.clients.add(ws)
     try:
         while True:

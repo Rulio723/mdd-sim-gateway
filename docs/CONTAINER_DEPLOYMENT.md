@@ -132,8 +132,8 @@ File Station 或 SMB 读取。YAML 的后续编辑应通过 Container Manager �
 - Egress 不发布 SOCKS 端口到 NAS；
 - `restart: unless-stopped`，用于 NAS 重启后恢复基础服务。
 
-Hardware 中的 NetworkManager 只允许管理 `wwan*` 和 `cdc-wdm*`，蜂窝连接强制
-`never-default`。如果它发现任何 NAS 物理网口、Open vSwitch、VLAN、Docker bridge 或
+Hardware 中的 NetworkManager 只允许管理 `ww*`（`wwan0`，或 `wws27u1i4` 这类可预测命名）
+和 `cdc-wdm*`，蜂窝连接强制 `never-default`。如果它发现任何 NAS 物理网口、Open vSwitch、VLAN、Docker bridge 或
 loopback 被接管，会停止蜂窝拨号。国家出口运行在容器网络中，不向 NAS 主路由表安装运营商
 路由。
 
@@ -157,12 +157,56 @@ https://NAS_LAN_IP:10443/
 5. 蜂窝模块能读取 SIM 状态，按需开启 4G 后 NAS 默认网关保持不变；
 6. 配置国家出口后，UDP 检查通过并显示实际节点名称；
 7. 启用 VoWiFi，依次看到 SWu 已连接、USIM 鉴权成功和 IMS 已注册；
-8. 浏览器通话页能正常打开，反向代理部署还需确认 WebSocket Upgrade 被转发；
+8. 浏览器通话页能正常打开，反向代理部署还需确认 WebSocket Upgrade 被转发，且保留 `Host` 头（或已列为可信反向代理并传递 `X-Forwarded-Host`）；
 9. 在正式使用前完成一次短信和通话测试。
 
 浏览器软电话信令与 WebUI 同源，不需要额外发布 WSS 端口。Engine 的 RTP 端口从默认
 `30000` 开始动态分配；若跨 VLAN 或经过防火墙使用通话功能，需要允许客户端与 NAS 之间的
 对应 UDP 流量。
+
+走国家出口（SOCKS）的线路只接在 internal 的 Engine 网络上，Docker 不会为它发布端口。
+这类线路的 RTP 由 Control 自动创建的 `mdd-sim-gateway-rtp-forward` 容器代为发布并转发：
+它使用 Control 镜像，不需要额外下载；只转发 UDP，而且只把 Engine 的回包送回发起这路通话的
+浏览器地址，Engine 本身不会因此获得任何对外路由。没有走出口的线路时不会创建这个容器。
+
+### 通话媒体模式
+
+> **部分实测**：在 Debian 13（x86_64，内核 6.12）的全容器栈上验证过：用 `docker exec` 启用和
+> 切回 direct、启用前的防火墙探测、中继容器、Engine 的网络接入顺序与地址选择、媒体网卡过滤和
+> TURN 的对端限制。中继模式下的 IMS 注册和浏览器通话只在原生安装上验证过（该主机上 Hardware
+> 容器未能接管模组，线路在全容器栈上无法注册）。**没有在 Synology NAS 上运行过。**
+
+通话音频默认使用 direct 模式：每条线路各自发布 RTP 端口（见上文）。也可以切换到 relay
+模式，改由一个 coturn 中继容器统一转发媒体，此时不再有任何 Engine 发布端口。中继容器
+（`mdd-sim-gateway-relay`）和它使用的内部媒体网络（`mdd-sim-gateway-media`）都由 Control
+按需创建和管理，**不在 Compose 文件中**，`docker compose down`/`up` 不会影响它们。
+
+通过 SSH 在 Control 容器内切换：
+
+```sh
+sudo docker exec -w /app/control mdd-sim-gateway-control python -m app.media status
+sudo docker exec -w /app/control mdd-sim-gateway-control python -m app.media direct
+sudo docker exec -w /app/control mdd-sim-gateway-control python -m app.media relay \
+    [--port N] [--bind ADDR] [--public-host HOST] [--public-port N]
+```
+
+中继使用未经修改的上游镜像 `coturn/coturn:4.17.2-alpine`（按摘要固定）。本地没有时，首次启用
+依次尝试本版本发布在 ghcr 上的副本和 Docker Hub 上游，两者都连不上则启用失败。之后每次一键
+更新，更新助手会和其他镜像一样从 Release 附件导入本版本的中继镜像（走相同的下载线路和校验）；
+导入失败不影响更新，中继继续使用原有镜像。
+
+启用时会先创建媒体网络，在临时 Engine 容器中确认内核能加载引擎的媒体过滤规则，并等待中继
+应答 STUN 请求；任一步失败都会回滚且不修改当前模式。过滤规则优先使用 nftables（需要 nf_tables
+及其 socket 匹配），内核不支持时改用 iptables-legacy，Synology DSM 的旧内核（DS1621+ 为 4.4）
+属于这种情况。iptables-legacy 只能按 RTP 端口范围放行，区分不了浏览器和运营商（IMS）两条腿：
+IPv4 PDN 下运营商那条腿的 RTP 也在这个范围里，经中继可以访问到，但需要有效的 TURN 凭据，仍比
+直连模式严格；AMI、SIP 和 WebSocket 不在范围内，照样挡住。`python -m app.media status` 和
+`/api/media` 会显示当前用的是哪一种。两种都加载不了时启用会被拒绝并给出原因，直连模式
+不受影响。切换会依次重建所有运行中的线路。启用后需要在 NAS 前端的路由器/防火墙放行中继端口
+的 UDP 和 TCP；经反向代理部署时该端口不是 HTTP，需要单独做 TCP/UDP 转发。
+
+整栈回滚时，更新助手会删除中继容器：回滚到的版本如果支持 relay 模式，会在一分钟内重新创建它；
+不支持则不会留下一个无人使用却仍对外开放的端口。
 
 ## 6. 数据、备份和证书
 
@@ -229,6 +273,13 @@ Engine 容器由 Control 按线路动态创建，不属于 Compose 项目，删�
 
 ```sh
 sudo docker ps -aq --filter "label=io.mdd-sim-gateway.component=engine" | xargs -r sudo docker rm -f
+```
+
+启用过 relay 模式时，中继容器和媒体网络同样不属于 Compose 项目，也要一并删除：
+
+```sh
+sudo docker rm -f mdd-sim-gateway-relay
+sudo docker network rm mdd-sim-gateway-media
 ```
 
 不要手工删除仍被其他容器使用的 Docker 网络、卷或镜像。MDD 只管理带

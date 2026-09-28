@@ -10,6 +10,10 @@ RUN pip install --no-cache-dir --no-index --find-links=/tmp/wheels PyYAML==6.0.3
 COPY runtime/vendor/${TARGETARCH}/bin/ /usr/local/bin/
 WORKDIR /app
 COPY host/mdd_orchestrator.py /app/host/mdd_orchestrator.py
+# The orchestrator imports these at start-up even though Egress never probes a modem.
+# tests/test_runtime_image_imports.py fails when an image misses a module it imports.
+COPY host/modem_probe.py /app/host/modem_probe.py
+COPY host/vpcd_modem_bridge.py /app/host/vpcd_modem_bridge.py
 COPY runtime/egress.py /app/runtime/egress.py
 COPY control/app/egress_contract.py /app/control/app/egress_contract.py
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 MDD_EGRESS_HOST=mdd-egress

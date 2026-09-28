@@ -163,12 +163,14 @@ RUN set -eu; \
 # Derive the Fedora runtime package closure from the binary we just built and every Asterisk
 # module we ship. This keeps all codecs and optional modules loadable without carrying compilers,
 # headers or source trees into the final image. Packages needed by the Python tunnel and its shell
-# supervisor are explicit because they are not visible to ldd.
+# supervisor are explicit because they are not visible to ldd. iptables-legacy is the relay-mode
+# media filter on kernels without nf_tables' socket match (Synology DSM's 4.4); nftables already
+# brings the xtables extensions it uses, so it adds only its own tools and libip4tc/libip6tc.
 RUN set -eu; \
     { \
       printf '%s\n' \
         bash coreutils grep hostname iproute net-tools procps-ng \
-        tcpdump bind-utils iputils ca-certificates \
+        tcpdump bind-utils iputils ca-certificates nftables iptables-legacy \
         python3 python3-jinja2 python3-pyscard python3-pysocks python3-requests; \
       { printf '%s\n' /usr/sbin/asterisk; find /usr/lib/asterisk/modules -type f -name '*.so'; } | \
         while IFS= read -r binary; do \

@@ -50,8 +50,11 @@ class ContainerComposeTests(unittest.TestCase):
         self.assertFalse(hardware.get("privileged", False))
         self.assertNotIn("ports", hardware)
         dockerfile = (ROOT / "runtime" / "Dockerfile.hardware").read_text()
-        self.assertIn("unmanaged-devices=*,except:interface-name:wwan*;"
-                      "except:interface-name:cdc-wdm*", dockerfile)
+        # ww* rather than wwan*: systemd's predictable names (wws27u1i4) start with ww.
+        rule = ("unmanaged-devices=*,except:interface-name:ww*;"
+                "except:interface-name:cdc-wdm*")
+        self.assertIn(rule, dockerfile)
+        self.assertIn(rule, (ROOT / "runtime" / "Dockerfile.hardware-overlay").read_text())
         self.assertIn("no-auto-default=*", dockerfile)
         self.assertIn('"reconcile_error" not in d', dockerfile)
         self.assertIn("hardware-dbus:/run/dbus:ro",

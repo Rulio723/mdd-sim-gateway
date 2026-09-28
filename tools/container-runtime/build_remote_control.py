@@ -39,7 +39,8 @@ def main():
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w:gz", format=tarfile.GNU_FORMAT) as archive:
         for name in ("runtime/Dockerfile.control-overlay", "control/app", "control/run.py",
-                     "host/mdd_update.py", "host/mdd_container_update.py", "webui/dist",
+                     "control/requirements.txt", "host/mdd_update.py",
+                     "host/mdd_container_update.py", "webui/dist",
                      "patches/lpac/01_pcsc_reader_selection.patch", "VERSION"):
             archive.add(ROOT / name, arcname=name, filter=include)
     build = ["sudo", "-n", "/usr/local/bin/docker", "build", "--network", "bridge",

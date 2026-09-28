@@ -134,6 +134,7 @@ sudo ./install.sh install
 |---|---:|---:|---|
 | 支持 ModemManager 的蜂窝模块 | ✓ | ✓ | 模块 AT/逻辑通道桥接 |
 | 大疆/Quectel EC25 类模块 | ✓ | ✓ | 自动识别并创建所需虚拟读卡通道 |
+| Quectel EC20（`05c6:9215`） | 未验证 | ✓（用户实测） | 自动识别并创建所需虚拟读卡通道 |
 | USB PC/SC 读卡器 | — | ✓ | 直接 PC/SC |
 | 三体电子 SCR Prime（`04d9:c001`） | — | ✓ | 直接 PC/SC；安装时使用 `patchprime` 驱动补丁 |
 | eUICC/eSIM 读卡器 | — | ✓ | PC/SC + lpac |

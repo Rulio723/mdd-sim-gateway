@@ -74,7 +74,12 @@ ARG MDD_VERSION=dev
 WORKDIR /app
 COPY --from=pcsc-build /hardware-root/ /
 COPY runtime/hardware.py /app/runtime/hardware.py
+COPY host/modem_probe.py /app/host/modem_probe.py
 COPY host/vpcd_modem_bridge.py /app/host/vpcd_modem_bridge.py
+# NetworkManager may manage only the modem: its cdc-wdm control port and its data interface.
+# The data interface is wwan0 on most hosts, but systemd's predictable naming calls it
+# ww<something> (wws27u1i4, wwp0s20u4i4); "ww" is systemd's WWAN prefix. hardware.py still
+# refuses to dial if NetworkManager claims anything that is not DEVTYPE=wwan.
 RUN if [ -n "${DEBIAN_MIRROR}" ]; then \
         sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
           /etc/apt/sources.list.d/debian.sources; \
@@ -97,7 +102,7 @@ RUN if [ -n "${DEBIAN_MIRROR}" ]; then \
         'no-auto-default=*' \
         '' \
         '[keyfile]' \
-        'unmanaged-devices=*,except:interface-name:wwan*;except:interface-name:cdc-wdm*' \
+        'unmanaged-devices=*,except:interface-name:ww*;except:interface-name:cdc-wdm*' \
         > /etc/NetworkManager/conf.d/90-mdd-cellular-only.conf
 
 LABEL io.mdd-sim-gateway.component="hardware" \

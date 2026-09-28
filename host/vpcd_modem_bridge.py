@@ -293,9 +293,15 @@ class ModemCard:
         self.ser = ATSerial(
             port, baud, timeout=0.25, write_timeout=2, exclusive=True
         )
-        self._drain()
-        self._at("ATE0")
-        self._at("AT+CMEE=2")
+        try:
+            self._drain()
+            self._at("ATE0")
+            self._at("AT+CMEE=2")
+        except Exception:
+            # A port that is not an AT port (the modem probe tries several) must not stay
+            # locked until garbage collection gets to it.
+            self.close()
+            raise
 
     def _drain(self):
         deadline = time.monotonic() + 0.5

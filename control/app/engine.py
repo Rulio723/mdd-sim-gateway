@@ -24,7 +24,7 @@ import time
 
 import docker
 
-from . import config as cfg, egress, sysinfo
+from . import config as cfg, egress, media, rtp_forward, sysinfo
 from .egress_contract import ENGINE_LABEL
 
 log = logging.getLogger("mdd.engine")
@@ -44,6 +44,8 @@ LIFECYCLE_EVENTS = {
     # reason_code carries the closed code (no_card / pin_required / pin_invalid /
     # card_mismatch / card_unreadable); the ICCID itself never enters this public record.
     "preflight_blocked",
+    # Rebuilt because the gateway's media mode changed; reason_code is the new mode.
+    "media_mode_rebuild",
 }
 _LIFECYCLE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _LIFECYCLE_INSTANCE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -126,6 +128,55 @@ def container_name(iid: str) -> str:
     return f"mdd-sim-gateway-engine-{iid}"
 
 
+_internal_networks: dict[str, bool] = {}
+
+
+def _engine_network_is_internal(client) -> bool:
+    """Whether the Engine network is internal (the container stack's is). Docker publishes no
+    port of a container that is only on internal networks."""
+    if not ENGINE_NETWORK:
+        return False
+    if ENGINE_NETWORK not in _internal_networks:
+        attrs = client.networks.get(ENGINE_NETWORK).attrs or {}
+        _internal_networks[ENGINE_NETWORK] = bool(attrs.get("Internal"))
+    return _internal_networks[ENGINE_NETWORK]
+
+
+def _engine_network_subnet(client) -> str:
+    """The Engine network's IPv4 subnet, or "" when there is none or it cannot be read.
+
+    The relay (softphone_ws) reaches each engine on this network, but a line going direct also
+    joins the uplink, which then holds the default route, and the engine's own address probe
+    lands there (#195). The engine binds its softphone listener inside this subnet instead."""
+    if not ENGINE_NETWORK:
+        return ""
+    try:
+        for entry in ((client.networks.get(ENGINE_NETWORK).attrs or {}).get("IPAM")
+                      or {}).get("Config") or []:
+            subnet = ipaddress.ip_network(entry.get("Subnet") or "")
+            if subnet.version == 4:
+                return str(subnet)
+    except Exception as exc:  # noqa: BLE001 - the engine falls back to its probed address
+        log.warning("engine network %s subnet unreadable: %s", ENGINE_NETWORK, exc)
+    return ""
+
+
+def reconcile_rtp_forward(client=None, exclude: str = "") -> None:
+    """Keep the RTP forwarder (rtp_forward.py) in step with the lines behind an exit. Best
+    effort: a line's registration and SMS never depend on it."""
+    if not ENGINE_NETWORK:
+        return
+    try:
+        client = client or _client()
+        if not _engine_network_is_internal(client):
+            return
+        configured = {container_name(str(inst["id"])) for inst in cfg.list_instances()
+                      if inst.get("id") is not None and inst.get("enabled", True)}
+        rtp_forward.reconcile(client, ENGINE_NETWORK, configured, exclude)
+    except Exception as exc:  # noqa: BLE001 - retried by the media supervisor
+        log.warning("RTP forwarder not updated: %s", exc)
+
+
 def _instance_paths(iid: str):
     base = os.path.join(DATA_DIR, "instances", str(iid))
     host_base = os.path.join(HOST_DATA_DIR, "instances", str(iid))
@@ -143,7 +194,8 @@ def _clear_runtime_state(base: str):
     """
     run_dir = os.path.join(base, "run")
     for name in ("swu_status.json", "pcscf", "pcscf.applied", "pin_status.json",
-                 "usim_status.json", "engine.env", "swu.ctl"):
+                 "usim_status.json", "engine.env", "swu.ctl", "media.json", "media.nft",
+                 "media.iptables"):
         try:
             os.unlink(os.path.join(run_dir, name))
         except FileNotFoundError:
@@ -438,6 +490,14 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         # Resolve this before replacing an existing Engine. A missing deployment
         # network must not destroy a line which is already running.
         direct_network = client.networks.get(DIRECT_NETWORK)
+    # Relay media mode: the line joins the media network and publishes nothing. None in
+    # direct mode, which leaves everything below exactly as it was.
+    media_attachment = media.engine_attachment(client)
+    if media_attachment is not None:
+        rendered_inst = {**rendered_inst, "media": media_attachment["instance"]}
+    engine_subnet = _engine_network_subnet(client)
+    if engine_subnet:
+        rendered_inst = {**rendered_inst, "engine_subnet": engine_subnet}
     cfg.write_instance_json(rendered_inst, settings)
     base, host_base = _instance_paths(iid)
     ports = inst.get("ports", {})
@@ -483,21 +543,34 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
     # loopback-only mapping as an explicit diagnostic option.
     if (settings.get("debug") or {}).get("ami", False):
         port_bindings[f"{5038}/tcp"] = ("127.0.0.1", ports.get("ami", 5038))
-    # RTP range
+    # RTP range. In relay mode media arrives through the relay on the media network instead.
+    # A line behind a SOCKS exit on an internal Engine network cannot publish ports: the RTP
+    # forwarder publishes its range and relays to it (rtp_forward.py).
+    forwarded = (media_attachment is None and bool(proxy_environment)
+                 and _engine_network_is_internal(client))
     rtp_start = ports.get("rtp_start", 10000)
-    for p in range(rtp_start, rtp_start + cfg.rtp_span(ports)):
-        port_bindings[f"{p}/udp"] = p
+    rtp_last = rtp_start + cfg.rtp_span(ports) - 1
+    if media_attachment is None and not forwarded:
+        for p in range(rtp_start, rtp_last + 1):
+            port_bindings[f"{p}/udp"] = p
+    labels = {MANAGED_LABEL: "true", "io.mdd-sim-gateway.component": "engine"}
+    if forwarded:
+        labels[rtp_forward.FORWARD_LABEL] = rtp_forward.label_value(rtp_start, rtp_last)
+    elif ENGINE_NETWORK and port_bindings:
+        # This line now publishes its own ports; the forwarder must let go of them first.
+        reconcile_rtp_forward(client, exclude=container_name(iid))
+    if media_attachment is not None:
+        labels[media.MODE_LABEL] = (media.RELAY if media_attachment.get("network") is not None
+                                    else media.RELAY_PENDING)
 
-    c = client.containers.run(
-        selected_image,
+    options = dict(
         name=container_name(iid),
-        detach=True,
         cap_add=["NET_ADMIN"],
         devices=["/dev/net/tun:/dev/net/tun:rwm"],
         volumes=volumes,
         ports=port_bindings,
         restart_policy={"Name": "unless-stopped"},
-        labels={MANAGED_LABEL: "true", "io.mdd-sim-gateway.component": "engine"},
+        labels=labels,
         # Asterisk is started with -g, so if it is ever killed by a signal a core lands in the
         # container's working directory. The engine bounces observed so far report ExitCode=0
         # with no kernel crash record, which is not what a signal death looks like — this exists
@@ -521,6 +594,19 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         sysctls=engine_sysctls,
         **network_options,
     )
+    media_network = (media_attachment or {}).get("network")
+    if media_network is None:
+        c = client.containers.run(selected_image, detach=True, **options)
+    else:
+        # The media interface must exist when the entrypoint renders Asterisk's configuration
+        # and loads its firewall, so attach it before the first start.
+        c = client.containers.create(selected_image, **options)
+        try:
+            media_network.connect(c)
+            c.start()
+        except Exception:
+            c.remove(force=True)
+            raise
     if direct_network is not None:
         try:
             direct_network.connect(c)
@@ -528,6 +614,8 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
             c.remove(force=True)
             raise
     log.info("started engine container %s", c.name)
+    if forwarded:
+        reconcile_rtp_forward(client)
     return c.id
 
 
@@ -596,8 +684,9 @@ def container_runtime(iid: str) -> dict:
         ip = None
         if running:
             networks = c.attrs.get("NetworkSettings", {}).get("Networks", {})
+            # Never the media network: the engine accepts only call media there.
             candidates = ([networks.get(ENGINE_NETWORK, {})] if ENGINE_NETWORK
-                          else networks.values())
+                          else [v for k, v in networks.items() if k != media.NETWORK])
             for network in candidates:
                 if network.get("IPAddress"):
                     ip = network["IPAddress"]
@@ -613,6 +702,19 @@ def container_runtime(iid: str) -> dict:
     except docker.errors.NotFound:
         return {"running": False, "ip": None, "container_id": None,
                 "restart_count": 0, "started_at": ""}
+
+
+def media_mode_of(iid: str) -> str | None:
+    """The media mode a running engine was created in, or None when it is not running.
+    Containers from before relay mode existed carry no label and run in direct mode."""
+    try:
+        c = _client().containers.get(container_name(iid))
+    except docker.errors.NotFound:
+        return None
+    if c.status != "running":
+        return None
+    labels = (c.attrs.get("Config") or {}).get("Labels") or {}
+    return labels.get(media.MODE_LABEL) or media.DIRECT
 
 
 def last_engine_exit(iid: str) -> dict:

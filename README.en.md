@@ -153,6 +153,7 @@ it has been validated on a Synology DS1621+; results from other hosts are record
 |---|---:|---:|---|
 | ModemManager-compatible cellular module | Yes | Yes | Modem APDU/logical-channel bridge |
 | DJI/Quectel EC25-class module | Yes | Yes | Automatically provisioned virtual slots |
+| Quectel EC20 (`05c6:9215`) | Unverified | Yes (user-verified) | Automatically provisioned virtual slots |
 | USB PC/SC reader | No | Yes | Direct PC/SC |
 | Santi Electronics SCR Prime (`04d9:c001`) | No | Yes | Direct PC/SC; install with the `patchprime` driver patch |
 | eUICC/eSIM reader | No | Yes | PC/SC and lpac |

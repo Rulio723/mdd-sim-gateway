@@ -143,10 +143,11 @@ boundaries:
 - no host-published Egress SOCKS port;
 - `restart: unless-stopped` for recovery after a NAS reboot.
 
-Hardware NetworkManager is restricted to `wwan*` and `cdc-wdm*`, and cellular connections are
-created with `never-default`. Hardware stops cellular setup if it sees a NAS physical NIC, Open
-vSwitch, VLAN, Docker bridge or loopback under its control. Country exits stay inside container
-networks and do not install carrier routes into the NAS main routing table.
+Hardware NetworkManager is restricted to `ww*` (`wwan0`, or a predictable name such as
+`wws27u1i4`) and `cdc-wdm*`, and cellular connections are created with `never-default`.
+Hardware stops cellular setup if it sees a NAS physical NIC, Open vSwitch, VLAN, Docker bridge
+or loopback under its control. Country exits stay inside container networks and do not install
+carrier routes into the NAS main routing table.
 
 ## 6. First-start acceptance checks
 
@@ -167,12 +168,65 @@ administrator account immediately. Then verify:
 5. enabling modem 4G leaves the NAS default route unchanged;
 6. the chosen country exit passes UDP checks and shows the selected node;
 7. each enabled line reaches SWu connected, USIM authentication and IMS registered;
-8. the Calls page opens and any reverse proxy forwards WebSocket upgrade headers;
+8. the Calls page opens and any reverse proxy forwards WebSocket upgrade headers and keeps the
+   `Host` header (or is listed as a trusted proxy and sends `X-Forwarded-Host`);
 9. a test SMS and call complete before production use.
 
 The browser phone shares the WebUI origin and needs no separate WSS host port. RTP ranges begin at
 UDP 30000 by default; allow the assigned range between clients and the NAS when crossing VLANs or
 firewalls.
+
+A line behind a country exit (SOCKS) is only on the internal Engine network, where Docker publishes
+no port. Control publishes and forwards its RTP range through a `mdd-sim-gateway-rtp-forward`
+container it creates from its own image (nothing to download). It forwards UDP only, and sends an
+Engine's answer only back to the browser address that opened that call; the Engine gains no route
+of its own. Without such a line the container is not created.
+
+### Call media modes
+
+> **Partly tested**: on a full-container stack on Debian 13 (x86_64, kernel 6.12) the following
+> were verified: enabling over `docker exec` and switching back to direct, the firewall probe, the
+> relay container, the Engine's network order and address choice, the media interface filter and
+> the TURN peer limits. IMS registration and browser calls in relay mode were verified on host
+> installs only (on that host the Hardware container could not take over the modem, so no line
+> registered on the stack). **It has not been run on a Synology NAS.**
+
+Call audio defaults to direct mode: each line publishes its own RTP ports (see above). It can
+be switched to relay mode instead, where a single coturn relay container carries all media and no
+Engine publishes any port. The relay container (`mdd-sim-gateway-relay`) and the internal media
+network it uses (`mdd-sim-gateway-media`) are both created and managed by Control on demand,
+**not by the Compose file** — `docker compose down`/`up` does not touch them.
+
+Switch it over SSH inside the Control container:
+
+```sh
+sudo docker exec -w /app/control mdd-sim-gateway-control python -m app.media status
+sudo docker exec -w /app/control mdd-sim-gateway-control python -m app.media direct
+sudo docker exec -w /app/control mdd-sim-gateway-control python -m app.media relay \
+    [--port N] [--bind ADDR] [--public-host HOST] [--public-port N]
+```
+
+The relay runs the unmodified upstream image `coturn/coturn:4.17.2-alpine`, pinned by digest.
+When it is not present, the first enable tries this release's copy on ghcr and then upstream on
+Docker Hub, and fails if neither can be reached. From then on every one-click update imports
+this release's relay image from the Release assets like the other images, over the same routes and
+checksums; a failed import does not fail the update and the relay keeps the image it has.
+
+Enabling creates the media network, checks in a throwaway Engine container that the kernel can
+load the engines' media filter, and waits for the relay to answer a STUN request; any failure rolls
+back and leaves the mode unchanged. The filter is nftables where the kernel supports it (nf_tables
+and its socket match) and iptables-legacy where it does not, as on Synology DSM's old kernel (4.4
+on a DS1621+). iptables-legacy can only admit the RTP port range, so it cannot tell the browser leg
+from the carrier (IMS) leg: on an IPv4 PDN the carrier leg's RTP is in that range and reachable
+through the relay, though only with valid TURN credentials, which is still stricter than direct
+mode; AMI, SIP and the WebSocket are outside the range and stay blocked. `python -m app.media
+status` and `/api/media` show which one is in use. If neither loads, enabling is refused with the
+reason and direct mode is unaffected. Switching rebuilds every running line one at a time.
+Once enabled, forward the relay port's UDP and TCP in any router or firewall in front of the NAS;
+behind a reverse proxy that port is not HTTP, so it needs a plain TCP/UDP forward of its own.
+
+A whole-stack rollback removes the relay container: a release that supports relay mode recreates it
+within a minute, and one that does not is not left with an open port and nothing behind it.
 
 ## 7. Persistent data, backup and certificates
 
@@ -236,6 +290,14 @@ fails with "Resource is still in use". When uninstalling over SSH, remove the En
 
 ```sh
 sudo docker ps -aq --filter "label=io.mdd-sim-gateway.component=engine" | xargs -r sudo docker rm -f
+```
+
+If relay mode was ever enabled, the relay container and the media network are not part of the
+project either; remove them too:
+
+```sh
+sudo docker rm -f mdd-sim-gateway-relay
+sudo docker network rm mdd-sim-gateway-media
 ```
 
 ## 9. Common problems

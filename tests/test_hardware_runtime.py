@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
+from runtime import hardware
 from runtime.hardware import HardwareSupervisor, kernel_objects
 
 
@@ -396,7 +397,9 @@ class HardwareRuntimeTests(unittest.TestCase):
         app.terminate_qmi_proxy = Mock()
         fake_paths = [Mock()]
         fake_paths[0].exists.return_value = True
-        with patch("runtime.hardware.Path.glob", return_value=fake_paths):
+        # A predictable data interface name counts as the QMI net port too.
+        with patch("runtime.hardware.Path.glob", return_value=fake_paths), \
+                patch("runtime.hardware.cellular_net_interfaces", return_value={"wws27u1i4"}):
             app.reconcile_cellular([{"id": "modem-a", "tty": "/dev/ttyUSB2"}],
                                    ["/org/freedesktop/ModemManager1/Modem/0"])
         app.command.assert_called_once_with(
@@ -423,6 +426,7 @@ class HardwareRuntimeTests(unittest.TestCase):
         fake_paths[0].exists.return_value = True
 
         with patch("runtime.hardware.Path.glob", return_value=fake_paths), \
+                patch("runtime.hardware.cellular_net_interfaces", return_value={"wwan0"}), \
                 patch("runtime.hardware.time.monotonic", return_value=5.0):
             app.reconcile_cellular([{"id": "modem-a", "tty": "/dev/ttyUSB2"}],
                                    ["/org/freedesktop/ModemManager1/Modem/0"])
@@ -500,6 +504,41 @@ class HardwareRuntimeTests(unittest.TestCase):
 
         self.pass_at(app, 425.0, port_class)
         self.assertEqual(port.write.call_count, 2)
+
+    def test_unclaimed_modem_resets_back_off_and_stop(self):
+        """A modem ModemManager can never claim is not reset every few minutes for good."""
+        app = self.unclaimed_modem_app()
+        port_class, port = self.fake_port()
+        now, writes = 5.0, []
+        for _ in range(60):
+            self.pass_at(app, now, port_class)
+            writes.append(port.write.call_count)
+            now += 60.0
+        self.assertEqual(port.write.call_count, hardware.UNCLAIMED_RESET_ATTEMPTS)
+        # Spaced 5 then 10 minutes apart (each also waits for the two-minute grace).
+        times = [5.0 + 60.0 * i for i, count in enumerate(writes)
+                 if count != (writes[i - 1] if i else 0)]
+        self.assertEqual([b - a for a, b in zip(times, times[1:])], [300.0, 600.0])
+
+    def test_a_claim_restores_the_reset_budget(self):
+        app = self.unclaimed_modem_app()
+        app.unclaimed_resets["modem-a"] = hardware.UNCLAIMED_RESET_ATTEMPTS
+        port_class, _port = self.fake_port()
+        app.modem_snapshot.return_value = {
+            "available": True, "mm_object": "/org/freedesktop/ModemManager1/Modem/0",
+            "network_interface": "wwan0", "radio_enabled": True,
+            "registration": "home", "data_active": True}
+        self.pass_at(app, 5.0, port_class)
+        self.assertNotIn("modem-a", app.unclaimed_resets)
+
+    def test_flight_mode_never_resets_an_unclaimed_modem(self):
+        app = self.unclaimed_modem_app()
+        app.desired_devices.return_value = {
+            "modem-a": {"cellular_enabled": False, "vowifi_enabled": True, "flight_mode": True}}
+        port_class, _port = self.fake_port()
+        self.pass_at(app, 5.0, port_class)
+        self.pass_at(app, 5.0 + 3600, port_class)
+        port_class.assert_not_called()
 
     def test_grace_clock_clears_once_modemmanager_claims_the_modem(self):
         app = self.unclaimed_modem_app()
@@ -594,7 +633,8 @@ class ModemProfileTests(unittest.TestCase):
     def test_without_a_config_the_built_in_profile_names_the_dji_module(self):
         with tempfile.TemporaryDirectory() as temp:
             app = HardwareSupervisor(data_path=Path(temp))
-            self.assertEqual(app.modem_profiles(), [("2c7c", "0125", 2, "DJI/Quectel EC25")])
+            self.assertEqual(app.modem_profiles(), [("2c7c", "0125", 2, "DJI/Quectel EC25"),
+                                                    ("05c6", "9215", 2, "Quectel EC20")])
 
     def test_profiles_and_names_come_from_config_yaml(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -605,7 +645,21 @@ class ModemProfileTests(unittest.TestCase):
                 "  - {vid: 1e0e, pid: '9001'}\n")
             app = HardwareSupervisor(data_path=data)
             self.assertEqual(app.modem_profiles(), [("2c7c", "0125", 3, "Quectel EG25-G"),
-                                                    ("1e0e", "9001", 2, "")])
+                                                    ("1e0e", "9001", 2, ""),
+                                                    ("05c6", "9215", 2, "Quectel EC20")])
+
+    def test_profiles_are_read_from_where_control_saves_them(self):
+        """Control keeps settings under `settings:`; reading a top-level `hardware` key meant
+        a real config.yaml never reached the container and every name fell back."""
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            (data / "config.yaml").write_text(
+                "settings:\n  hardware:\n    modem_profiles:\n"
+                "    - {name: Quectel EG25-G, vid: 2c7c, pid: '0125', at_interface: 2}\n"
+                "instances: {}\n")
+            app = HardwareSupervisor(data_path=data)
+            self.assertEqual(app.modem_profiles(), [("2c7c", "0125", 2, "Quectel EG25-G"),
+                                                    ("05c6", "9215", 2, "Quectel EC20")])
 
     def test_an_unreadable_config_keeps_the_built_in_profile(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -694,6 +748,126 @@ class AdaptiveCadenceTests(unittest.TestCase):
         from runtime import hardware
         # Dockerfile.hardware fails the check when status.json is older than 15 s.
         self.assertLessEqual(hardware.IDLE_INTERVAL + 5, 15)
+
+
+class CellularNetInterfaceTests(unittest.TestCase):
+    """Issue #189: with systemd's predictable naming an EC25's data interface is wws27u1i4,
+    not wwan0. It was never reported to ModemManager, which then refused the modem with
+    "Failed to find a net port in the QMI modem"."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.net = Path(temp.name) / "class" / "net"
+        self.net.mkdir(parents=True)
+        # Every test gets its own classification cache, and the supervisor's reads of the
+        # default root land in the fake tree.
+        for patcher in (patch.object(hardware, "_cellular_net", {}),
+                        patch.object(hardware, "NET_ROOT", self.net),
+                        patch.object(hardware, "EVENT_ROOTS", (("net", self.net, None),))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def add_interface(self, name, devtype=None, ifindex=2):
+        path = self.net / name
+        path.mkdir()
+        lines = ([f"DEVTYPE={devtype}"] if devtype else []) + [
+            f"INTERFACE={name}", f"IFINDEX={ifindex}"]
+        (path / "uevent").write_text("\n".join(lines) + "\n")
+
+    def add_host_interfaces(self):
+        self.add_interface("wws27u1i4", "wwan", 2111)
+        self.add_interface("wwan0", "wwan", 4)
+        self.add_interface("eth0", None, 2)
+        self.add_interface("docker0", "bridge", 3)
+        self.add_interface("vethe1f2a3b", None, 7)
+        self.add_interface("wlan0", "wlan", 5)
+
+    def test_a_net_interface_is_cellular_by_devtype_whatever_its_name(self):
+        self.add_host_interfaces()
+        self.assertEqual(kernel_objects(), {("net", "wws27u1i4"), ("net", "wwan0")})
+
+    def test_a_wwan_name_is_still_recognised_without_a_devtype(self):
+        # What every host that worked before this change looks like, whatever its kernel
+        # writes to uevent.
+        self.add_interface("wwan0")
+        self.assertEqual(kernel_objects(), {("net", "wwan0")})
+
+    def test_each_uevent_is_read_once_across_wake_checks(self):
+        self.add_host_interfaces()
+        reads = []
+        classify = hardware.CellularNetInterfaces.classify
+
+        def counting(interfaces, name):
+            reads.append(name)
+            return classify(interfaces, name)
+
+        with tempfile.TemporaryDirectory() as data, \
+                patch.object(hardware.CellularNetInterfaces, "classify", counting):
+            app = HardwareSupervisor(data_path=Path(data))
+            for _ in range(5):
+                kernel_objects()
+                app.wake_signature()
+            self.assertEqual(sorted(reads), sorted(
+                ["wws27u1i4", "wwan0", "eth0", "docker0", "vethe1f2a3b", "wlan0"]))
+
+            # A new interface costs one read, and one that has gone is forgotten.
+            reads.clear()
+            self.add_interface("vethc0ffee", None, 9)
+            (self.net / "vethe1f2a3b" / "uevent").unlink()
+            (self.net / "vethe1f2a3b").rmdir()
+            first = app.wake_signature()
+            self.assertEqual(app.wake_signature(), first)
+            self.assertEqual(reads, ["vethc0ffee"])
+            known = {name for name, _ in hardware._cellular_net[self.net].known}
+            self.assertNotIn("vethe1f2a3b", known)
+            self.assertIn("vethc0ffee", known)
+
+    def test_a_predictable_name_is_reported_and_then_removed(self):
+        self.add_interface("wws27u1i4", "wwan", 2111)
+        self.add_interface("eth0", None, 2)
+        with tempfile.TemporaryDirectory() as temp:
+            app = HardwareSupervisor(Path(temp) / "status.json", data_path=Path(temp))
+            events = []
+            app.report_event = lambda action, subsystem, name: events.append(
+                (action, subsystem, name))
+            app.command = Mock(return_value=Mock(returncode=0, stdout=""))
+            app.discover_modems = Mock(return_value=[])
+            app.reconcile_pcsc = Mock()
+
+            app.reconcile()
+            self.assertEqual(events, [("add", "net", "wws27u1i4")])
+
+            # Unplugged: the interface and its uevent are gone, and the remove event is
+            # built from the name that was reported.
+            events.clear()
+            (self.net / "wws27u1i4" / "uevent").unlink()
+            (self.net / "wws27u1i4").rmdir()
+            app.reconcile()
+            self.assertEqual(events, [("remove", "net", "wws27u1i4")])
+            self.assertEqual(app.reported, set())
+
+    def test_networkmanager_may_hold_a_predictable_cellular_interface(self):
+        self.add_interface("wws27u1i4", "wwan", 2111)
+        self.add_interface("eth0", None, 2)
+        # A ww name alone is not enough: NetworkManager's rule lets it in by name, so the
+        # check has to be the one that asks the kernel.
+        self.add_interface("wwfake0", None, 8)
+        app = HardwareSupervisor()
+        app.command = Mock(return_value=Mock(returncode=0, stdout=(
+            "wws27u1i4:connected\ncdc-wdm0:connected\nwwan0:disconnected\n"
+            "eth0:connected\nwwfake0:connected\nlo:unmanaged\n")))
+        with self.assertRaises(RuntimeError) as raised:
+            app.assert_networkmanager_isolated()
+        message = str(raised.exception)
+        self.assertIn("eth0", message)
+        self.assertIn("wwfake0", message)
+        self.assertNotIn("wws27u1i4", message)
+        self.assertNotIn("cdc-wdm0", message)
+        self.assertNotIn("wwan0", message)
+
+        app.command.return_value.stdout = "wws27u1i4:connected\ncdc-wdm0:connected\n"
+        app.assert_networkmanager_isolated()
 
 
 if __name__ == "__main__":
