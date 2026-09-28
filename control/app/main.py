@@ -675,6 +675,16 @@ def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
             log.warning("instance %s: correcting modem reader binding before %s start",
                         inst.get("id"), reason)
             inst = cfg.upsert_instance({"id": str(inst["id"]), **binding})
+        # The same for a line on an ordinary reader: its saved USB port may be where the SIM
+        # sat the last time, e.g. an eSIM profile used before in another reader. The engine
+        # then finds no reader there, falls back to an index holding another line's card and
+        # refuses to authenticate -- a retry every minute until someone re-saves the line.
+        reader = {} if binding else _live_reader_binding_for_instance(inst)
+        if reader and any(inst.get(key) != value for key, value in reader.items()):
+            log.warning("instance %s: SIM found in the reader at USB port %s, not %s; "
+                        "rebinding before %s start", inst.get("id"), reader["reader_port"],
+                        inst.get("reader_port") or "(none)", reason)
+            inst = cfg.upsert_instance({"id": str(inst["id"]), **reader})
         # A line follows its SIM; its device identity follows the physical modem/reader
         # currently holding that SIM. Refresh the rendered snapshot on every start.
         inst = _apply_current_hardware_imei(inst)
@@ -1956,6 +1966,26 @@ def _line_subscriber(iid: str) -> str:
         return f"iccid:{iccid}"
     imsi = cellular_sms._normalize_imsi(inst.get("imsi"))
     return f"imsi:{imsi}" if imsi else ""
+
+
+# Opens the push sent when a late part completes a text already pushed incomplete, so the
+# second notification reads as the rest of the first rather than as a new message.
+SMS_COMPLETED_MARK = "（补全）"
+
+
+async def _publish_completed_sms(rec: dict) -> None:
+    """Announce a text that a late part has just made whole (#193).
+
+    Its incomplete form was published when the reaper gave up waiting -- pushed like any text,
+    since that is what stored it -- and many people read only the push, where the missing part
+    may have been the code they were waiting for. So the whole text is pushed once more, once
+    the last part is in rather than for each part on the way. It is not a new arrival for read
+    state: the message stays where the reader saw it, marked completed.
+    """
+    iid = str(rec["instance"])
+    await asyncio.to_thread(_harvest_allowance_reply, iid, rec["peer"])
+    _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"],
+                   SMS_COMPLETED_MARK + rec["body"])
 
 
 async def _publish_incoming_sms(rec: dict) -> None:
@@ -3839,6 +3869,29 @@ def _reader_port_for_instance(inst: dict) -> str | None:
             if c.get("present") and c.get("iccid") == iccid and c.get("reader_port"):
                 return c.get("reader_port")
     return None
+
+
+def _live_reader_binding_for_instance(inst: dict) -> dict:
+    """The reader_port/reader_index where the card monitor sees this line's SIM right now.
+
+    Only for a line on an ordinary PC/SC reader: a modem's virtual readers carry one SIM on
+    several logical slots and are rebound from the bridge metadata instead. Uses what the
+    monitor has already read -- no APDU is sent, so a running engine is never raced. Empty
+    when the SIM is not seen, or when more than one present reader claims it.
+    """
+    wanted = str(inst.get("iccid") or "").strip()
+    if not wanted or inst.get("swu_reader"):
+        return {}
+    holders = [c for c in hub.cards.values()
+               if c.get("present") and c.get("iccid") == wanted and c.get("reader_port")
+               and not str(c.get("name") or "").startswith("VoWiFi Modem ")]
+    if len(holders) != 1:
+        return {}
+    found = holders[0]
+    binding = {"reader_port": str(found["reader_port"])}
+    if found.get("index") is not None:
+        binding["reader_index"] = int(found["index"])
+    return binding
 
 
 def _card_identity_mismatch(inst: dict) -> dict | None:
@@ -7901,14 +7954,17 @@ async def api_engine_event(payload: dict):
                              "message %d", seq, total, sender, ref, late["message_id"])
                     return {"ok": True, "merged": "duplicate"}
                 merged = _join_sms_parts(late["bodies"], late["seqs"], total)
-                rec = await asyncio.to_thread(store.set_message_body, late["message_id"],
-                                              merged)
+                rec = await asyncio.to_thread(
+                    store.set_message_body, late["message_id"], merged,
+                    int(time.time()) if late["complete"] else None)
                 log.info("late part %d/%d from %s (ref %d) merged into message %d — %s",
                          seq, total, sender, ref, late["message_id"],
                          "now complete" if late["complete"]
                          else f"{len(late['seqs'])}/{total} parts")
                 if rec:
                     await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+                    if late["complete"]:
+                        await _publish_completed_sms(rec)
                 return {"ok": True, "merged": f"{len(late['seqs'])}/{total}"}
             group = await asyncio.to_thread(store.add_sms_segment, iid, sender, ref, total,
                                             seq, text, sent_ts=sent_ts, with_meta=True)

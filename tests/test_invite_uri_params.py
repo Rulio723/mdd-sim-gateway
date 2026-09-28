@@ -61,8 +61,10 @@ class CarrierDefaultTests(unittest.TestCase):
                                    "invite_uri_params": "user=phone"},
                                   mcc="234", mnc="15")["invite_uri_params"], "user=phone")
         giffgaff = config.carrier_sip_defaults("234", "10", "test-card")
-        self.assertNotIn("invite_uri_params", giffgaff)
+        # O2 keeps the endpoint-wide switch its SMS has always had, and shows the call option.
         self.assertTrue(giffgaff["user_eq_phone"])
+        self.assertTrue(giffgaff["invite_uri_params_enable"])
+        self.assertEqual(giffgaff["invite_uri_params"], "user=phone")
         self.assertIn("country=GB", giffgaff["pani"])
 
 

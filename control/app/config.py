@@ -1080,7 +1080,12 @@ CARRIER_SIP_PROFILES = {
     "234-10": {  # O2 UK and MVNOs such as giffgaff
         "pani_country": "GB",
         "access_type": "wlan1",
+        # Calls need ;user=phone (the TAS answers 487 without it). The endpoint-wide switch
+        # also puts it on SMS, which has worked here, so it stays; the call-only parameter
+        # is what the line form shows.
         "user_eq_phone": True,
+        "invite_uri_params_enable": True,
+        "invite_uri_params": "user=phone",
     },
     # T-Mobile US and MVNOs on its IMS core, such as Ultra Mobile. Its MGCF answers an INVITE
     # to a US number with 500 "CC_IMS_TRY_NEXT_MGCF_FAIL" unless the request URI carries

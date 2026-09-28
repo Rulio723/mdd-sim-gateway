@@ -748,6 +748,11 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
                     {new Date(m.ts * 1000).toLocaleString()}
                     {m.transport === 'cellular' ? ` · ${tr('4G SMS')}` : ''}
                     {isMms ? ` · ${tr('MMS')}` : ''}
+                    {/* Shown incomplete, then made whole by a late part: it stays where it was
+                        read, so this mark is how the reader learns the text changed. */}
+                    {m.completed_ts ? <span style={{ cursor: 'help' }}
+                      title={tr('Part of this text arrived late and was added at {time}.', { time: new Date(m.completed_ts * 1000).toLocaleString() })}>
+                      {` · ${tr('Completed')}`}</span> : ''}
                     {statusText}
                   </div>
                   {failed && m.error && (

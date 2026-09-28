@@ -782,9 +782,21 @@ def _migration_read_baseline(c) -> None:
               (ADMIN_OWNER,))
 
 
+def _migration_completed_ts(c) -> None:
+    """When a late part completed a message that had been shown incomplete (set_message_body).
+
+    Kept on the message rather than only announced, so a page loaded later and a native client
+    can both still say the text was completed after it first appeared.
+    """
+    try:
+        c.execute("ALTER TABLE messages ADD COLUMN completed_ts INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+
 _MIGRATIONS = (_migration_message_identity, _migration_modem_object_on_message, _migration_mms,
                _migration_identity_scope, lambda c: _migration_filed_mms_pushes(c),
-               _migration_read_baseline)
+               _migration_read_baseline, _migration_completed_ts)
 
 
 def _sweep_binary_messages(c) -> int:
@@ -1229,12 +1241,21 @@ def _insert_message(c, instance: str, direction: str, peer: str, body: str, *, s
             "received_ts": int(received_ts)}
 
 
-def set_message_body(mid: int, body: str) -> dict | None:
-    """Replace a stored message's text and return the record as it now reads."""
+def set_message_body(mid: int, body: str, completed_ts: int | None = None) -> dict | None:
+    """Replace a stored message's text and return the record as it now reads.
+
+    `completed_ts` records that this text is now whole after being shown with parts missing.
+    The message keeps its place, its time and its read state; the mark is how a reader learns it
+    changed.
+    """
     with _lock, _conn() as c:
-        c.execute("UPDATE messages SET body=? WHERE id=?", (body, int(mid)))
+        if completed_ts is None:
+            c.execute("UPDATE messages SET body=? WHERE id=?", (body, int(mid)))
+        else:
+            c.execute("UPDATE messages SET body=?, completed_ts=? WHERE id=?",
+                      (body, int(completed_ts), int(mid)))
         row = c.execute(
-            "SELECT id,instance,direction,peer,body,status,error,ts,transport,kind "
+            "SELECT id,instance,direction,peer,body,status,error,ts,transport,kind,completed_ts "
             "FROM messages WHERE id=?", (int(mid),)).fetchone()
         if row and (row["kind"] or "sms") == "sms":
             # The text grew, so its identity did too; the identity of the partial text stays
@@ -2969,8 +2990,9 @@ def unread_counts(owner: int, instance: str) -> dict[str, int]:
     An outbound message is never unread -- it was sent from here. A conversation with nothing
     unread is absent rather than zero, so the caller can treat the map as the set of unread ones.
 
-    Known gap: a late part of a long SMS is joined into the message it belongs to and keeps
-    that message's id, so if the message was already read, the text it gains is not unread.
+    A late part of a long SMS completes the message it belongs to in place: same id, same
+    place, same read state. That is deliberate (#193) -- a message the reader has seen does not
+    move -- and the message carries `completed_ts` instead, which the conversation shows.
     """
     with _lock, _conn() as c:
         rows = c.execute(

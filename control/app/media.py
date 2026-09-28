@@ -729,6 +729,11 @@ def probe_engine_firewall(client, network) -> str:
             network=network.name,
             cap_add=["NET_ADMIN"],
             labels={MANAGED_LABEL: "true", COMPONENT_LABEL: "media-probe"},
+            # docker-py returns a finished container's output only for the json-file and
+            # journald drivers, and None otherwise. Synology's daemon defaults to its own `db`
+            # driver, so without this the probe ran, its answer was lost, and relay mode was
+            # refused with "gave no result" on every DSM host.
+            log_config={"type": "json-file", "config": {}},
             remove=True, stdout=True, stderr=True)
     except Exception as exc:  # noqa: BLE001 - ContainerError carries the tools' own messages
         detail = getattr(exc, "stderr", b"") or str(exc)

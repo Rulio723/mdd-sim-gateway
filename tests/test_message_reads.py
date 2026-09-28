@@ -44,7 +44,8 @@ class ReadStateTests(unittest.TestCase):
         # A gateway from before read state: the schema step has not run, and nothing is marked.
         with store._conn() as c:
             c.execute("DELETE FROM message_reads")
-            c.execute(f"PRAGMA user_version={len(store._MIGRATIONS) - 1}")
+            c.execute("PRAGMA user_version="
+                      f"{store._MIGRATIONS.index(store._migration_read_baseline)}")
         store.init()
         for line in (LINE, OTHER_LINE):
             self.assertEqual(store.unread_counts(store.ADMIN_OWNER, line), {}, line)

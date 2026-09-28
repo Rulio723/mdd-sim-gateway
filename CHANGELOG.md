@@ -2,36 +2,16 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
-## [1.13.0-rc2] - 2026-09-28
+## [1.13.0] - 2026-09-29
 
-Second release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
-
-### Fixed
-
-- **v1.13.0-rc1's Egress image did not start**, so every container update to it rolled back:
-  the orchestrator had begun importing `host/modem_probe.py` (for trying unrecognised modems),
-  which the Egress Dockerfile never copied. The image now carries it and the bridge module it
-  imports, and a test follows each runtime image's imports from its entry point and fails when
-  the Dockerfile misses one. CI does not build the Egress or Hardware images, so nothing had run
-  it before the release.
-- **A container update no longer asks for 6 GiB free.** The figure was fixed, sized for the
-  images before they were slimmed, and refused a Raspberry Pi with 5.1 GiB free for an update
-  whose arm64 archives total about 530 MB. It is now worked out from this release's archive
-  sizes -- staging must hold every archive, Docker's image store every archive and its
-  unpacked image -- with 4 GiB when the Release does not report sizes, and a refusal says how
-  much is needed and how much is free. The check runs in the release being updated from, so it
-  takes effect from the update after this one.
-- **A successful container update removes the releases before the one it replaced.** Only
-  the new release and its rollback are kept, besides anything a container uses and the host
-  install's `latest`/`trusted` images; before, every release's images stayed until someone
-  pruned them by hand.
-
-## [1.13.0-rc1] - 2026-09-28
-
-First release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
+The automatic update channel stays on 1.9.5.
 
 ### Upgrade notes
 
+- **Updating from v1.12.0 still needs about 6 GiB free.** That figure is checked by the updater
+  in the release being updated from; from 1.13.0 on, later updates ask only for what the
+  release's images need. On a small SD card, remove older images first (Settings, "Clear old
+  and rollback images").
 - **Behind a reverse proxy that rewrites `Host` -- nginx does by default -- live updates and
   the softphone stop after this upgrade** until the proxy keeps the host name the browser used.
   For nginx add `proxy_set_header Host $http_host;` to the gateway's `location` (not `$host`,
@@ -39,13 +19,11 @@ First release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
   keep `Host`, or list the proxy under Settings → Security → Trusted reverse proxies and have it
   send `X-Forwarded-Host`. The WebUI shows a banner saying so when it happens. Direct
   access and proxies that keep `Host` (Caddy, Traefik and Cloudflare do) need nothing.
-
 - **The control image gains one Python package**, `phonenumberslite`, which the address book
   uses to tell two spellings of one number apart from two different numbers. It is the
   pure-Python Apache-2.0 port of Google's libphonenumber without the geocoding and carrier data
   (about 5 MB installed instead of 46 MB), with no dependencies and no native code. It comes
   with the new control image; nothing needs installing on the host.
-
 - **The control plane gains two Python packages**, Pillow and pi-heif (the decode-only build of
   pillow-heif), for converting MMS pictures on the gateway. The control image carries them; on
   a host install `install.sh reload` installs them from prebuilt wheels (amd64 and arm64), and
@@ -67,7 +45,6 @@ First release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
 - **Experimental: add a modem the gateway does not know.** The Devices page lists unrecognised
   USB devices that look like modems; "Try this device" finds the AT port and checks SIM access
   with `AT+CSIM` before adding it, instead of editing `config.yaml` by hand.
-
 - **Messages are marked read.** A conversation with something new shows how many, and opening
   it clears that. The position is recorded as a message id rather than a time, because an
   inbound SMS carries the network's own timestamp and a delayed one can be older than a message
@@ -157,6 +134,19 @@ First release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
   interface, and iptables-legacy, its fallback on kernels without nf_tables (about 0.3 MB; the
   xtables extensions it uses already come with nftables). An update therefore rebuilds every
   engine image.
+- **One `;user=phone` setting on the line form instead of two.** The call-only request-URI
+  parameters replace the old endpoint-wide checkbox, which also put `;user=phone` on SMS. The old
+  checkbox is shown only on a line where it was turned on by hand, labelled as the older setting,
+  so it can be turned off. O2 (234-10) keeps the endpoint-wide default its SMS has always used,
+  and its form now shows the call option on with `user=phone`.
+- **A long SMS completed by a late part says so, and is pushed again whole** (#193). A text
+  still missing parts after three minutes is shown and pushed with `[…]` for the gap; a part
+  that arrives later (up to an hour) completes it where it is. It keeps its place, its time and
+  its read state, and now carries a "Completed" mark with the time, stored with the message so
+  a reloaded page and a native client show it too. Once the last part is in, the whole text is
+  pushed once more, opening with "（补全）" so it reads as the rest of the first push rather
+  than a new message -- for anyone who reads only the push, the missing part may have been the
+  code they were waiting for.
 
 ### Fixed
 
@@ -170,26 +160,22 @@ First release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
 - On a host install (local mode), switching on a country exit took the host's DNS: the exit's
   tun interface registered itself as the default DNS route, so the host resolved nothing. The
   exit interfaces are kept out of the host's DNS.
-
 - **Outgoing calls on T-Mobile US and MVNOs on its IMS core (310-240, such as Ultra Mobile).**
   The network refused every call to a US number with 500 "CC_IMS_TRY_NEXT_MGCF_FAIL" because
   the request URI lacked `;user=phone` (#114). A line can now add request-URI parameters to its
   outgoing calls (line settings → SIP), and 310-240 lines add `user=phone` by default. Only the
   call carries them; SMS is sent exactly as before, and every other carrier's lines are
   unchanged unless the setting is switched on. Numbers are dialled as typed, `+` included.
-
 - **Every incoming SMS no longer ends in a failed SIP request.** Besides handing the text to the
   manager, each engine forwarded it to the browser softphone as a SIP MESSAGE, which the
   softphone has no handler for and answered with 405 Method Not Allowed. The WebUI shows texts
   from the manager's store, so the forward is gone; nothing that was visible changes.
-
 - On the container stack, the browser softphone had no audio on a line behind a country exit.
   Such a line is only on the internal Engine network, and Docker publishes no port there, so its
   RTP ports were never reachable. Control now runs a small `mdd-sim-gateway-rtp-forward`
   container from its own image that publishes those ranges and relays UDP to the line. The
   Engine's networks and routes are unchanged, so nothing it sends can bypass the exit. A line
   created before this version is forwarded once it is rebuilt (an update does that).
-
 - On the container stack, an EC25 on a host that gives network interfaces predictable names
   (Debian 13 and other systemd 257 hosts call its data interface something like `wws27u1i4`
   instead of `wwan0`) is claimed by ModemManager again. Hardware only told ModemManager about
@@ -197,12 +183,10 @@ First release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
   "Failed to find a net port in the QMI modem". Hardware now asks the kernel whether an
   interface is a cellular one (`DEVTYPE=wwan`) instead of going by its name, reading each
   interface once, and NetworkManager is allowed to manage `ww*` rather than only `wwan*`.
-
 - On the container stack, a modem ModemManager cannot claim is no longer reset every few
   minutes for good. Each reset took that SIM's VoWiFi down for a minute or more. The resets now
   double their spacing and stop after three, none is made while flight mode is on, and the count
   starts over once ModemManager claims the modem.
-
 - In the installer's docker mode, `SWU_TUN_MTU` now reaches the control container, and a reload
   or update keeps the value the running container had. Before, the container was recreated
   without it, so the engines fell back to the default MTU and a carrier that drops fragments
@@ -214,6 +198,23 @@ First release candidate for 1.13.0. The automatic update channel stays on 1.9.5.
   most three times, spaced out, and not while flight mode is on, where the reboot would only
   interrupt VoWiFi. The cellular badge says what happened, and VoWiFi, which
   keeps working through the SIM bridge, is no longer shown as starting.
+- **A container update no longer asks for 6 GiB free.** The figure was fixed, sized for the
+  images before they were slimmed, and refused a Raspberry Pi with 5.1 GiB free for an update
+  whose arm64 archives total about 530 MB. It is now worked out from this release's archive
+  sizes -- staging must hold every archive, Docker's image store every archive and its
+  unpacked image -- with 4 GiB when the Release does not report sizes, and a refusal says how
+  much is needed and how much is free. The check runs in the release being updated from, so it
+  takes effect from the update after this one.
+- **A successful container update removes the releases before the one it replaced.** Only
+  the new release and its rollback are kept, besides anything a container uses and the host
+  install's `latest`/`trusted` images; before, every release's images stayed until someone
+  pruned them by hand.
+- **A line on a card reader follows its SIM to whichever reader holds it.** Switching the eSIM
+  in a reader to a profile last used in another reader started that profile's line with the
+  old USB port: the engine found no reader there, fell back to one holding another line's card,
+  refused to authenticate, and retried every minute until the line was saved again. Every
+  start now rebinds such a line to the reader the card monitor sees its SIM in, as modem lines
+  already were. No card is read to find it.
 
 ### Security
 

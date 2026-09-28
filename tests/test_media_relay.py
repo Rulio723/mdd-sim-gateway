@@ -277,6 +277,12 @@ class MediaRelayTests(unittest.TestCase):
         self.assertFalse(self.media.filter_separates_legs(kind))
         self.assertTrue(self.media.filter_separates_legs("nft"))
 
+    def test_the_probe_output_survives_a_daemon_that_does_not_log_to_json(self):
+        # Synology's Docker logs to its own `db` driver, and docker-py then hands back None
+        # for a finished container's output: relay mode was refused on every DSM host.
+        _kind, (_args, kwargs) = self.probe(b"filter=iptables-legacy\n")
+        self.assertEqual(kwargs["log_config"]["type"], "json-file")
+
     def test_a_probe_without_a_result_is_a_failure(self):
         with self.assertRaisesRegex(self.media.MediaError, "no result"):
             self.probe(b"")

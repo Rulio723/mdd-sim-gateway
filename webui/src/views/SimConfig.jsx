@@ -418,11 +418,15 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
               {t('Leave empty to identify as MDD-Sim-Gateway. Set this only when the carrier rejects registration from an unrecognised terminal.')}
             </div>
           </Field>
-          <label style={{ marginTop: 8 }}>
-            <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={!!form.sip.user_eq_phone}
-              onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />
-            {t('Add ;user=phone to telephone-number SIP requests')}
-          </label>
+          {/* The endpoint-wide switch is superseded by the call-only parameters below. It stays
+              visible only on a line where someone turned it on by hand, so it can be turned off;
+              a carrier default (O2) keeps working without being shown twice. */}
+          {form.sip.user_eq_phone === true && !(form.sip_carrier_defaults || {}).user_eq_phone &&
+            <label style={{ marginTop: 8 }}>
+              <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked
+                onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />
+              {t('Add ;user=phone to every SIP request, SMS included (older setting; the call-only option below replaces it)')}
+            </label>}
           {(() => {
             // A setting the line leaves unset follows the carrier profile, so show that value.
             const carrier = form.sip_carrier_defaults || {}
