@@ -19,6 +19,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from copy import deepcopy
@@ -360,6 +361,11 @@ def _config_error(summary: str, completed) -> str:
 
 def _orchestrator_module():
     path = Path(__file__).resolve().parents[2] / "host" / "mdd_orchestrator.py"
+    # The control container runs from /app/control, with host/ mounted separately.
+    # The loaded module imports host.modem_probe, so make its package root importable.
+    package_root = str(path.parent.parent)
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
     spec = importlib.util.spec_from_file_location("mdd_proxy_test_orchestrator", path)
     if not spec or not spec.loader:
         raise EgressError("proxy protocol support is unavailable")

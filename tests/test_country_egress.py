@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import subprocess
+import sys
 import time
 import io
 import tempfile
@@ -1023,6 +1025,23 @@ class PastedNodeFidelityTests(unittest.TestCase):
 
 class ProxyProfileDescriptionTests(unittest.TestCase):
     """The parsed view is what answers "it works in my other client"."""
+
+    def test_control_container_can_load_host_parser_without_repo_on_python_path(self):
+        # The control image runs from /app/control; /app/host is a separate bind mount.
+        # A normal test run from the repo root hides missing import-path setup.
+        control_dir = Path(__file__).resolve().parents[1] / "control"
+        script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from app import egress
+parsed = egress.describe_proxy_profile({"type": "node", "value": "socks5://127.0.0.1:1080"})
+assert parsed["protocol"] == "socks", parsed
+"""
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(control_dir)],
+            cwd=control_dir, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_it_reports_the_switches_that_decide_whether_a_node_carries_ike(self):
         parsed = egress.describe_proxy_profile({
