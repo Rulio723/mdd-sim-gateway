@@ -300,6 +300,7 @@ const zh = {
   'Select a SIM / line to use the softphone.': '请选择一张 SIM/线路使用软电话。', 'Select a SIM / line to view and send messages.': '请选择一张 SIM/线路查看和发送短信。',
   'WebRTC is disabled for this SIM. Enable it in SIM Config (needs HTTPS/TLS) to use the browser phone.': '此 SIM 尚未启用 WebRTC。请在 SIM 配置中启用（需要 HTTPS/TLS），然后使用浏览器电话。',
   Decline: '拒接', Answer: '接听', Call: '呼叫', Hangup: '挂断', Mute: '静音', Unmute: '取消静音', Keypad: '拨号键盘', Record: '录音', Stop: '停止',
+  'Type or tap keys': '按键或键盘输入',
   'Call declined': '通话已拒接', Busy: '忙线', 'Call cancelled': '通话已取消', 'Call ended': '通话结束',
   'New message': '新短信', 'Clear all conversations': '清空所有会话', 'Loading conversations…': '正在读取会话…', 'No conversations yet.': '暂无会话。',
   'Loading messages…': '正在读取短信…', 'No messages in this conversation.': '此会话暂无短信。',

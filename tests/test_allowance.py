@@ -72,6 +72,23 @@ class AllowanceTests(unittest.TestCase):
         self.assertEqual(complete["source"], "sms")
         self.assertEqual(complete["updated_ts"], 108)
 
+    def test_ultra_english_reply_parses_all_fields(self):
+        english_reply = [
+            {"body": (
+                "Remaining monthly minutes: 87\n"
+                "Remaining monthly texts: 77\n"
+                "Remaining monthly data: 99.0MB\n"
+                "Plan Expires: 10/19/2026\n"
+                "PayGo Wallet Balance: $6.51"
+            )}
+        ]
+        parsed = allowance.parse_reply("ultramobile", english_reply)
+        self.assertEqual(parsed["voice_remaining"], "87")
+        self.assertEqual(parsed["sms_remaining"], "77")
+        self.assertEqual(parsed["data_remaining"], "99.0MB")
+        self.assertEqual(parsed["valid_until"], "10/19/2026")
+        self.assertEqual(parsed["balance"], "$6.51")
+
     def test_ctexcel_reply_parses_balance(self):
         parsed = allowance.parse_reply("ctexcel", [
             {"body": "Your current credit balance is £1.01."}])

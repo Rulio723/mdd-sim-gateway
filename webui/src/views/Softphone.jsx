@@ -741,7 +741,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                   background: 'var(--surface-2, rgba(255,255,255,0.06))', border: '1px solid var(--border, rgba(255,255,255,0.12))',
                   fontSize: 20, letterSpacing: 2, textAlign: 'center', overflow: 'hidden', whiteSpace: 'nowrap',
                   direction: 'rtl', color: dtmfSeq ? 'var(--text)' : 'var(--text-mute)' }}>
-                  {dtmfSeq || 'Type or tap keys'}
+                  {dtmfSeq || t('Type or tap keys')}
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
                   {KEYS.map(([k]) => (

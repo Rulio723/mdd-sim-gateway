@@ -99,11 +99,11 @@ def parse_reply(key: str, messages: list[dict]) -> dict:
     parsed = {}
     if key == "ultramobile":
         patterns = {
-            "voice_remaining": r"(?:本月)?剩余通话时间[：:]\s*([\d.]+\s*(?:分钟|min(?:ute)?s?))",
-            "sms_remaining": r"(?:本月)?剩余短信数[：:]\s*([\d.]+\s*(?:条|texts?|SMS))",
-            "data_remaining": r"(?:本月)?剩余流量[：:]\s*([\d.]+\s*(?:KB|MB|GB|TB))",
-            "valid_until": r"(?:计划到期日|到期日|有效期)[：:]\s*([^\s\n]+)",
-            "balance": r"(?:PayGo\s*)?(?:钱包余额|余额)[：:]\s*([^\s\n]+)",
+            "voice_remaining": r"(?:(?:本月)?剩余通话时间|Remaining\s+(?:monthly\s+)?minutes)[：:]\s*([\d.]+\s*(?:分钟|min(?:ute)?s?)?)",
+            "sms_remaining": r"(?:(?:本月)?剩余短信数|Remaining\s+(?:monthly\s+)?texts)[：:]\s*([\d.]+\s*(?:条|texts?|SMS)?)",
+            "data_remaining": r"(?:(?:本月)?剩余流量|Remaining\s+(?:monthly\s+)?data)[：:]\s*([\d.]+\s*(?:KB|MB|GB|TB))",
+            "valid_until": r"(?:计划到期日|到期日|有效期|Plan\s+Expires)[：:]\s*([^\s\r\n]+)",
+            "balance": r"(?:PayGo\s*)?(?:钱包余额|余额|Wallet\s+Balance|Balance)[：:]\s*([^\s\r\n]+)",
         }
         for field, pattern in patterns.items():
             match = re.search(pattern, text, re.IGNORECASE)
