@@ -4,6 +4,7 @@ import { useI18n } from '../i18n.jsx'
 import SimConfig from './SimConfig.jsx'
 import Logs from './Logs.jsx'
 import VowifiHistory from './VowifiHistory.jsx'
+import VowifiTrace from './VowifiTrace.jsx'
 
 const CAP_STATES = ['off', 'starting', 'on', 'stopping', 'degraded', 'error', 'unsupported']
 
@@ -140,6 +141,8 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   const pending = submitting || c.actual === 'starting' || c.actual === 'stopping'
   const unavailable = !c.available || c.actual === 'unsupported' || device.compatibilityOnly ||
     device.present === false || (kind === 'cellular' && capability(device, 'flight').desired)
+  const canDisableWhileStarting = !submitting && c.desired && (c.actual === 'starting' || c.actual === 'stopping')
+  const switchDisabled = (pending && !canDisableWhileStarting) || unavailable
   const title = kind === 'cellular' ? t('4G network') : kind === 'flight' ? t('Flight mode') : t('VoWiFi / WiFi Calling')
   const canRetry = kind === 'vowifi' && c.desired && ['off', 'degraded', 'error'].includes(c.actual) && !unavailable
   const change = async (next, retry = false) => {
@@ -198,12 +201,16 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   // carrier's answer is the one that tells the user something, so it wins while the line is off.
   const unsupportedReason = unsupported && c.actual === 'off'
     ? (device.capabilities?.vowifi?.support?.reason || '') : ''
+  const reasonMatch = String(c.reason || '').match(/^Waiting for cellular registration \((.+)\)$/)
+  const renderedReason = reasonMatch
+    ? t('Waiting for cellular registration ({registration})', { registration: reasonMatch[1] })
+    : (c.reason ? t(c.reason) : t(`cap.help.${c.actual}`))
   const detail = c.actual === 'on'
     ? (kind === 'vowifi' ? t('Working — connected to the carrier over Wi-Fi.')
       : kind === 'cellular' ? [t('Mobile data connected'), cellular.operator, cellular.ip].filter(Boolean).join(' · ')
       : t('cap.help.on'))
     : unsupportedReason ? t(unsupportedReason)
-    : (c.reason ? t(c.reason) : t(`cap.help.${c.actual}`))
+    : renderedReason
   const badgeState = capabilityBadgeState(device, kind, displayedState)
   // A draft line starts by itself once these are filled in. IMEI belongs to the reader
   // (Hardware tab); every other field belongs to the SIM (SIM tab).
@@ -237,7 +244,7 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
       </div>}
     </div>
     <div className="u-cap-actions">{canRetry && <button className="btn btn-ghost" disabled={submitting} onClick={() => change(true, true)}>{t(unsupported ? 'Try again' : 'Restart line')}</button>}{unsupported && !c.desired && !unavailable && <button className="btn btn-ghost" disabled={pending} onClick={() => change(true)}>{t('Try anyway')}</button>}<Badge state={badgeState}>{device.present === false ? t('Offline') : null}</Badge><button className={`u-switch ${displayedDesired ? 'on' : ''}`} role="switch" aria-checked={displayedDesired}
-      aria-label={title} disabled={pending || unavailable} onClick={toggle}><span /></button></div>
+      aria-label={title} disabled={switchDisabled} onClick={toggle}><span /></button></div>
   </div>
 }
 
@@ -1325,6 +1332,6 @@ export function DiagnosticsPage(props) {
     {tab === 'health' && props.initialLoading ? <p role="status">{t('Loading')}…</p> : tab === 'health' && props.loadErrors?.devices && !devices.length ? <p className="u-error">{t('Loading failed')}</p> : tab === 'health' && <div className="u-device-grid">{devices.map((d, i) => <div className="card u-panel" key={d.id}><h3>{deviceTitle(d, i)}</h3><div className="u-detail"><span>{t('4G network')}</span><Badge state={capability(d, 'cellular').actual} /></div><div className="u-detail"><span>VoWiFi / IMS</span><Badge state={capability(d, 'vowifi').actual} /></div><button className="btn btn-ghost" onClick={() => run(d)}>{t('Run diagnostics')}</button>{results[d.id]?.checks?.map(check => <div className="u-detail" key={check.name}><span>{check.name}</span><b>{check.ok ? '✓' : '✕'} {check.detail}</b></div>)}</div>)}</div>}
     {tab === 'host' && <HostPanel host={host} alerts={hostAlerts} loading={hostLoading} clearing={clearingAlerts} onClear={clearHostAlerts} t={t} />}
     {tab === 'logs' && <Logs {...props} />}
-    {tab === 'bundle' && <div className="card u-panel"><h2>{t('Redacted support bundle')}</h2><p>{t('Contains status, configuration shape and bounded logs. SIM identities, phone numbers, credentials and cryptographic material are removed.')}</p><div className="u-support-actions"><a className="btn btn-primary" href={api.supportBundleUrl}>{t('Download support bundle')}</a><div><b>{t('Found a problem or have a suggestion?')}</b><p>{t('Open a GitHub Issue. For faults, attach the redacted support bundle when appropriate.')}</p><a href={issueUrl} target="_blank" rel="noreferrer">{t('Submit an Issue')} ↗</a></div></div></div>}
+    {tab === 'bundle' && <><VowifiTrace devices={devices} showToast={props.showToast} /><div className="card u-panel"><h2>{t('Redacted support bundle')}</h2><p>{t('Contains status, configuration shape and bounded logs. SIM identities, phone numbers, credentials and cryptographic material are removed.')}</p><div className="u-support-actions"><a className="btn btn-primary" href={api.supportBundleUrl}>{t('Download support bundle')}</a><div><b>{t('Found a problem or have a suggestion?')}</b><p>{t('Open a GitHub Issue. For faults, attach the redacted support bundle when appropriate.')}</p><a href={issueUrl} target="_blank" rel="noreferrer">{t('Submit an Issue')} ↗</a></div></div></div></>}
   </div>
 }
